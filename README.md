@@ -39,3 +39,9 @@ along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowled
 > This project is under active research and development; There will be crashes here and there, as the project is glue between the existing buggy AMD drivers.
 >
 > See repository issues and [our site](https://chefkiss.dev/applehax/nootedred) for more information.
+
+## Documentation
+
+- [Contributing to UserPatches](docs/CONTRIBUTING-USERPATCHES.md) — architecture, adding macOS builds,
+  APU families, patch-data generation, resolver rules, and testing checklist.
+- [Chromium/Electron fix usage](docs/Chromium-Fix-Usage.md) — end-user installation and rollback.

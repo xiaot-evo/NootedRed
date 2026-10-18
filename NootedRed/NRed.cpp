@@ -45,6 +45,7 @@
 #include <Regs/GC.hpp>
 #include <Regs/NBIO.hpp>
 #include <Regs/SMU.hpp>
+#include <UserPatches.hpp>
 #include <X5000.hpp>
 #include <X6000FB.hpp>
 #include <kern/clock.h>
@@ -65,6 +66,8 @@ void NRed::init()
     SYSLOG("NRed", "|-----------------------------------------------------------------|");
 
     Backlight::singleton().init();
+
+    UserPatches::singleton().init();
 
     lilu.onKextLoadForce(&kextRadeonX6000Framebuffer);
     lilu.onKextLoadForce(&kextRadeonX5000HWLibs);
