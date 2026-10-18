@@ -45,3 +45,4 @@ along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowled
 - [Contributing to UserPatches](docs/CONTRIBUTING-USERPATCHES.md) — architecture, adding macOS builds,
   APU families, patch-data generation, resolver rules, and testing checklist.
 - [Chromium/Electron fix usage](docs/Chromium-Fix-Usage.md) — end-user installation and rollback.
+- [Device profile / media capability layer](docs/Device-Profile.md) — graphics + future VDA capability model.

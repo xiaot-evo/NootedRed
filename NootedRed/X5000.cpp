@@ -36,6 +36,7 @@
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <PenguinWizardry/PatcherPlus.hpp>
 #include <X5000.hpp>
+#include <DeviceProfile.hpp>
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSObject.h>
 #include <mach/i386/vm_param.h>
@@ -346,10 +347,12 @@ void X5000::wrapSetupAndInitializeHWCapabilities(void* const self)
 
     FunctionCast(wrapSetupAndInitializeHWCapabilities, singleton().orgGFX9SetupAndInitializeHWCapabilities)(self);
 
+    const auto* const profile = DeviceProfile::current();
+
     singleton().supportedDisplayCountField(self) = 4;
-    singleton().hasUVD0Field(self)               = false;
-    singleton().hasVCEField(self)                = false;
-    singleton().hasVCN0Field(self)               = false;    // TODO
+    singleton().hasUVD0Field(self)               = profile != nullptr && profile->media.hasUVD0;
+    singleton().hasVCEField(self)                = profile != nullptr && profile->media.hasVCE;
+    singleton().hasVCN0Field(self)               = profile != nullptr && profile->media.hasVCN0;
     singleton().hasSDMAPagingQueueField(self)    = false;
     singleton().hasGetAllClockLimitsField(self)  = false;
     if (currentKernelVersion() >= MACOS_10_15) { singleton().dccDisplayableSupportField(self) = true; }

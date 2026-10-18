@@ -23,6 +23,7 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_mach.hpp>
 #include <Headers/kern_util.hpp>
+#include <DeviceProfile.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <UserPatches.hpp>
 #include <libkern/OSTypes.h>
@@ -915,6 +916,16 @@ void UserPatches::registerGLDriverFix(const PagePatch* const patchTable, const s
 
 void UserPatches::processPatcher(KernelPatcher& patcher)
 {
+    const auto* const profile = DeviceProfile::current();
+    if (profile != nullptr) {
+        SYSLOG("UserPatch", "Device profile: %s (family %s)", profile->name,
+               DeviceProfile::familyName(profile->family));
+        if (!profile->graphics.conditionalDualQuad) {
+            SYSLOG("UserPatch", "Graphics policy disables the conditional dual-quad fix for this profile");
+            return;
+        }
+    }
+
     if (this->patches == nullptr || this->patchCount == 0) {
         SYSLOG("UserPatch", "No user-space GL driver patches are configured, not installing any hooks");
         return;
