@@ -46,12 +46,23 @@
 #include <Regs/NBIO.hpp>
 #include <Regs/SMU.hpp>
 #include <UserPatches.hpp>
+#include <VCNBridge.hpp>
+#include <VDA.hpp>
 #include <X5000.hpp>
 #include <X6000FB.hpp>
 #include <kern/clock.h>
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <mach/i386/vm_types.h>
+
+// Generated 15.8.1 user-space VDA patch tables.  They are produced by tools/gen_vda_*_data.py and are only
+// present once the data generation step has been run; the bridge builds and stays inert without them.
+#if __has_include(<VDAVAData.hpp>)
+#include <VDAVAData.hpp>
+#endif
+#if __has_include(<VDAGVAData.hpp>)
+#include <VDAGVAData.hpp>
+#endif
 
 static NRed moduleInstance;
 
@@ -67,7 +78,24 @@ void NRed::init()
 
     Backlight::singleton().init();
 
+#if __has_include(<VDAVAData.hpp>)
+    if constexpr (sizeof(VDAVAData::Patches) / sizeof(VDAVAData::Patches[0]) > 0) {
+        UserPatches::singleton().registerVDAFix(VDAVAData::Patches,
+                                                sizeof(VDAVAData::Patches) / sizeof(VDAVAData::Patches[0]));
+    }
+#endif
+#if __has_include(<VDAGVAData.hpp>)
+    if constexpr (sizeof(VDAGVAData::Patches) / sizeof(VDAGVAData::Patches[0]) > 0) {
+        UserPatches::singleton().registerVDAFix(VDAGVAData::Patches,
+                                                sizeof(VDAGVAData::Patches) / sizeof(VDAGVAData::Patches[0]));
+    }
+#endif
+
     UserPatches::singleton().init();
+
+    VDA::singleton().init();
+
+    VCNBridge::singleton().init();
 
     lilu.onKextLoadForce(&kextRadeonX6000Framebuffer);
     lilu.onKextLoadForce(&kextRadeonX5000HWLibs);
@@ -78,7 +106,7 @@ void NRed::init()
     lilu.onPatcherLoadForce(
         [](void* const, KernelPatcher& patcher)
         {
-            singleton().processPatcher();
+            singleton().processPatcher(patcher);
             DriverInjector::singleton().processPatcher(patcher);
             PenguinWizardry::RuntimeMCManager::singleton().processPatcher(patcher);
         },
@@ -95,6 +123,7 @@ void NRed::init()
             AppleGFXHDA::singleton().processKext(patcher, id, slide, size);
             X5000HWLibs::singleton().processKext(patcher, id, slide, size);
             X5000::singleton().processKext(patcher, id, slide, size);
+            VCNBridge::singleton().processKext(patcher, id, slide, size);
         },
         nullptr);
 }
@@ -149,7 +178,7 @@ void NRed::hwLateInit()
     DBGLOG("NRed", "enumRevision = 0x%X", this->enumRevision);
 }
 
-void NRed::processPatcher()
+void NRed::processPatcher(KernelPatcher& patcher)
 {
     const auto devInfo = DeviceInfo::create();
     assert(devInfo != nullptr);
@@ -201,6 +230,9 @@ void NRed::processPatcher()
         WIOKit::renameDevice(device, name);
         WIOKit::awaitPublishing(device);
     }
+
+    VDA::singleton().processPatcher();
+    UserPatches::singleton().processPatcher(patcher);
 
     DeviceInfo::deleter(devInfo);
 }

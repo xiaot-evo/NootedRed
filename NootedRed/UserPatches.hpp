@@ -86,13 +86,25 @@ public:
     // after `init`, as long as both happen from `NRed::init`.
     void registerGLDriverFix(const PagePatch* patchTable, size_t count);
 
+    // Adds the -NRedVDA user-space patch table (VA driver / AppleGVA).  Same storage/lifetime rules as
+    // `registerGLDriverFix`.  Applied in addition to the GL patches.
+    void registerVDAFix(const PagePatch* patchTable, size_t count);
+
+    // Installs the native page patch backend.  Called from `NRed::processPatcher` once the device ID and
+    // profile are known (it must run before user processes validate pages).
+    void processPatcher(KernelPatcher& patcher);
+
 private:
     // Longest supported replacement, in bytes.
     static constexpr size_t kMaxPatchSize = 32;
 
-    // Amount of distinct pages and per-page sites the native backend supports.
-    static constexpr size_t kMaxNativePages  = 4;
-    static constexpr size_t kMaxSitesPerPage = 4;
+    // Amount of distinct pages and per-page sites the native backend supports.  The VDA tables patch pages
+    // of two shared-cache images, so the limits are larger than the original GL-only backend.
+    static constexpr size_t kMaxNativePages  = 12;
+    static constexpr size_t kMaxSitesPerPage = 16;
+
+    // Maximum combined (GL + VDA) patch entries in the native backend.
+    static constexpr size_t kMaxNativePatches = 64;
 
     // Amount of patches handed over to Lilu's user patcher.
     static constexpr size_t kMaxLiluPatches = 8;
@@ -110,14 +122,30 @@ private:
         const UInt8* image{nullptr};
         NativeSite   sites[kMaxSitesPerPage]{};
         size_t       siteCount{0};
+        bool         vda{false};
     };
 
     const PagePatch* patches{nullptr};
     size_t           patchCount{0};
-    bool             enabled{false};
+
+    struct PatchTable
+    {
+        const PagePatch* table{nullptr};
+        size_t           count{0};
+    };
+
+    PatchTable vdaTables[2]{};
+    size_t     vdaTableCount{0};
+
+    PagePatch nativePatches[kMaxNativePatches]{};
+    bool      nativePatchIsVDA[kMaxNativePatches]{};
+    size_t    nativePatchCount{0};
+    bool      enabled{false};
+    bool      vdaEnabled{false};
 
     NativePage nativePages[kMaxNativePages]{};
     size_t     nativePageCount{0};
+    UInt32     vdaAppliedCount{0};
 
     UserPatcher::BinaryModPatch liluPatches[kMaxLiluPatches]{};
     UserPatcher::BinaryModInfo  liluModInfo{};
@@ -126,7 +154,6 @@ private:
     mach_vm_address_t orgCsValidatePage{0};
     mach_vm_address_t orgCsValidateRange{0};
 
-    void processPatcher(KernelPatcher& patcher);
     auto installUserPatcher() -> bool;
     auto installNativePagePatcher(KernelPatcher& patcher) -> bool;
     auto buildNativePatches() -> bool;

@@ -66,6 +66,10 @@ public:
 
     void processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size);
 
+    // Clears/sets the VCN0 capability on the AMD hardware object.  Used by VCNBridge when the native engine
+    // fails to initialise after the capability was advertised.
+    void setVCN0Capability(void* self, bool enabled);
+
 private:
     static bool   allocateHWEngines(void* self);
     static void   wrapSetupAndInitializeHWCapabilities(void* self);

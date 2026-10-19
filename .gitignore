@@ -6,7 +6,8 @@
 ._*
 
 # Custom folder icons
-Icon
+Icon
+
 
 # Volume root files
 .DocumentRevisions-V100
@@ -59,3 +60,6 @@ compile_commands.json
 ### clangd
 # Cache
 .cache/
+
+# External tester datasets (Apple binaries, nvram, hardware identifiers)
+platform-data/

@@ -46,3 +46,4 @@ along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowled
   APU families, patch-data generation, resolver rules, and testing checklist.
 - [Chromium/Electron fix usage](docs/Chromium-Fix-Usage.md) — end-user installation and rollback.
 - [Device profile / media capability layer](docs/Device-Profile.md) — graphics + future VDA capability model.
+- [Platform data collector](tools/README-collect-platform-data.md) — collect a target machine's drivers, kexts, firmware and capabilities for new macOS/APU support.

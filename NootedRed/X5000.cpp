@@ -37,6 +37,8 @@
 #include <PenguinWizardry/PatcherPlus.hpp>
 #include <X5000.hpp>
 #include <DeviceProfile.hpp>
+#include <VCNBridge.hpp>
+#include <VDA.hpp>
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSObject.h>
 #include <mach/i386/vm_param.h>
@@ -323,9 +325,27 @@ bool X5000::allocateHWEngines(void* const self)
     [[clang::suppress]] singleton().pm4EngineField(self)   = singleton().pm4EngineMC->alloc();
     [[clang::suppress]] singleton().sdma0EngineField(self) = singleton().sdmaEngineMC->alloc();
 
-    // No VCN? :-(
+    // VCN0 is only populated when the opt-in bridge validated both drivers and allocated the native X6000
+    // VCN2 engine.  If allocation fails, make sure the capability does not stay advertised.
+    const auto* const profile = DeviceProfile::current();
+    if (profile != nullptr && profile->media.hasVCN0 && VCNBridge::singleton().isRequested()) {
+        if (auto* const vcn0 = VCNBridge::singleton().allocateEngine(self); vcn0 != nullptr) {
+            (singleton().pm4EngineField + kAMDHWEngineTypeVCN0 * sizeof(void*))(self) = vcn0;
+            // Keep the capability in sync regardless of whether setupAndInitializeHWCapabilities runs before
+            // or after allocateHWEngines in this macOS build.
+            singleton().hasVCN0Field(self) = true;
+        }
+        else {
+            singleton().hasVCN0Field(self) = false;
+        }
+    }
 
     return true;
+}
+
+void X5000::setVCN0Capability(void* const self, const bool enabled)
+{
+    if (self != nullptr) { singleton().hasVCN0Field(self) = enabled; }
 }
 
 // TODO: Replace with IP Discovery?
@@ -349,13 +369,20 @@ void X5000::wrapSetupAndInitializeHWCapabilities(void* const self)
 
     const auto* const profile = DeviceProfile::current();
 
+    // Media engines stay off unless the user opted in with -NRedVDA, the validated 0x1638 profile advertises
+    // VCN0, and the bridge actually enabled/allocated the native engine.  allocateHWEngines() sets the same
+    // capability after a successful allocation, so the result does not depend on the hook ordering.
+    const auto mediaEnabled = VDA::singleton().isRequested() && VCNBridge::singleton().engineEnabled();
+
     singleton().supportedDisplayCountField(self) = 4;
-    singleton().hasUVD0Field(self)               = profile != nullptr && profile->media.hasUVD0;
-    singleton().hasVCEField(self)                = profile != nullptr && profile->media.hasVCE;
-    singleton().hasVCN0Field(self)               = profile != nullptr && profile->media.hasVCN0;
+    singleton().hasUVD0Field(self)               = mediaEnabled && profile != nullptr && profile->media.hasUVD0;
+    singleton().hasVCEField(self)                = mediaEnabled && profile != nullptr && profile->media.hasVCE;
+    singleton().hasVCN0Field(self)               = mediaEnabled && profile != nullptr && profile->media.hasVCN0;
     singleton().hasSDMAPagingQueueField(self)    = false;
     singleton().hasGetAllClockLimitsField(self)  = false;
     if (currentKernelVersion() >= MACOS_10_15) { singleton().dccDisplayableSupportField(self) = true; }
+
+    if (mediaEnabled) { DBGLOG("X5000", "VCN0 media engine enabled from the device profile"); }
 }
 
 // TODO: Investigate why this is needed.

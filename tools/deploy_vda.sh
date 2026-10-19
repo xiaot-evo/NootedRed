@@ -1,0 +1,88 @@
+#!/bin/bash
+# Install the current NootedRed release kext on an OpenCore EFI partition.
+# Usage:
+#   tools/deploy_vda.sh --esp /Volumes/EFI            # install (keeps a timestamped backup)
+#   tools/deploy_vda.sh --esp /Volumes/EFI --restore  # restore the newest timestamped backup
+#   tools/deploy_vda.sh --list-backups --esp /Volumes/EFI
+#
+# This script never reboots and never edits the OpenCore config/boot-args. Add -NRedVDA yourself (see
+# docs/VDA-Deployment.md). Run it from the repository root; it needs sudo for the ESP writes.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="${ROOT}/build/macosx/x86_64/release/NootedRed.kext"
+BACKUP_DIR="${ROOT}/build/efi-backup"
+ESP=""
+ACTION="install"
+
+usage() {
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --esp) ESP="${2:-}"; shift 2 ;;
+        --restore) ACTION="restore"; shift ;;
+        --list-backups) ACTION="list"; shift ;;
+        -h|--help) usage ;;
+        *) echo "unknown argument: $1" >&2; usage ;;
+    esac
+done
+
+if [[ -z "${ESP}" ]]; then
+    echo "missing --esp /Volumes/EFI" >&2
+    exit 1
+fi
+if [[ ! -d "${ESP}/EFI/OC/Kexts" ]]; then
+    echo "not an OpenCore ESP: ${ESP}/EFI/OC/Kexts not found" >&2
+    exit 1
+fi
+
+DST="${ESP}/EFI/OC/Kexts/NootedRed.kext"
+mkdir -p "${BACKUP_DIR}"
+
+# The ESP may be mounted with noowners and be writable by the current user; only use sudo when needed.
+SUDO=""
+if [[ ! -w "${ESP}/EFI/OC/Kexts" ]]; then
+    SUDO="sudo"
+fi
+
+case "${ACTION}" in
+    list)
+        ls -1dt "${BACKUP_DIR}"/NootedRed-*.kext 2>/dev/null || echo "no backups"
+        ;;
+    restore)
+        BACKUP="$(ls -1dt "${BACKUP_DIR}"/NootedRed-*.kext 2>/dev/null | head -n1 || true)"
+        if [[ -z "${BACKUP}" ]]; then
+            echo "no backup found in ${BACKUP_DIR}" >&2
+            exit 1
+        fi
+        echo "restoring ${BACKUP} -> ${DST}"
+        ${SUDO} rm -rf "${DST}"
+        ${SUDO} ditto "${BACKUP}" "${DST}"
+        echo "restored; reboot to apply"
+        ;;
+    install)
+        if [[ ! -d "${SRC}" ]]; then
+            echo "missing build artifact: ${SRC}" >&2
+            echo "run: DEVELOPER_DIR=/Library/Developer/CommandLineTools xmake f -m release -y" >&2
+            echo "     DEVELOPER_DIR=/Library/Developer/CommandLineTools xmake -y" >&2
+            exit 1
+        fi
+        NEW_HASH="$(shasum -a 256 "${SRC}/Contents/MacOS/NootedRed" | awk '{print $1}')"
+        echo "new kext SHA-256: ${NEW_HASH}"
+        if [[ -d "${DST}" ]]; then
+            OLD_HASH="$(shasum -a 256 "${DST}/Contents/MacOS/NootedRed" | awk '{print $1}')"
+            STAMP="$(date +%Y%m%d-%H%M%S)"
+            BACKUP="${BACKUP_DIR}/NootedRed-${STAMP}.kext"
+            echo "backing up current kext (${OLD_HASH}) -> ${BACKUP}"
+            ${SUDO} ditto "${DST}" "${BACKUP}"
+        fi
+        echo "installing -> ${DST}"
+        ${SUDO} rm -rf "${DST}"
+        ${SUDO} ditto "${SRC}" "${DST}"
+        echo "installed. Add -NRedVDA to boot-args for the VDA experiment, then reboot."
+        echo "boot once without -NRedVDA first to confirm the default-off path is still green."
+        ;;
+esac

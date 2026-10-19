@@ -25,6 +25,9 @@
 
 static const char* pathRadeonX6000Framebuffer =
     "/System/Library/Extensions/AMDRadeonX6000Framebuffer.kext/Contents/MacOS/AMDRadeonX6000Framebuffer";
+// The VCN2 engine lives in the X6000 accelerated driver.  A normal Renoir boot does not load it; VCNBridge
+// requests it from inside the X5000 accelerator start when -NRedVDA is set.
+static const char* pathRadeonX6000 = "/System/Library/Extensions/AMDRadeonX6000.kext/Contents/MacOS/AMDRadeonX6000";
 static const char* pathRadeonX5000HWLibs = "/System/Library/Extensions/AMDRadeonX5000HWServices.kext/Contents/PlugIns/"
                                            "AMDRadeonX5000HWLibs.kext/Contents/MacOS/AMDRadeonX5000HWLibs";
 static const char* pathRadeonX5000 = "/System/Library/Extensions/AMDRadeonX5000.kext/Contents/MacOS/AMDRadeonX5000";
@@ -37,6 +40,10 @@ static const char* pathAppleGFXHDA = "/System/Library/Extensions/AppleGFXHDA.kex
 KernelPatcher::KextInfo kextRadeonX6000Framebuffer{
     "com.apple.kext.AMDRadeonX6000Framebuffer", &pathRadeonX6000Framebuffer, 1, {true}, {},
     KernelPatcher::KextInfo::Unloaded,
+};
+
+KernelPatcher::KextInfo kextRadeonX6000{
+    "com.apple.kext.AMDRadeonX6000", &pathRadeonX6000, 1, {true}, {}, KernelPatcher::KextInfo::Unloaded,
 };
 
 KernelPatcher::KextInfo kextRadeonX5000HWLibs{
