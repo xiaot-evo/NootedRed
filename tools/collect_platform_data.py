@@ -34,11 +34,17 @@ MTL_IMAGE = "AMDRadeonX5000MTLDriver"
 PAGE = 0x1000
 KEXT_PATTERNS = [
     "AMDRadeonX5000*.kext",
-    "AMDRadeonX6000Framebuffer.kext",
-    "AMDRadeonX6000*.kext",
     "AMDRadeonX5000*.bundle",
+    "AMDRadeonX6000Framebuffer.kext",
 ]
 MEDIA_PATTERNS = ["VCN", "VCE", "UVD", "VideoToolbox", "VTDecoder", "AV1", "HEVC", "H264"]
+
+# The GL/MTL driver binaries are collected separately (the MTL one from the shared cache); do not
+# duplicate their multi-megabyte Resources in the kext section.
+SKIP_KEXT_BUNDLES = {"AMDRadeonX5000GLDriver.bundle", "AMDRadeonX5000MTLDriver.bundle"}
+FIRMWARE_EXTENSIONS = {".dat", ".bin", ".fw", ".txt", ".md", ".json", ".yaml", ".yml"}
+MAX_RESOURCE_BYTES = 8 * 1024 * 1024
+MAX_IOREG_CHARS = 512 * 1024
 
 
 def run(cmd: list[str], timeout: int = 30) -> str:
@@ -139,11 +145,24 @@ def add_text(root: Path, name: str, text: str):
     (root / name).write_text(text, errors="replace")
 
 
-def _copy_bundle(root: Path, bundle: Path, kept: list[dict], seen: set[Path]):
+def filter_ioreg(text: str, keys: tuple[str, ...]) -> str:
+    lines = []
+    for line in text.splitlines():
+        if "IOKitDiagnostics" in line or len(line) > 4000:
+            continue
+        if any(key.lower() in line.lower() for key in keys):
+            lines.append(line)
+    return "\n".join(lines)[:MAX_IOREG_CHARS]
+
+
+def _copy_bundle(root: Path, bundle: Path, kept: list[dict], seen: set[Path], full: bool,
+                 skipped: list[str]):
     resolved = bundle.resolve()
     if resolved in seen:
         return
     seen.add(resolved)
+    if bundle.name in SKIP_KEXT_BUNDLES:
+        return
     info = bundle / "Contents" / "Info.plist"
     binary_dir = bundle / "Contents" / "MacOS"
     resources = bundle / "Contents" / "Resources"
@@ -162,30 +181,44 @@ def _copy_bundle(root: Path, bundle: Path, kept: list[dict], seen: set[Path]):
         resource_dest = dest / "Resources"
         resource_dest.mkdir(exist_ok=True)
         for resource in sorted(resources.iterdir()):
-            if resource.is_file() and resource.stat().st_size < 32 * 1024 * 1024:
-                (resource_dest / resource.name).write_bytes(resource.read_bytes())
-    if binaries:
-        kept.append({"name": bundle.name, "binary": binaries[0].name, "path": str(bundle)})
+            if not resource.is_file():
+                continue
+            if not full and (resource.suffix.lower() not in FIRMWARE_EXTENSIONS
+                             or resource.stat().st_size > MAX_RESOURCE_BYTES):
+                skipped.append(str(resource))
+                continue
+            if resource.stat().st_size > MAX_RESOURCE_BYTES:
+                skipped.append(str(resource))
+                continue
+            (resource_dest / resource.name).write_bytes(resource.read_bytes())
+    kept.append({
+        "name": bundle.name,
+        "binary": binaries[0].name if binaries else None,
+        "path": str(bundle),
+    })
     plugins = bundle / "Contents" / "PlugIns"
     if plugins.is_dir():
         for plugin in sorted(plugins.glob("*.kext")):
-            _copy_bundle(root, plugin, kept, seen)
+            _copy_bundle(root, plugin, kept, seen, full, skipped)
 
 
-def collect_kexts(root: Path) -> list[dict]:
+def collect_kexts(root: Path, full: bool) -> tuple[list[dict], list[str]]:
     kept: list[dict] = []
     seen: set[Path] = set()
+    skipped: list[str] = []
     extension_root = Path("/System/Library/Extensions")
     for pattern in KEXT_PATTERNS:
         for bundle in sorted(extension_root.glob(pattern)):
-            _copy_bundle(root, bundle, kept, seen)
-    return kept
+            _copy_bundle(root, bundle, kept, seen, full, skipped)
+    return kept, skipped
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="NootedRed-platform-data.zip")
     parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--full", action="store_true",
+                        help="include all kext resources (larger zip; not needed for normal analysis)")
     args = parser.parse_args()
 
     cache_dir = args.cache_dir
@@ -211,19 +244,13 @@ def main() -> None:
     add_text(root, "csrutil.txt", run(["csrutil", "status"]))
     add_text(root, "nvram.txt", run(["nvram", "-p"]))
     ioreg = run(["ioreg", "-lw0"])
-    add_text(root, "ioreg-gpu.txt", "\n".join(
-        line for line in ioreg.splitlines()
-        if "IOKitDiagnostics" not in line and len(line) < 4000
-        and any(key.lower() in line.lower() for key in ("AMDRadeonX5000", "AMDRadeonX6000", "GPUConfigurationVariable"))
-    ))
-    add_text(root, "ioreg-media.txt", "\n".join(
-        line for line in ioreg.splitlines()
-        if "IOKitDiagnostics" not in line and len(line) < 4000
-        and any(key.lower() in line.lower() for key in MEDIA_PATTERNS)
-    ))
+    add_text(root, "ioreg-gpu.txt", filter_ioreg(ioreg, ("AMDRadeonX5000", "AMDRadeonX6000",
+                                                          "GPUConfigurationVariable")))
+    add_text(root, "ioreg-media.txt", filter_ioreg(ioreg, tuple(MEDIA_PATTERNS)))
     for class_name in ("AMDRadeonX5000_AMDGFX9Hardware", "AMDRadeonX5000_AMDHWInfo",
                        "AMDRadeonX5000_AMDHWRegisters"):
-        add_text(root, f"ioreg-{class_name}.txt", run(["ioreg", "-lw0", "-c", class_name]))
+        add_text(root, f"ioreg-{class_name}.txt",
+                 filter_ioreg(run(["ioreg", "-lw0", "-c", class_name]), (class_name, "IOClass")))
     add_text(root, "coremedia-defaults.txt", run(["defaults", "read", "com.apple.coremedia"]))
     add_text(root, "videotoolbox-ffmpeg.txt", run(["ffmpeg", "-hide_banner", "-hwaccels"]))
 
@@ -257,12 +284,23 @@ def main() -> None:
              "\n".join(f"{value:#x} {kind} {name}" for value, kind, name in symbols))
 
     # Relevant kexts and firmware
-    add_text(root, "kexts.json", json.dumps(collect_kexts(root), indent=2))
+    kept_kexts, skipped_resources = collect_kexts(root, args.full)
+    add_text(root, "kexts.json", json.dumps(kept_kexts, indent=2))
 
-    # Hashes of every payload
+    # Manifest and hashes of every payload
+    manifest = {
+        "tool": "collect_platform_data.py",
+        "generated": run(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"]).strip(),
+        "full_resources": args.full,
+        "cache_dir": str(cache_dir),
+        "kexts": kept_kexts,
+        "skipped_resource_count": len(skipped_resources),
+        "skipped_resources": skipped_resources[:200],
+    }
+    add_text(root, "manifest.json", json.dumps(manifest, indent=2))
     hashes = []
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path.name != "hashes.txt":
+        if path.is_file() and path.name not in ("hashes.txt", "manifest.json"):
             hashes.append(f"{sha256(path.read_bytes())}  {path.relative_to(root)}")
     (root / "hashes.txt").write_text("\n".join(hashes) + "\n")
 

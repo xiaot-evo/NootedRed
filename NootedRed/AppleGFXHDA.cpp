@@ -34,6 +34,28 @@ static constexpr UInt32 RenoirHDMIDeviceID = 0x1637;
 
 static AppleGFXHDA moduleInstance;
 
+namespace
+{
+
+    // A function that another plugin already routed has a jump written at its entry: EB rel8 (short), E9 rel32
+    // (long) or FF 25 (Lilu's slotted long jump).  Lilu refuses to mix jump types on one function and panics
+    // from inside routeMultipleLong, so detect the previous route and leave that symbol alone.  AppleALC is
+    // known to route AppleGFXHDAController::probe, which otherwise makes NootedRed panic during boot.
+    bool isAlreadyRouted(KernelPatcher& patcher, const size_t id, const char* const symbol,
+                         const mach_vm_address_t slide, const size_t size)
+    {
+        const auto from = patcher.solveSymbol(id, symbol, slide, size);
+        if (from == 0) {
+            patcher.clearError();
+            return false;
+        }
+
+        const auto* const bytes = reinterpret_cast<const UInt8*>(from);
+        return bytes[0] == 0xE9 || bytes[0] == 0xEB || (bytes[0] == 0xFF && bytes[1] == 0x25);
+    }
+
+}    // namespace
+
 AppleGFXHDA& AppleGFXHDA::singleton() { return moduleInstance; }
 
 void AppleGFXHDA::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t slide, size_t size)
@@ -48,14 +70,29 @@ void AppleGFXHDA::processKext(KernelPatcher& patcher, size_t id, mach_vm_address
     };
     PANIC_COND(!patcher.solveMultiple(id, solveRequests, slide, size, true), "AGFXHDA", "Failed to solve symbols");
 
-    KernelPatcher::RouteRequest requests[] = {
+    // Another plugin (AppleALC routes AppleGFXHDAController::probe) may have installed a short jump on a
+    // symbol we also route.  Lilu panics when a long multiroute is attempted on top of a short route, so
+    // filter the already-routed symbols out; the plugin that owns them keeps handling them.
+    KernelPatcher::RouteRequest routeRequests[] = {
         {"__ZN21AppleGFXHDAController5probeEP9IOServicePi", wrapProbe, this->orgProbe},
         {"__ZN31AppleGFXHDAFunctionGroupFactory27createAppleHDAFunctionGroupEP11DevIdStruct",
          wrapCreateAppleHDAFunctionGroup, this->orgCreateAppleHDAFunctionGroup},
         {"__ZN24AppleGFXHDAWidgetFactory20createAppleHDAWidgetEP11DevIdStruct", wrapCreateAppleHDAWidget,
          this->orgCreateAppleHDAWidget},
     };
-    PANIC_COND(!patcher.routeMultipleLong(id, requests, slide, size), "AGFXHDA", "Failed to route symbols");
+
+    auto routed = true;
+    for (auto& request : routeRequests) {
+        if (isAlreadyRouted(patcher, id, request.symbol, slide, size)) {
+            SYSLOG("AGFXHDA", "`%s` is already routed by another plugin; leaving it to that plugin",
+                   request.symbol);
+            continue;
+        }
+
+        routed &= patcher.routeMultipleLong(id, &request, 1, slide, size);
+    }
+
+    PANIC_COND(!routed, "AGFXHDA", "Failed to route symbols");
 }
 
 IOService* AppleGFXHDA::wrapProbe(IOService* that, IOService* provider, SInt32* score)

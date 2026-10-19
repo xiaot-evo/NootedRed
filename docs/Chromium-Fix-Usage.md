@@ -163,6 +163,15 @@ Enabling user-space GL driver patches (experimental)
 Patched ... site(s) ...
 ```
 
+当前 `master` 还会打印兼容性诊断（`-NRedGLFix` 开启时）：
+
+```text
+Compat: profile="Renoir/Green Sardine" family="Green Sardine" level=experimental device=0x1638 ...
+```
+
+> 驱动二进制 `LC_UUID` 的捕获推迟到 M2：早期的 VFS 读取版本会在 Lilu patcher-load 阶段读文件，
+> 已作为启动卡住的嫌疑点移除，当前构建不会再出现 `target identity` 行。
+
 如果没有任何 `UserPatch` 日志，先检查 boot-args 和 kext 是否加载。
 
 ### 3. 实际应用

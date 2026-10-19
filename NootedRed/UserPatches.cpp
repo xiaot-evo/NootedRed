@@ -27,6 +27,7 @@
 #include <NRed.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <UserPatches.hpp>
+#include <TahoePatchData.hpp>
 #include <VCNBridge.hpp>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSTypes.h>
@@ -883,6 +884,46 @@ static const UInt8 kGLDriverDualQuadPage[] = {
     };
     constexpr size_t kGLDriverPatchCount = arrsize(kGLDriverPatches);
 
+    // macOS 26.7.1 (Darwin 25.6.0) GL driver.  The driver layout moved: _gfx9_HwInfoInitData is at
+    // 0xDF80 and _glrAMD_GFX9_UpdateHwCbDualQuadMode at 0x819E, so the 15.8.1 page images cannot match.
+    // Only the GL driver is covered here; the Metal 26.7.1 sites still need validation.
+    static const UserPatches::PagePatch kTahoeGLDriverPatches[] = {
+        {UserPatcher::FileSegment::SegmentTextText, kTahoeGLHwInfoPage,    kGLDriverHwInfoFind,
+         kGLDriverHwInfoReplace,                    sizeof(kGLDriverHwInfoFind),   0, 1},
+        {UserPatcher::FileSegment::SegmentTextText, kTahoeGLDualQuadPage,  kGLDriverDualQuadFind,
+         kGLDriverDualQuadReplace,                  sizeof(kGLDriverDualQuadFind), 1, 1},
+        // The Metal pipeline context moved the CB_COLOR_CONTROL boolean write to +0xE4; patch the
+        // direct boolean assignment (and edx,~1 -> or edx,1) rather than the old 15.8.1 gate/setz pair.
+        {UserPatcher::FileSegment::SegmentTextText, kTahoeMTLControlPage, kTahoeMTLDualQuadFind,
+         kTahoeMTLDualQuadReplace,                  sizeof(kTahoeMTLDualQuadFind), 0, 1},
+    };
+    constexpr size_t kTahoeGLDriverPatchCount = arrsize(kTahoeGLDriverPatches);
+
+    // Version/family-aware patch sets.  Add one entry per validated macOS build; the exact page images
+    // still gate every site, so a set from another build can never modify a mismatched driver page.
+    // `15.8.1` is Darwin 24.6.0 (macOS 15.8.1, build 24H32).
+    static const UserPatches::PatchSet kGLDriverPatchSets[] = {
+        // Family-specific entries first: all current gfx9 APUs share the same page data, but keeping
+        // them separate lets a future family diverge without changing the selection code.
+        {"15.8.1 / Renoir-family", PenguinWizardry::KernelVersion(24, 6), PenguinWizardry::KernelVersion(24, 6),
+         static_cast<UserPatches::ApuMask>(UserPatches::kApuRenoir | UserPatches::kApuRenoirE |
+                                           UserPatches::kApuGreenSardine),
+         kGLDriverPatches, kGLDriverPatchCount},
+        {"15.8.1 / Raven-family", PenguinWizardry::KernelVersion(24, 6), PenguinWizardry::KernelVersion(24, 6),
+         static_cast<UserPatches::ApuMask>(UserPatches::kApuRaven | UserPatches::kApuRaven2 |
+                                           UserPatches::kApuPicasso),
+         kGLDriverPatches, kGLDriverPatchCount},
+        // Generic fallback for the case where APU attributes are not populated yet.  It is deliberately
+        // last so a known family always wins.
+        {"15.8.1 / gfx9 APU fallback", PenguinWizardry::KernelVersion(24, 6),
+         PenguinWizardry::KernelVersion(24, 6), UserPatches::kApuAll, kGLDriverPatches,
+         kGLDriverPatchCount},
+        // macOS 26.7.1 (Darwin 25.6.0).  Exact page images make this a no-op on any other driver build.
+        {"26.7.1 / gfx9 APU", PenguinWizardry::KernelVersion(25, 6), PenguinWizardry::KernelVersion(25, 6),
+         UserPatches::kApuAll, kTahoeGLDriverPatches, kTahoeGLDriverPatchCount},
+    };
+    constexpr size_t kGLDriverPatchSetCount = sizeof(kGLDriverPatchSets) / sizeof(kGLDriverPatchSets[0]);
+
 }    // namespace
 
 UserPatches& UserPatches::singleton() { return moduleInstance; }
@@ -890,9 +931,9 @@ UserPatches& UserPatches::singleton() { return moduleInstance; }
 void UserPatches::init()
 {
     // `registerGLDriverFix` may already have been called; do not overwrite a custom table then.
-    if (this->patches == nullptr && this->patchCount == 0) {
-        this->patches    = kGLDriverPatches;
-        this->patchCount = kGLDriverPatchCount;
+    if (this->patches == nullptr && this->patchCount == 0 && this->patchSets == nullptr) {
+        this->patchSets     = kGLDriverPatchSets;
+        this->patchSetCount = kGLDriverPatchSetCount;
     }
 
     this->enabled = kGLFixDefaultEnabled;
@@ -914,6 +955,69 @@ void UserPatches::registerGLDriverFix(const PagePatch* const patchTable, const s
 {
     this->patches    = patchTable;
     this->patchCount = count;
+    this->patchSets  = nullptr;
+    this->patchSetCount = 0;
+}
+
+void UserPatches::registerPatchSets(const PatchSet* const sets, const size_t count)
+{
+    this->patchSets     = sets;
+    this->patchSetCount = count;
+    this->patches       = nullptr;
+    this->patchCount    = 0;
+}
+
+auto UserPatches::currentApuMask() const -> ApuMask
+{
+    const auto& attributes = NRed::singleton().getAttributes();
+
+    UInt8 mask = 0;
+    if (attributes.isRaven2()) { mask |= kApuRaven2; }
+    if (attributes.isPicasso()) { mask |= kApuPicasso; }
+    if (attributes.isRenoir()) { mask |= kApuRenoir; }
+    if (attributes.isRenoirE()) { mask |= kApuRenoirE; }
+    if (attributes.isGreenSardine()) { mask |= kApuGreenSardine; }
+
+    // NRed leaves the attributes empty for the base Raven (0x15DD); model that explicitly.  A zero
+    // device ID means NRed has not populated its device information yet, so return an unknown mask and
+    // let the selector use the generic fallback rather than guessing a family.
+    if (mask == 0) {
+        if (NRed::singleton().getDeviceID() == 0x15DD) { mask = kApuRaven; }
+        else if (NRed::singleton().getDeviceID() == 0) { return static_cast<ApuMask>(0); }
+    }
+
+    return static_cast<ApuMask>(mask);
+}
+
+void UserPatches::selectPatchSet()
+{
+    if (this->patches != nullptr || this->patchCount != 0) { return; }
+    if (this->patchSets == nullptr || this->patchSetCount == 0) { return; }
+
+    const auto version = currentKernelVersion();
+    const auto apus    = static_cast<UInt8>(this->currentApuMask());
+
+    for (size_t index = 0; index < this->patchSetCount; index++) {
+        const auto& set = this->patchSets[index];
+        if (version < set.minVersion || version > set.maxVersion) { continue; }
+
+        // An unknown APU (zero mask) may only use the generic fallback, never a family-specific set.
+        if (apus == 0) {
+            if (set.apus != UserPatches::kApuAll) { continue; }
+        }
+        else if ((static_cast<UInt8>(set.apus) & apus) == 0) {
+            continue;
+        }
+
+        this->patches    = set.patches;
+        this->patchCount = set.count;
+        SYSLOG("UserPatch", "Selected patch set \"%s\" for macOS %u.%u / APU mask 0x%02X", set.name,
+               version.major(), version.minor(), apus);
+        return;
+    }
+
+    SYSLOG("UserPatch", "No patch set matches macOS %u.%u / APU mask 0x%02X; not installing any user patches",
+           version.major(), version.minor(), apus);
 }
 
 void UserPatches::registerVDAFix(const PagePatch* const patchTable, const size_t count)
@@ -938,13 +1042,16 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
     const auto* const profile = DeviceProfile::current();
     auto              glEnabled = this->enabled;
     if (profile != nullptr) {
-        SYSLOG("UserPatch", "Device profile: %s (family %s)", profile->name,
-               DeviceProfile::familyName(profile->family));
+        SYSLOG("UserPatch", "Device profile: %s (family %s, level %s)", profile->name,
+               DeviceProfile::familyName(profile->family), DeviceProfile::levelName(profile->level));
         if (!profile->graphics.conditionalDualQuad) {
             SYSLOG("UserPatch", "Graphics policy disables the conditional dual-quad fix for this profile");
             glEnabled = false;
         }
     }
+
+    // Pick the version/family-aware GL patch set before the native page list is built from it.
+    if (glEnabled) { this->selectPatchSet(); }
 
     // Build the native page list from whichever tables are enabled.  The VDA tables only exist on macOS 11
     // and newer, where the native backend is the one being used, and only for the validated 0x1638 profile.
@@ -972,9 +1079,7 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
                 append(this->vdaTables[i].table, this->vdaTables[i].count, true);
             }
         }
-    }
 
-    if (currentKernelVersion() >= MACOS_11) {
         if (this->nativePatchCount == 0) {
             SYSLOG("UserPatch", "No user-space driver patches are configured, not installing any hooks");
             return;
@@ -1103,7 +1208,8 @@ auto UserPatches::buildNativePatches() -> bool
         }
 
         if (placed != patch.count) {
-            SYSLOG("UserPatch", "Failed to locate all occurrences of patch %zu (%zu missing); refusing the native page table",
+            SYSLOG("UserPatch",
+                   "Failed to locate all occurrences of patch %zu (%zu missing); refusing the native page table",
                    patchIndex, patch.count - placed);
             return false;
         }
@@ -1117,7 +1223,8 @@ auto UserPatches::buildNativePatches() -> bool
 
         if (page == nullptr) {
             if (this->nativePageCount >= kMaxNativePages) {
-                SYSLOG("UserPatch", "Too many distinct pages for the native backend (%zu); refusing the native page table",
+                SYSLOG("UserPatch",
+                       "Too many distinct pages for the native backend (%zu); refusing the native page table",
                        kMaxNativePages);
                 return false;
             }
@@ -1129,7 +1236,8 @@ auto UserPatches::buildNativePatches() -> bool
         }
 
         if (page->siteCount + patch.count > kMaxSitesPerPage) {
-            SYSLOG("UserPatch", "Too many patch sites on a single page (%zu + %zu > %zu); refusing the native page table",
+            SYSLOG("UserPatch",
+                   "Too many patch sites on a single page (%zu + %zu > %zu); refusing the native page table",
                    page->siteCount, patch.count, kMaxSitesPerPage);
             return false;
         }

@@ -32,6 +32,34 @@ identifiers.
 
 The archive is untrusted external data and is not executed. Use it only for offline analysis.
 
+## 2026-10-19 — macOS 26.7.1 (25G241), Renoir 0x1638
+
+| Field | Value |
+| --- | --- |
+| macOS | 26.7.1 (25G241) |
+| Darwin | 25.6.0 |
+| CPU | 8-Core Intel Xeon W (spoofed) |
+| GPU | AMD Radeon RX Renoir Graphics |
+| Device ID | `0x1638` |
+| Revision | `0xc5` |
+| Archive | `NootedRed-master-data-full.zip` |
+| Archive SHA-256 | `b45d3f6a4cf3eda5089965a82a45bdd167065820ec9820155acb7ec6123f188b` |
+| Collection mode | `--full` |
+| Local path | `platform-data/2026-10-19_macos-26.7.1_25G241_8-Core-Intel-Xeon-W_0x1638/` |
+
+### Cross-dataset validation
+
+The 0x164c and 0x1638 datasets have byte-identical GL and MTL driver payloads:
+
+```text
+GLDriver.bin  ce205f063627a4b82ee8ccee04ab7963a3efb8dec488cb3c53ed6c6719434f80
+MTL-image.bin fd46d5864a1b4c2e290b01b9c2676f6d91026ba58505b0a8393d35483afb74b4
+```
+
+This confirms that for macOS 26.7.1 build 25G241, the same exact page images and PatchSet work for
+Renoir/Green Sardine `0x164c` and `0x1638`; APU-specific selection belongs in DeviceProfile, not in
+per-driver page data.
+
 ## Adding a dataset
 
 1. Copy the archive under `platform-data/<date>_<os>_<cpu>_<device-id>/`.

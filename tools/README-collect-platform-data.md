@@ -8,13 +8,17 @@ DeviceProfile and PatchSet tables. It does **not** install or patch anything.
 - Run on the target macOS install.
 - Python 3 (`/usr/bin/python3`, Xcode CLT, Homebrew, or python.org).
 - No root required.
-- Enough free space for a ~20–50 MB zip.
+- Enough free space for a ~5 MB zip (default optimized profile).
 
 ## Usage
 
 ```sh
 python3 tools/collect_platform_data.py --out NootedRed-platform-data.zip
 ```
+
+The default profile keeps the analysis-critical data and skips huge Metal resources (MPS/Tensile/
+`.builtin` runtime blobs). Use `--full` only when those resources are specifically needed; the zip can
+grow to ~40 MB.
 
 If the dyld cache is not auto-detected:
 
@@ -35,7 +39,7 @@ hardware profile.
 - `AMDRadeonX5000MTLDriver` `__TEXT`, load commands and the full symbol table from the dyld cache;
 - relevant X5000/X6000 kexts, plug-ins, Info.plists and firmware resources;
 - filtered ioreg GPU/media data, VideoToolbox/CoreMedia defaults and `ffmpeg -hwaccels` (if installed);
-- SHA-256 hashes for every payload.
+- `manifest.json` and SHA-256 hashes for every payload, including skipped large resources.
 
 ## Privacy
 
@@ -49,3 +53,15 @@ project.
 2. Add a DeviceProfile entry if the APU is new.
 3. Locate the GL/MTL patch sites for that build; generate a PatchSet/signatures.
 4. Build, install, reboot, and verify on that machine.
+
+## Importing a dataset
+
+Use the importer to verify the archive and normalize its metadata into the local dataset archive:
+
+```sh
+python3 tools/import_platform_data.py NootedRed-platform-data.zip
+```
+
+It writes `platform-data/<date>_<os>_<build>_<cpu>_<device>/` with the archive, `SHA256`,
+`dataset.json`, extracted metadata and driver images. `platform-data/` is gitignored because it
+contains Apple binaries and hardware identifiers.

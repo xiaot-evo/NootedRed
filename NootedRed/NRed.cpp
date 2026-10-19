@@ -24,6 +24,7 @@
 #include <AppleGFXHDA.hpp>
 #include <Backlight.hpp>
 #include <DebugEnabler.hpp>
+#include <DeviceProfile.hpp>
 #include <DriverInjector.hpp>
 #include <GPUDriversAMD/ATOMBIOS.hpp>
 #include <GPUDriversAMD/CAIL/Result.hpp>
@@ -201,6 +202,9 @@ void NRed::processPatcher(KernelPatcher& patcher)
     this->iGPU->setProperty("hda-gfx", hdaGfxBytes, sizeof(hdaGfxBytes));
 
     this->deviceID = static_cast<UInt16>(WIOKit::readPCIConfigValue(this->iGPU, WIOKit::kIOPCIConfigDeviceID));
+    // Legacy attribute mapping kept for the existing hardware paths (X5000/HWLibs).  The compatibility
+    // layer's source of truth for family and capability is DeviceProfile, which distinguishes Cezanne and
+    // Barcelo explicitly (see docs/Compatibility-Architecture.md).
     switch (this->deviceID) {
         case 0x15D8: {
             this->attributes.setPicasso();
@@ -222,6 +226,10 @@ void NRed::processPatcher(KernelPatcher& patcher)
     }
     this->pciRevision = static_cast<UInt8>(WIOKit::readPCIConfigValue(this->iGPU, WIOKit::kIOPCIConfigRevisionID));
 
+    // One canonical compatibility line per boot; it also publishes the facts as IORegistry properties so a
+    // user report is triageable without a custom build.
+    DeviceProfile::logCurrent();
+
     char name[128];
     for (size_t i = 0, ii = 0; i < devInfo->videoExternal.size(); i++) {
         auto device = OSDynamicCast(IOPCIDevice, devInfo->videoExternal[i].video);
@@ -240,7 +248,12 @@ void NRed::processPatcher(KernelPatcher& patcher)
     DeviceInfo::deleter(devInfo);
 }
 
-void NRed::setProp32(const char* const key, const UInt32 value) const { this->iGPU->setProperty(key, value, 32); }
+void NRed::setProp32(const char* const key, const UInt32 value) const
+{
+    if (this->iGPU == nullptr) { return; }
+
+    this->iGPU->setProperty(key, value, 32);
+}
 
 UInt32 NRed::readReg32(const UInt32 reg) const
 {
