@@ -23,15 +23,30 @@ default-off boot and the wider acceptance matrix (Chromium, DRM, 10-bit, other A
   path clears readiness and keeps the normal graphics-only state; the new code has no panic path. A hang in
   Apple's engine/power path remains the hardware risk and is covered by the staged runbook.
 - Phase 4 (user space): `tools/gen_vda_va_data.py` and `tools/gen_vda_gva_data.py` derive the 15.8.1
-  `AMDRadeonVADriver2` and AppleGVA patches (6 + 1 patch records, 6 page images). `UserPatches` now
+  `AMDRadeonVADriver2` and AppleGVA patches (9 + 1 patch records, 9 page images; the last three VA
+  records are the follow-up encode feedback-stride fixes). `UserPatches` now
   supports multiple patch tables, applies the VA/GVA tables only when `-NRedVDA` is set, the target is
   0x1638 and the kernel VCN bridge has prepared/loaded both drivers, and keeps the GL table behaviour
   unchanged. A failed native engine hardware-init disables the bridge and clears `hasVCN0`.
 - Default behaviour is unchanged: without `-NRedVDA` no VCN engine, capability, property or user-space
   hook is installed by the new code.
 - Builds pass in release, debug and releasedbg (CommandLineTools toolchain on this machine).
-- Hardware/reboot validation is pending; the deployment and rollback steps are in
+- Hardware/reboot validation passed on 2026-10-19; the deployment and rollback steps are in
   [`VDA-Deployment.md`](VDA-Deployment.md).
+
+### Post-validation hardening (2026-10-19 code review)
+
+- X5000 accelerator `stop` is routed as well as `start`; teardown clears `engineAllocated`, the X5000
+  hardware handle and the media properties without touching a possibly-destroyed hardware object. A later
+  start can allocate a fresh engine.
+- The native page backend matches a first-word fingerprint before the full 4 KiB image, installs the
+  combined table atomically (no zero-site/partial pages), and counts applied VDA pages atomically.
+- `-NRedVDA` is rejected unless the running kernel is exactly 15.8.1 24H32 and there is no external video
+  device. The exact build string is checked at accelerator-start time, because the early kext-load phase can
+  run before `osversion` is populated; if it is still empty there, the ABI guards remain the protection.
+  The native backend also rechecks the external-device condition before building VDA pages.
+- The VA/AppleGVA generators recover stock pages from the committed tables while the runtime page cache is
+  patched; the VA generator verifies the stock `__text` hash in `--check`.
 
 ### Bring-up log
 
@@ -54,7 +69,8 @@ default-off boot and the wider acceptance matrix (Chromium, DRM, 10-bit, other A
   software YUV output byte-for-byte. Hardware decode is working on the target. Evidence and caveats:
   [`analysis/vda-1581-hardware-validation.md`](../analysis/vda-1581-hardware-validation.md). A follow-up
   found hardware encode (`h264_videotoolbox`/`hevc_videotoolbox`) failing with -12704 and added the VCN2
-  feedback-stride patches; that build is deployed and awaits a reboot test (decode is unchanged).
+  feedback-stride patches; after the reboot both encoders produced decodable 720p/1080p files and the
+  VideoProc probe path is ready for a GUI re-check (decode is unchanged).
 
 ## Prior art and chosen direction
 
@@ -175,9 +191,10 @@ call-site data. The runtime ring/submit and watchdog behaviour is hardware-only.
 
 ### Phase 4 — VideoToolbox/VDA exposure — implemented and validated on 0x1638
 
-Status: 15.8.1 VA (6 records / 5 pages) and AppleGVA (1 record / 1 page) patches are generated and
+Status: 15.8.1 VA (9 records / 8 pages) and AppleGVA (1 record / 1 page) patches are generated and
 integrated into `UserPatches`; they are only applied when `-NRedVDA` is set, the profile is `0x1638` and
-the kernel VCN bridge reports ready. End-to-end VideoToolbox selection/decode needs hardware validation.
+the kernel VCN bridge reports ready. End-to-end VideoToolbox selection/decode and hardware encode are
+validated on the target.
 
 - Generate 15.8.1 user-space patches for the AppleGVA decoder-selection path and
   `AMDRadeonVADriver2` (`VAAcceleratorInfo::identify` with per-device `vaFamily=5`, `VAFactory::create*`,

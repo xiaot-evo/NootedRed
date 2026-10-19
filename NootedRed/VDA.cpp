@@ -69,6 +69,7 @@ void VDA::processPatcher()
     DBGLOG("VDA", "-NRedVDA requested for %s; VCN bridge readiness is reported by the VCN module", profile->name);
 
     NRed::singleton().setProp32("NRedVDARequested", static_cast<UInt32>(this->requested));
-    NRed::singleton().setProp32("NRedVDAMediaEnabled", static_cast<UInt32>(this->mediaEnginesEnabled()));
+    // The VCN bridge owns the effective enablement and updates this property after engine allocation.
+    NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
     NRed::singleton().setProp32("NRedVCNGeneration", vcnGeneration);
 }

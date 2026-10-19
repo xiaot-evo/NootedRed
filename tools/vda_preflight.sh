@@ -20,10 +20,10 @@ DARWIN="$(uname -r)"
 DARWIN_MAJOR="$(echo "${DARWIN}" | cut -d. -f1)"
 DARWIN_MINOR="$(echo "${DARWIN}" | cut -d. -f2)"
 echo "macOS ${PRODUCT} (${BUILD}), Darwin ${DARWIN}"
-if [[ "${PRODUCT}" == "15.8.1" && "${DARWIN_MAJOR}" == "24" && "${DARWIN_MINOR}" == "6" ]]; then
-    pass "OS/Darwin matches the generated 15.8.1 (24.6) data"
+if [[ "${PRODUCT}" == "15.8.1" && "${BUILD}" == "24H32" && "${DARWIN_MAJOR}" == "24" && "${DARWIN_MINOR}" == "6" ]]; then
+    pass "OS/build matches the generated 15.8.1 24H32 (Darwin 24.6) data"
 else
-    fail "OS/Darwin does not match the generated 15.8.1 (24.6) data"
+    fail "OS/build does not match the generated 15.8.1 24H32 (Darwin 24.6) data"
 fi
 
 # --- iGPU identity ---
@@ -40,9 +40,15 @@ if [[ "${CHIP_COUNT}" -gt 1 ]]; then
     warn "more than one display chip found; a dGPU can make the X6000 bridge unsafe (it should refuse, but verify)"
 fi
 
-# --- X6000 accelerator must not already be loaded (dGPU case) ---
+BOOTARGS="$(sysctl -n kern.bootargs 2>/dev/null || true)"
+
+# --- X6000 accelerator: it may be loaded by this experimental bridge, but not preloaded for a dGPU ---
 if kextstat 2>/dev/null | grep -q 'com.apple.kext.AMDRadeonX6000 '; then
-    fail "com.apple.kext.AMDRadeonX6000 is already loaded; the VDA bridge must not be enabled"
+    if echo "${BOOTARGS:-$(sysctl -n kern.bootargs 2>/dev/null || true)}" | grep -q -- '-NRedVDA'; then
+        pass "AMDRadeonX6000 is loaded (expected when -NRedVDA is active)"
+    else
+        fail "AMDRadeonX6000 is already loaded without -NRedVDA; the VDA bridge must not be enabled"
+    fi
 else
     pass "AMDRadeonX6000 is not loaded as an accelerator"
 fi
@@ -64,17 +70,34 @@ for generator in gen_vcn_kernel_data.py gen_vda_va_data.py gen_vda_gva_data.py; 
     fi
 done
 
-# --- build artifact ---
-KEXT="${ROOT}/build/macosx/x86_64/release/NootedRed.kext"
-if [[ -d "${KEXT}" ]]; then
+# --- build artifact (per-branch layout, with the old path as fallback) ---
+KEXT=""
+BRANCH="$(git -C "${ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+if [[ -z "${BRANCH}" || "${BRANCH}" == "HEAD" ]]; then
+    BRANCH="detached-$(git -C "${ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+fi
+BRANCH="$(printf '%s' "${BRANCH}" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+MAIN_ROOT="$(cd "$(git -C "${ROOT}" rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd || true)"
+for candidate in \
+    "${ROOT}/build/branches/${BRANCH}/macosx/x86_64/release/NootedRed.kext" \
+    "${ROOT}/build/branches/shared/macosx/x86_64/release/NootedRed.kext" \
+    "${ROOT}/build/macosx/x86_64/release/NootedRed.kext" \
+    "${MAIN_ROOT}/build/branches/${BRANCH}/macosx/x86_64/release/NootedRed.kext" \
+    "${MAIN_ROOT}/build/branches/shared/macosx/x86_64/release/NootedRed.kext" \
+    "${MAIN_ROOT}/build/artifacts/${BRANCH}/NootedRed.kext"; do
+    if [[ -d "${candidate}" ]]; then KEXT="${candidate}"; break; fi
+done
+if [[ -z "${KEXT}" ]]; then
+    KEXT="$(find "${ROOT}/build" -path '*/macosx/x86_64/release/NootedRed.kext' -type d 2>/dev/null | head -n1)"
+fi
+if [[ -n "${KEXT}" && -d "${KEXT}" ]]; then
     HASH="$(shasum -a 256 "${KEXT}/Contents/MacOS/NootedRed" | awk '{print $1}')"
     pass "release kext present (SHA-256 ${HASH})"
 else
-    fail "release kext missing: ${KEXT} (build with the CommandLineTools toolchain)"
+    fail "release kext missing (looked under build/branches/* and build/macosx)"
 fi
 
 # --- boot arguments / EFI ---
-BOOTARGS="$(sysctl -n kern.bootargs 2>/dev/null || true)"
 echo "boot-args: ${BOOTARGS}"
 if echo "${BOOTARGS}" | grep -q -- '-NRedVDA'; then
     warn "-NRedVDA is already in boot-args; the next boot will run the experimental path"

@@ -66,12 +66,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: Artifacts
-          path: build/*/*/*/*.zip
+          path: build/branches/*/*/*/*/*.zip
       - name: Upload build
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           shopt -s nullglob
-          files=(build/*/*/*/*.zip)
+          files=(build/branches/*/*/*/*/*.zip)
           [ ${#files[@]} -gt 0 ] || { echo "No zip files found"; exit 1; }
           NOTES=$(awk -v ver="${{ github.ref_name }}" '
             $0 ~ "^## " ver "([[:space:]]|$)" {flag=1; next}

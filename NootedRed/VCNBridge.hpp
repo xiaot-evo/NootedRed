@@ -50,10 +50,10 @@ class VCNBridge
     bool x6000Prepared{false};
     bool loadAttempted{false};
     bool loadCompleted{false};
-    bool acceleratorStarted{false};
     bool engineAllocated{false};
 
     mach_vm_address_t orgAcceleratorStart{0};
+    mach_vm_address_t orgAcceleratorStop{0};
     mach_vm_address_t orgNewVideo{0};
     mach_vm_address_t orgNewShared{0};
     mach_vm_address_t orgNewClient{0};
@@ -76,7 +76,8 @@ class VCNBridge
     OSMetaClass* sharedMC{nullptr};
     OSMetaClass* clientMC{nullptr};
     void*        hardwareHandle{nullptr};
-    ClassPair    classPairs[6];
+    static constexpr size_t kClassPairCount = 6;
+    ClassPair              classPairs[kClassPairCount];
 
 public:
     static VCNBridge& singleton();
@@ -93,9 +94,6 @@ public:
     // Both drivers prepared and the optional X6000 load completed.
     bool loadReady() const;
 
-    // Both drivers prepared, X6000 loaded and the accelerator start succeeded.
-    bool ready() const { return this->loadReady() && this->acceleratorStarted; }
-
     // Native VCN2 engine allocated successfully in the X5000 engine array.  This is also true during the
     // original accelerator start (engine allocation happens before start() returns), which is required by
     // the video/shared entry points that run inside that start.
@@ -107,6 +105,7 @@ public:
 
 private:
     static bool          acceleratorStart(void* self, IOService* provider);
+    static void          acceleratorStop(void* self, IOService* provider);
     static void*         newShared();
     static void*         newClient();
     static void*         newVideo(void* self);

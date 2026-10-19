@@ -5,7 +5,7 @@
 //   dyld cache base 0x7FF800000000
 //   image path /System/Library/Extensions/AMDRadeonVADriver2.bundle/Contents/MacOS/AMDRadeonVADriver2
 //   image base 0x7FFB08606000, image UUID 662187E49F38375B9BF6CCAC3F60979A, LC_BUILD_VERSION platform 1 minos 0xf0800 sdk 0xf0800
-//   __text SHA-256 4625da9c90c303aef1eb10e802c4a779a51be8946ac00c94f0ccee01a23feac5
+//   __text SHA-256 bd079ec5c035db1ca6db3888989d7728d751b434b46a3332c5ae957cd1896044
 //
 // These patches are only valid for the exact image above and only for the PCI device they are
 // generated for (Renoir 0x1638).  They force the stock VA driver to identify the GFX9/VCN 2.x
@@ -51,7 +51,7 @@ namespace VDAVAData
         "macOS 15.8.1 (24H32); AMDRadeonVADriver2 7.0.25; dyld cache 42EC2890-BC40-317E-BB27-45142BFF7F26 base 0x7FF800000000; "
         "image base 0x7FFB08606000";
     inline constexpr char CacheUUID[] = "42EC2890-BC40-317E-BB27-45142BFF7F26";
-    inline constexpr char TextSHA256[] = "4625da9c90c303aef1eb10e802c4a779a51be8946ac00c94f0ccee01a23feac5";
+    inline constexpr char TextSHA256[] = "bd079ec5c035db1ca6db3888989d7728d751b434b46a3332c5ae957cd1896044";
     inline constexpr UInt64 CacheBase = 0x7FF800000000ULL;
     inline constexpr UInt64 ImageBase = 0x7FFB08606000ULL;
 

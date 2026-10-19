@@ -47,3 +47,8 @@ along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowled
 - [Chromium/Electron fix usage](docs/Chromium-Fix-Usage.md) — end-user installation and rollback.
 - [Device profile / media capability layer](docs/Device-Profile.md) — graphics + future VDA capability model.
 - [Platform data collector](tools/README-collect-platform-data.md) — collect a target machine's drivers, kexts, firmware and capabilities for new macOS/APU support.
+
+## Build artifacts
+
+Use `tools/build-branch.sh -y` to put the kext and zip under
+`build/branches/<branch>/...`. See [docs/Build-Artifacts.md](docs/Build-Artifacts.md).

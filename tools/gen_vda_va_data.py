@@ -581,6 +581,9 @@ def verify_header(text: str, cache: DyldCache, image: MachOImage, pages, entries
         errors.append("header CacheUUID constant does not match the generated value")
     if f"ImageBase = 0x{image.base:X}ULL" not in text:
         errors.append("header ImageBase constant does not match the generated value")
+    text_hash = hashlib.sha256(image.text_bytes()).hexdigest()
+    if f'TextSHA256[] = "{text_hash}"' not in text:
+        errors.append("header TextSHA256 constant does not match the stock __text hash")
     if len(records) != len(entries):
         errors.append(f"header has {len(records)} patch records, generator derived {len(entries)}")
         return errors
@@ -694,10 +697,18 @@ def derive(cache: DyldCache, output_path: pathlib.Path = OUTPUT_PATH):
 
     def text_bytes() -> bytes:
         data = bytearray(original_text())
+        text_start = image.text[2]
         for address, page in stock.items():
-            offset = address - image.base
-            if 0 <= offset <= len(data) - PAGE_SIZE:
-                data[offset : offset + PAGE_SIZE] = page
+            # Page 0 starts before __text; pages are not aligned to the __text buffer.
+            offset = address - text_start
+            source = 0
+            if offset < 0:
+                source = -offset
+                offset = 0
+            if offset >= len(data) or source >= PAGE_SIZE:
+                continue
+            length = min(PAGE_SIZE - source, len(data) - offset)
+            data[offset : offset + length] = page[source : source + length]
         return bytes(data)
 
     cache.read_page = read_page

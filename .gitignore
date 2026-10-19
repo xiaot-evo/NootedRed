@@ -63,3 +63,6 @@ compile_commands.json
 
 # External tester datasets (Apple binaries, nvram, hardware identifiers)
 platform-data/
+
+# Local git worktrees
+.worktrees/

@@ -55,8 +55,9 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <mach/i386/vm_types.h>
 
-// Generated 15.8.1 user-space VDA patch tables.  They are produced by tools/gen_vda_*_data.py and are only
-// present once the data generation step has been run; the bridge builds and stays inert without them.
+// Generated 15.8.1 user-space VDA patch tables.  They are produced by tools/gen_vda_*_data.py and are
+// committed with this branch; the VCN bridge itself does not depend on them, but VDA user-space patching
+// is a no-op if they are absent.
 #if __has_include(<VDAVAData.hpp>)
 #include <VDAVAData.hpp>
 #endif
@@ -225,6 +226,8 @@ void NRed::processPatcher(KernelPatcher& patcher)
     for (size_t i = 0, ii = 0; i < devInfo->videoExternal.size(); i++) {
         auto device = OSDynamicCast(IOPCIDevice, devInfo->videoExternal[i].video);
         if (device == nullptr) { continue; }
+
+        this->externalVideo = true;
 
         snprintf(name, arrsize(name), "GFX%zu", ii++);
         WIOKit::renameDevice(device, name);

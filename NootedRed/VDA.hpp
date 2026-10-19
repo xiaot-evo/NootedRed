@@ -30,7 +30,6 @@
 class VDA
 {
     bool requested{false};
-    bool ready{false};
 
 public:
     static VDA& singleton();
@@ -45,9 +44,4 @@ public:
     // True when the user explicitly opted in with -NRedVDA.
     bool isRequested() const { return this->requested; }
 
-    // Kept for the runtime gate contract; the bridge owns the actual ready state.
-    bool isReady() const { return this->ready; }
-
-    // Effective media enablement: opt-in requested and the engine bring-up completed.
-    bool mediaEnginesEnabled() const { return this->requested && this->ready; }
 };

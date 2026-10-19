@@ -10,10 +10,41 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="${ROOT}/build/macosx/x86_64/release/NootedRed.kext"
 BACKUP_DIR="${ROOT}/build/efi-backup"
 ESP=""
 ACTION="install"
+
+# Artifacts live under build/branches/<branch>/... after the per-branch build change; keep the old
+# build/macosx path as a fallback for existing checkouts.
+find_kext() {
+    local branch
+    branch="$(git -C "${ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [[ -z "${branch}" || "${branch}" == "HEAD" ]]; then
+        branch="detached-$(git -C "${ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    fi
+    branch="$(printf '%s' "${branch}" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+    [[ -n "${branch}" ]] || branch="unknown"
+
+    local main_root
+    main_root="$(cd "$(git -C "${ROOT}" rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd || true)"
+
+    local candidate
+    for candidate in \
+        "${ROOT}/build/branches/${branch}/macosx/x86_64/release/NootedRed.kext" \
+        "${ROOT}/build/branches/shared/macosx/x86_64/release/NootedRed.kext" \
+        "${ROOT}/build/macosx/x86_64/release/NootedRed.kext" \
+        "${main_root}/build/branches/${branch}/macosx/x86_64/release/NootedRed.kext" \
+        "${main_root}/build/branches/shared/macosx/x86_64/release/NootedRed.kext" \
+        "${main_root}/build/artifacts/${branch}/NootedRed.kext"; do
+        if [[ -d "${candidate}" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+
+    find "${ROOT}/build" -path '*/macosx/x86_64/release/NootedRed.kext' -type d 2>/dev/null | head -n1
+}
+SRC="$(find_kext)"
 
 usage() {
     sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
@@ -64,13 +95,13 @@ case "${ACTION}" in
         echo "restored; reboot to apply"
         ;;
     install)
-        if [[ ! -d "${SRC}" ]]; then
-            echo "missing build artifact: ${SRC}" >&2
-            echo "run: DEVELOPER_DIR=/Library/Developer/CommandLineTools xmake f -m release -y" >&2
-            echo "     DEVELOPER_DIR=/Library/Developer/CommandLineTools xmake -y" >&2
+        if [[ -z "${SRC}" || ! -d "${SRC}" ]]; then
+            echo "missing build artifact (looked under build/branches/* and build/macosx)" >&2
+            echo "run: tools/build-branch.sh -m release -y" >&2
             exit 1
         fi
         NEW_HASH="$(shasum -a 256 "${SRC}/Contents/MacOS/NootedRed" | awk '{print $1}')"
+        echo "source kext: ${SRC}"
         echo "new kext SHA-256: ${NEW_HASH}"
         if [[ -d "${DST}" ]]; then
             OLD_HASH="$(shasum -a 256 "${DST}/Contents/MacOS/NootedRed" | awk '{print $1}')"
@@ -82,6 +113,17 @@ case "${ACTION}" in
         echo "installing -> ${DST}"
         ${SUDO} rm -rf "${DST}"
         ${SUDO} ditto "${SRC}" "${DST}"
+        INSTALLED_HASH="$(shasum -a 256 "${DST}/Contents/MacOS/NootedRed" 2>/dev/null | awk '{print $1}')"
+        if [[ "${INSTALLED_HASH}" != "${NEW_HASH}" ]]; then
+            echo "installed kext hash ${INSTALLED_HASH} != ${NEW_HASH}" >&2
+            if [[ -n "${BACKUP:-}" && -d "${BACKUP}" ]]; then
+                echo "restoring ${BACKUP}" >&2
+                ${SUDO} rm -rf "${DST}"
+                ${SUDO} ditto "${BACKUP}" "${DST}"
+            fi
+            exit 1
+        fi
+        echo "verified installed SHA-256: ${INSTALLED_HASH}"
         echo "installed. Add -NRedVDA to boot-args for the VDA experiment, then reboot."
         echo "boot once without -NRedVDA first to confirm the default-off path is still green."
         ;;

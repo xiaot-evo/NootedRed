@@ -39,8 +39,9 @@
 //    `kPageSize` page image has to match byte for byte before `find` is replaced with `replace`, so a
 //    patch can never hit an unrelated binary.  See analysis/lilu-userpatch.md for the details.
 //
-// Both backends are gated behind the `-NRedGLFix` boot argument (and `-NRedGLFixOff` to force them off
-// even if the default is ever flipped) and log under the `UserPatch` tag.
+// The GL table is gated by `-NRedGLFix`/`-NRedGLFixOff`; the optional VA/AppleGVA tables are a separate
+// `-NRedVDA` opt-in and only apply on the validated 0x1638 profile after the kernel VCN bridge is ready.
+// Both log under the `UserPatch` tag.
 class UserPatches
 {
 public:
@@ -77,8 +78,8 @@ public:
 
     static UserPatches& singleton();
 
-    // Parses the boot arguments and registers the patcher load callback.  Must be called from
-    // `NRed::init` so that the request is queued before Lilu starts processing them.
+    // Parses the boot arguments and records the enabled tables.  Must be called from `NRed::init`;
+    // `processPatcher` installs the selected backend once the device profile is known.
     void init();
 
     // Replaces the built-in GL driver patch table.  `patchTable` has to point to static storage, as it
@@ -98,9 +99,10 @@ private:
     // Longest supported replacement, in bytes.
     static constexpr size_t kMaxPatchSize = 32;
 
-    // Amount of distinct pages and per-page sites the native backend supports.  The VDA tables patch pages
-    // of two shared-cache images, so the limits are larger than the original GL-only backend.
-    static constexpr size_t kMaxNativePages  = 12;
+    // Amount of distinct pages and per-page sites the native backend supports.  The combined GL (3),
+    // VA (8) and AppleGVA (1) tables currently use 12 pages; keep headroom so a new table cannot be
+    // silently dropped by the page cap.  The backend refuses the whole table on overflow.
+    static constexpr size_t kMaxNativePages  = 16;
     static constexpr size_t kMaxSitesPerPage = 16;
 
     // Maximum combined (GL + VDA) patch entries in the native backend.
@@ -120,6 +122,7 @@ private:
     struct NativePage
     {
         const UInt8* image{nullptr};
+        UInt64       head{0};
         NativeSite   sites[kMaxSitesPerPage]{};
         size_t       siteCount{0};
         bool         vda{false};
@@ -145,7 +148,7 @@ private:
 
     NativePage nativePages[kMaxNativePages]{};
     size_t     nativePageCount{0};
-    UInt32     vdaAppliedCount{0};
+    SInt32     vdaAppliedCount{0};
 
     UserPatcher::BinaryModPatch liluPatches[kMaxLiluPatches]{};
     UserPatcher::BinaryModInfo  liluModInfo{};

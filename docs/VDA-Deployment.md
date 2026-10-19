@@ -19,8 +19,10 @@ DEVELOPER_DIR=/Library/Developer/CommandLineTools xmake f -m release -y
 DEVELOPER_DIR=/Library/Developer/CommandLineTools xmake -y
 ```
 
-Artifact: `build/macosx/x86_64/release/NootedRed.kext`
-(zip: `build/macosx/x86_64/release/NootedRed-0.9.0-RELEASE.zip`).
+Artifact: `build/branches/<branch>/macosx/x86_64/release/NootedRed.kext`
+(zip: `.../NootedRed-0.9.0-RELEASE.zip`). The supported build wrapper is `tools/build-branch.sh`;
+see [Build-Artifacts.md](Build-Artifacts.md). `tools/deploy_vda.sh` locates the current branch artifact
+automatically (it also accepts the old `build/macosx/...` layout).
 
 Before deploying, run the read-only preflight; it verifies the OS/Darwin, iGPU, dGPU/X6000 state, kernel
 collection, generated data and build artifact:
@@ -35,7 +37,7 @@ tools/vda_preflight.sh
 # adapt the ESP mount point if needed
 sudo mount -t msdos /dev/diskXsY /Volumes/EFI
 sudo ditto /Volumes/EFI/EFI/OC/Kexts/NootedRed.kext \
-            "/Volumes/WorkSpace/Projects/Hackintosh/NootedRed/build/efi-backup/NootedRed-preVDA.kext"
+            "build/efi-backup/NootedRed-preVDA.kext"
 shasum -a 256 /Volumes/EFI/EFI/OC/Kexts/NootedRed.kext/Contents/MacOS/NootedRed
 ```
 
@@ -88,8 +90,9 @@ X5000: VCN0 media engine enabled from the device profile
 
 `NRedVCNX5000Seen=1`, `NRedVCNX6000Seen=1`, `NRedVCNAccelStartSeen=1` show that the kext-load/start hooks
 ran at all; `NRedVCNX5000ABIValidated=1`, `NRedVCNX6000ABIValidated=1`, `NRedVCNNativeLoadReady=1`,
-`NRedVCNEngineAllocated=1` in ioreg are the kernel-side success markers. `NRedVCNUserApplied` is the count
-of VDA user-space pages successfully patched (VA/AppleGVA); it only increases once the bridge is ready.
+`NRedVCNEngineAllocated=1` in ioreg are the kernel-side success markers. `NRedVCNUserApplied` counts VDA user-space page write events (VA/AppleGVA); it only increases once the
+bridge is ready. It is a diagnostic, not a count of distinct live pages, and pages already patched in the
+shared-cache page cache stay patched until reboot.
 
 ## 6. Decode test
 
@@ -113,10 +116,11 @@ adverse case from the community fork). Watch for:
 
 ## 7. Validated results (2026-10-19)
 
-The target passed the first real-hardware run:
+The target passed the real-hardware runs on 2026-10-19 (latest loaded kext SHA-256
+`3495df006ca54f4d9cfd4899e23126efeb1009c9a0ea51660b4bf3c27a9121ba`):
 
 - `NRedVCNStage=11`, both ABI guards `=1`, X6000 native load ready, engine allocated, VCN
-  `initHardware=1`, `NRedVCNUserApplied=4`;
+  `initHardware=1`; VA/AppleGVA patches applied and `h264_videotoolbox`/`hevc_videotoolbox` encode works;
 - H.264 720p, 64x64 H.264 and HEVC 720p VideoToolbox decodes matched the software output;
 - 5 repeated 1080p H.264 + 5 repeated 1080p HEVC decodes matched and produced no `.gpuRestart`;
 - ffmpeg exposes `videotoolbox_vld` for H.264; AppleGVA logs for HEVC show
@@ -133,6 +137,10 @@ long-duration playback, Hackintool create/destroy and other APUs.
 4. Optionally boot with only the graphics fix (`-NRedGLFix`) to confirm the baseline.
 
 The new kernel code has no panic path: ABI mismatch, failed X6000 load, failed engine allocation and
-failed user-space page matching all return safely and the VDA path is disabled. A hang, if any, would be
-inside Apple's native VCN2 engine/power path, which is exactly what the staged validation above is meant
-to isolate. Keep the backup EFI and rollback steps ready.
+failed user-space page matching all return safely and stop installing new VDA patches. The user-space
+VA/AppleGVA pages, however, are written into the shared-cache page cache after code-signing validation:
+once applied they are system-wide for the rest of the boot and cannot be reliably rolled back. A failure
+after that point disables further patching but does not make already-patched clients stock again; reboot
+to return to a clean cache. A hang, if any, would be inside Apple's native VCN2 engine/power path, which
+is exactly what the staged validation above is meant to isolate. Keep the backup EFI and rollback steps
+ready.

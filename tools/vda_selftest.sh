@@ -10,7 +10,7 @@ echo "boot-args: $(sysctl -n kern.bootargs 2>/dev/null || true)"
 
 echo
 echo "== iGPU VDA/VCN properties =="
-ioreg -l -w0 -r -n IGPU 2>/dev/null | grep -oE '"NRed[A-Za-z0-9]+"=[0-9]+' | sort -u || true
+ioreg -l -w0 -r -n IGPU 2>/dev/null | grep -oE '"NRed[A-Za-z0-9]+"[[:space:]]*=[[:space:]]*[0-9]+' | sort -u || true
 
 echo
 echo "== NootedRed / VCN / UserPatch logs (current boot) =="

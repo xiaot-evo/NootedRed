@@ -366,10 +366,72 @@ def verify_platform() -> dict:
     return {"product": product, "build": build, "gva_version": gva_version}
 
 
+
+def committed_stock_page(cache: SharedCache):
+    """Recover the stock AppleGVA page if the running VDA backend patched it in the page cache.
+
+    The native page backend writes matched pages after code-signing validation.  Those writes land in the
+    dyld shared cache's file-backed page cache, so a normal cache read returns the patched bytes until reboot.
+    The committed header carries the stock page image; accept it only when the live page is exactly that
+    image with this header's single replacement applied.
+    """
+    if not DEFAULT_HEADER.exists():
+        return None, None
+
+    text = DEFAULT_HEADER.read_text()
+    site_match = re.search(r"\bat 0x([0-9A-Fa-f]+)", text)
+    page_match = re.search(r"source page: 0x([0-9A-Fa-f]+)", text)
+    if not site_match or not page_match:
+        return None, None
+
+    def array(name: str) -> bytes:
+        match = re.search(rf"{name}(?:\[\d*\])?\s*=\s*\{{(.*?)\}};", text, re.S)
+        if not match:
+            raise GeneratorError(f"committed header has no {name} array")
+        return bytes(int(value, 16) for value in re.findall(r"0x([0-9A-Fa-f]{2})", match.group(1)))
+
+    stock = array("Page0")
+    find = array("Find0")
+    replace = array("Replace0")
+    if len(stock) != PAGE_SIZE or len(find) != len(replace):
+        raise GeneratorError("committed AppleGVA page/find/replace has an invalid size")
+
+    site = int(site_match.group(1), 16)
+    page_address = int(page_match.group(1), 16)
+    offset = site - page_address
+    if offset < 0 or offset + len(find) > PAGE_SIZE:
+        raise GeneratorError("committed AppleGVA patch site is outside its page")
+    if stock[offset : offset + len(find)] != find:
+        raise GeneratorError("committed AppleGVA page does not contain the committed find")
+
+    live = cache.read(page_address, PAGE_SIZE)
+    if live == stock:
+        return None, None
+
+    patched = bytearray(stock)
+    patched[offset : offset + len(find)] = replace
+    if live != bytes(patched):
+        raise GeneratorError("live AppleGVA page is neither the committed stock page nor its patched form")
+    return stock, page_address
+
+
 def derive(cache_dir: Path) -> dict:
     version = verify_platform()
     cache = SharedCache(cache_dir)
     try:
+        stock_page, stock_page_address = committed_stock_page(cache)
+        if stock_page is not None:
+            original_read = cache.read
+
+            def read_with_stock(address: int, size: int) -> bytes:
+                data = bytearray(original_read(address, size))
+                start = max(address, stock_page_address)
+                end = min(address + size, stock_page_address + PAGE_SIZE)
+                if start < end:
+                    data[start - address : end - address] = stock_page[start - stock_page_address : end - stock_page_address]
+                return bytes(data)
+
+            cache.read = read_with_stock
         if cache.uuid.hex().upper() != EXPECTED_CACHE_UUID:
             raise GeneratorError(
                 f"unexpected dyld cache UUID {cache.uuid.hex().upper()}; expected {EXPECTED_CACHE_UUID}"
@@ -502,7 +564,12 @@ def derive(cache_dir: Path) -> dict:
         with subcache_path.open("rb") as handle:
             handle.seek(file_offset)
             direct_page = handle.read(PAGE_SIZE)
-        if direct_page != page:
+        expected_direct_page = page
+        if stock_page is not None and page_address == stock_page_address:
+            expected_direct_page = bytearray(stock_page)
+            expected_direct_page[page_offset : page_offset + len(find)] = replace
+            expected_direct_page = bytes(expected_direct_page)
+        if direct_page != expected_direct_page:
             raise GeneratorError("the page image does not match the subcache file contents")
 
         return {
