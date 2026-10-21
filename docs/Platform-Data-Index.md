@@ -62,7 +62,9 @@ per-driver page data.
 
 ## Adding a dataset
 
-1. Copy the archive under `platform-data/<date>_<os>_<cpu>_<device-id>/`.
-2. Record its SHA-256.
-3. Add an entry here with OS, Darwin, APU/device ID, archive hash and initial findings.
-4. Never commit the archive or extracted Apple binaries.
+1. Collect a fresh dataset on the target machine with
+   [`tools/collect_compat_data.py`](../tools/README-collect-compat-data.md) (pristine boot preferred).
+2. Copy the archive under `platform-data/<date>_<os>_<cpu>_<device-id>/`.
+3. Record its SHA-256.
+4. Add an entry here with OS, Darwin, APU/device ID, archive hash and initial findings.
+5. Never commit the archive or extracted Apple binaries.

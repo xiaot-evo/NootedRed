@@ -22,6 +22,8 @@ class PatchSet:
     major: int
     minor: int
     apus: int
+    max_major: int | None = None
+    max_minor: int | None = None
 
 
 SETS = [
@@ -29,14 +31,17 @@ SETS = [
     PatchSet("15.8.1 / Raven-family", 24, 6, RAVEN | RAVEN2 | PICASSO),
     PatchSet("15.8.1 / gfx9 APU fallback", 24, 6, ALL),
     PatchSet("26.7.1 / gfx9 APU", 25, 6, ALL),
+    PatchSet("14.8.x / Sonoma gfx9 APU", 23, 6, ALL),
 ]
 
 
 def select(major: int, minor: int, apus: int) -> str | None:
     for patch_set in SETS:
+        max_major = patch_set.max_major if patch_set.max_major is not None else patch_set.major
+        max_minor = patch_set.max_minor if patch_set.max_minor is not None else patch_set.minor
         if (major, minor) < (patch_set.major, patch_set.minor):
             continue
-        if (major, minor) > (patch_set.major, patch_set.minor):
+        if (major, minor) > (max_major, max_minor):
             continue
         if apus == 0:
             if patch_set.apus != ALL:
@@ -59,7 +64,10 @@ def main() -> None:
         (24, 7, RENOIR, None),
         (25, 6, RENOIR, "26.7.1 / gfx9 APU"),
         (25, 5, RENOIR, None),
-        (23, 6, RENOIR, None),
+        (23, 6, RENOIR, "14.8.x / Sonoma gfx9 APU"),
+        (23, 5, RENOIR, None),
+        (23, 0, RENOIR, None),
+        (22, 6, RENOIR, None),
     ]
     for major, minor, apus, expected in cases:
         got = select(major, minor, apus)

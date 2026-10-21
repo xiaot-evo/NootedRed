@@ -24,23 +24,29 @@
 #include <Headers/kern_mach.hpp>
 #include <Headers/kern_util.hpp>
 #include <DeviceProfile.hpp>
+#include <GLFixSemanticData.hpp>
 #include <NRed.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <UserPatches.hpp>
 #include <TahoePatchData.hpp>
+#include "UserPatchesSonoma.inc"
 #include <VCNBridge.hpp>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSTypes.h>
 #include <mach/i386/vm_types.h>
+#include <sys/vnode.h>
 
 static UserPatches moduleInstance;
 
 namespace
 {
 
-    const char* const kBootArgGLFix    = "-NRedGLFix";
-    const char* const kBootArgGLFixOff = "-NRedGLFixOff";
-    const char* const kBootArgVDA      = "-NRedVDA";
+    const char* const kBootArgGLFix            = "-NRedGLFix";
+    const char* const kBootArgGLFixOff         = "-NRedGLFixOff";
+    const char* const kBootArgGLFixSemanticMTL = "-NRedGLFixSemanticMTL";
+    const char* const kBootArgGLFixSemanticOff = "-NRedGLFixSemanticOff";
+    const char* const kBootArgVDA              = "-NRedVDA";
+    const char* const kBootArgAVC              = "-NRedAVC";
 
     // The patch bytes and page images below are specific to one driver build, and the native backend hooks
     // code signing page validation, so this is opt-in until the table has been filled in and tested.
@@ -612,6 +618,9 @@ static const UInt8 kMTLControlPage[] = {
     static const UInt8 kMTLGateReplace[] = {0xEB, 0x0B};
     static const UInt8 kMTLAllowFind[]    = {0x0F, 0x94, 0xC0};
     static const UInt8 kMTLAllowReplace[] = {0x31, 0xC0, 0x90};
+    // macOS 14 (Sonoma) uses setae instead of setz for the same allow decision.
+    static const UInt8 kMTLAllowFind_Sonoma[]    = {0x0F, 0x93, 0xC0};
+    static const UInt8 kMTLAllowReplace_Sonoma[] = {0x31, 0xC0, 0x90};
 
 static const UInt8 kGLDriverDualQuadPage[] = {
     0x00, 0x48, 0x8B, 0x8B, 0x68, 0x0D, 0x00, 0x00, 0x8B, 0x83, 0x84, 0x18, 0x00, 0x00, 0x48, 0xBA,
@@ -872,6 +881,7 @@ static const UInt8 kGLDriverDualQuadPage[] = {
     0x00, 0x3D, 0xF9, 0x88, 0x00, 0x00, 0x0F, 0x85, 0x97, 0x01, 0x00, 0x00, 0x45, 0x84, 0xD2, 0xB8,
 };
 
+
     static const UserPatches::PagePatch kGLDriverPatches[] = {
         {UserPatcher::FileSegment::SegmentTextText, kGLDriverHwInfoPage,    kGLDriverHwInfoFind,
          kGLDriverHwInfoReplace,                    sizeof(kGLDriverHwInfoFind),   0, 1},
@@ -884,18 +894,39 @@ static const UInt8 kGLDriverDualQuadPage[] = {
     };
     constexpr size_t kGLDriverPatchCount = arrsize(kGLDriverPatches);
 
+    // macOS 14 (Sonoma) exact pages.  The 15.8.1 pages cannot match this driver.
+    static const UserPatches::PagePatch kGLDriverPatches_Sonoma[] = {
+        {UserPatcher::FileSegment::SegmentTextText, kGLDriverHwInfoPage_Sonoma,   kGLDriverHwInfoFind,
+         kGLDriverHwInfoReplace,                    sizeof(kGLDriverHwInfoFind),   0, 1},
+        {UserPatcher::FileSegment::SegmentTextText, kGLDriverDualQuadPage_Sonoma, kGLDriverDualQuadFind,
+         kGLDriverDualQuadReplace,                  sizeof(kGLDriverDualQuadFind), 1, 1},
+        {UserPatcher::FileSegment::SegmentTextText, kMTLControlPage_Sonoma,       kMTLGateFind,
+         kMTLGateReplace,                           sizeof(kMTLGateFind),          0, 1},
+        {UserPatcher::FileSegment::SegmentTextText, kMTLControlPage_Sonoma,       kMTLAllowFind_Sonoma,
+         kMTLAllowReplace_Sonoma,                   sizeof(kMTLAllowFind_Sonoma),  0, 1},
+    };
+    constexpr size_t kGLDriverPatchCount_Sonoma = arrsize(kGLDriverPatches_Sonoma);
+
     // macOS 26.7.1 (Darwin 25.6.0) GL driver.  The driver layout moved: _gfx9_HwInfoInitData is at
     // 0xDF80 and _glrAMD_GFX9_UpdateHwCbDualQuadMode at 0x819E, so the 15.8.1 page images cannot match.
     // Only the GL driver is covered here; the Metal 26.7.1 sites still need validation.
+    // macOS 26.7.1 Metal uses the same gate/allow pair as Sequoia; only the page image and the
+    // allow-pattern occurrence differ.  This matches the implementation that is known to be smooth on
+    // 26.7.1; the direct-field form is left in TahoePatchData.hpp for reference/experiments only.
+    static const UInt8 kTahoeMTLGateFind[]    = {0x74, 0x28};
+    static const UInt8 kTahoeMTLGateReplace[] = {0xEB, 0x00};
+    static const UInt8 kTahoeMTLAllowFind[]    = {0x0F, 0x94, 0xC1};
+    static const UInt8 kTahoeMTLAllowReplace[] = {0x31, 0xC9, 0x90};
+
     static const UserPatches::PagePatch kTahoeGLDriverPatches[] = {
         {UserPatcher::FileSegment::SegmentTextText, kTahoeGLHwInfoPage,    kGLDriverHwInfoFind,
          kGLDriverHwInfoReplace,                    sizeof(kGLDriverHwInfoFind),   0, 1},
         {UserPatcher::FileSegment::SegmentTextText, kTahoeGLDualQuadPage,  kGLDriverDualQuadFind,
          kGLDriverDualQuadReplace,                  sizeof(kGLDriverDualQuadFind), 1, 1},
-        // The Metal pipeline context moved the CB_COLOR_CONTROL boolean write to +0xE4; patch the
-        // direct boolean assignment (and edx,~1 -> or edx,1) rather than the old 15.8.1 gate/setz pair.
-        {UserPatcher::FileSegment::SegmentTextText, kTahoeMTLControlPage, kTahoeMTLDualQuadFind,
-         kTahoeMTLDualQuadReplace,                  sizeof(kTahoeMTLDualQuadFind), 0, 1},
+        {UserPatcher::FileSegment::SegmentTextText, kTahoeMTLControlPage,  kTahoeMTLGateFind,
+         kTahoeMTLGateReplace,                      sizeof(kTahoeMTLGateFind),     0, 1},
+        {UserPatcher::FileSegment::SegmentTextText, kTahoeMTLControlPage,  kTahoeMTLAllowFind,
+         kTahoeMTLAllowReplace,                     sizeof(kTahoeMTLAllowFind),    1, 1},
     };
     constexpr size_t kTahoeGLDriverPatchCount = arrsize(kTahoeGLDriverPatches);
 
@@ -921,6 +952,11 @@ static const UInt8 kGLDriverDualQuadPage[] = {
         // macOS 26.7.1 (Darwin 25.6.0).  Exact page images make this a no-op on any other driver build.
         {"26.7.1 / gfx9 APU", PenguinWizardry::KernelVersion(25, 6), PenguinWizardry::KernelVersion(25, 6),
          UserPatches::kApuAll, kTahoeGLDriverPatches, kTahoeGLDriverPatchCount},
+        // macOS 14.8.x (Sonoma, Darwin 23.6).  Exact pages are primary; other 14.x builds fall
+        // through to the semantic backend.
+        {"14.8.x / Sonoma gfx9 APU", PenguinWizardry::KernelVersion(23, 6),
+         PenguinWizardry::KernelVersion(23, 6), UserPatches::kApuAll, kGLDriverPatches_Sonoma,
+         kGLDriverPatchCount_Sonoma},
     };
     constexpr size_t kGLDriverPatchSetCount = sizeof(kGLDriverPatchSets) / sizeof(kGLDriverPatchSets[0]);
 
@@ -940,14 +976,31 @@ void UserPatches::init()
     if (checkKernelArgument(kBootArgGLFix)) { this->enabled = true; }
     if (checkKernelArgument(kBootArgGLFixOff)) { this->enabled = false; }
 
-    this->vdaEnabled = checkKernelArgument(kBootArgVDA);
+    // The semantic backend is the generic cross-build fallback: it runs whenever the GL fix is enabled
+    // (exact page sets still win), unless explicitly disabled.  Metal context scanning covers the whole
+    // shared-cache range; it is forced on here with `-NRedGLFixSemanticMTL`, and enabled automatically
+    // later when no exact patch set matches the running build.
+    this->semanticPatches    = GLFixSemantic::kPatches;
+    this->semanticPatchCount = GLFixSemantic::kPatchCount;
+    this->semanticEnabled    = this->enabled && !checkKernelArgument(kBootArgGLFixSemanticOff);
+    this->semanticMTLEnabled = this->semanticEnabled && checkKernelArgument(kBootArgGLFixSemanticMTL);
+
+    this->vdaEnabled = checkKernelArgument(kBootArgVDA) || checkKernelArgument(kBootArgAVC);
 
     if (!this->enabled && !this->vdaEnabled) {
         DBGLOG("UserPatch", "User-space driver patches are disabled");
         return;
     }
 
-    if (this->enabled) { SYSLOG("UserPatch", "Enabling user-space GL driver patches (experimental)"); }
+    if (this->enabled) {
+        SYSLOG("UserPatch", "Enabling user-space GL driver patches (experimental)");
+        if (this->semanticEnabled) {
+            SYSLOG("UserPatch", "Semantic GL fallback enabled (generic across macOS builds)");
+        }
+        if (this->semanticMTLEnabled) {
+            SYSLOG("UserPatch", "Semantic Metal context scanning enabled (forced)");
+        }
+    }
     if (this->vdaEnabled) { SYSLOG("UserPatch", "Enabling user-space VDA driver patches (experimental)"); }
 }
 
@@ -1018,6 +1071,14 @@ void UserPatches::selectPatchSet()
 
     SYSLOG("UserPatch", "No patch set matches macOS %u.%u / APU mask 0x%02X; not installing any user patches",
            version.major(), version.minor(), apus);
+
+    // Unknown build: the semantic backend is the whole fix.  GL scanning is already enabled with the
+    // feature; also enable the Metal variant groups here so a build without page data still gets the
+    // Chromium/ANGLE-Metal part of the fix.
+    if (this->semanticEnabled && !this->semanticMTLEnabled) {
+        this->semanticMTLEnabled = true;
+        SYSLOG("UserPatch", "Semantic Metal fallback enabled because no exact patch set matched");
+    }
 }
 
 void UserPatches::registerVDAFix(const PagePatch* const patchTable, const size_t count)
@@ -1054,11 +1115,14 @@ void UserPatches::processPatcher(KernelPatcher& patcher)
     if (glEnabled) { this->selectPatchSet(); }
 
     // Build the native page list from whichever tables are enabled.  The VDA tables only exist on macOS 11
-    // and newer, where the native backend is the one being used, and only for the validated 0x1638 profile.
-    const auto vdaAllowed = this->vdaEnabled && profile != nullptr && profile->deviceID == 0x1638
-                            && profile->media.hasVCN0 && !NRed::singleton().hasExternalVideo();
+    // and newer, where the native backend is the one being used.  The profile is the single source of truth
+    // for the target: a VCN 2.x device whose profile enables the engine may receive the user-space VA tables
+    // (the VCN 2.x profiles, with 0x1638 as the validated target).
+    const auto vdaAllowed = this->vdaEnabled && profile != nullptr && profile->media.hasVCN0
+                            && profile->media.vcnGeneration == DeviceProfile::kVcn2_2
+                            && !NRed::singleton().hasExternalVideo();
     if (this->vdaEnabled && !vdaAllowed) {
-        SYSLOG("UserPatch", "VDA patches requested but this profile is not the validated 0x1638 target");
+        SYSLOG("UserPatch", "VDA patches requested but this profile does not enable the validated VCN 2.x target");
     }
 
     this->nativePatchCount = 0;
@@ -1260,7 +1324,186 @@ auto UserPatches::buildNativePatches() -> bool
     return true;
 }
 
-void UserPatches::patchNativePage(const void* const data)
+auto UserPatches::isPatchedPage(const NativePage& page, const UInt8* const data) const -> bool
+{
+    if (page.image == nullptr || data == nullptr) { return false; }
+
+    for (size_t offset = 0; offset < kPageSize; offset++) {
+        const NativeSite* site{nullptr};
+        for (size_t siteIndex = 0; siteIndex < page.siteCount; siteIndex++) {
+            const auto& candidate = page.sites[siteIndex];
+            if (offset >= candidate.offset && offset < candidate.offset + candidate.size) {
+                site = &candidate;
+                break;
+            }
+        }
+
+        if (site != nullptr) {
+            if (data[offset] != site->replace[offset - site->offset]) { return false; }
+        }
+        else if (data[offset] != page.image[offset]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+auto UserPatches::isGLDriverVnode(void* const vnode) const -> bool
+{
+    if (vnode == nullptr) { return false; }
+
+    const char* const name = vnode_getname(reinterpret_cast<vnode_t>(vnode));
+    if (name == nullptr) { return false; }
+
+    const char* const needle = "AMDRadeonX5000GLDriver";
+    bool found = false;
+    for (size_t index = 0; name[index] != '\0' && !found; index++) {
+        size_t needleIndex = 0;
+        while (needle[needleIndex] != '\0' && name[index + needleIndex] == needle[needleIndex]) { needleIndex++; }
+        found = needle[needleIndex] == '\0';
+    }
+
+    vnode_putname(name);
+    return found;
+}
+
+auto UserPatches::patchSemanticPage(const void* const data, void* const vnode, const bool cachePage) -> bool
+{
+    if (!this->semanticEnabled || data == nullptr || this->semanticPatches == nullptr) { return false; }
+
+    const auto* const bytes = static_cast<const UInt8*>(data);
+
+    auto matchSite = [&](const SemanticPatch& patch, size_t& site) -> bool {
+        if (patch.context == nullptr || patch.mask == nullptr || patch.find == nullptr || patch.replace == nullptr) {
+            return false;
+        }
+        if (patch.contextSize == 0 || patch.contextSize > kPageSize || patch.findSize == 0
+            || patch.findSize != patch.replaceSize || patch.siteOffset + patch.findSize > patch.contextSize)
+        {
+            return false;
+        }
+
+        int found = -1;
+        for (size_t offset = 0; offset + patch.contextSize <= kPageSize; offset++) {
+            if ((bytes[offset] & patch.mask[0]) != (patch.context[0] & patch.mask[0])) { continue; }
+
+            bool matches = true;
+            for (size_t index = 1; index < patch.contextSize; index++) {
+                if ((bytes[offset + index] & patch.mask[index]) != (patch.context[index] & patch.mask[index])) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (!matches) { continue; }
+            if (found >= 0) { return false; }
+            found = static_cast<int>(offset);
+        }
+
+        if (found < 0) { return false; }
+
+        const auto candidate = static_cast<size_t>(found) + patch.siteOffset;
+        if (candidate + patch.findSize > kPageSize) { return false; }
+        if (memcmp(bytes + candidate, patch.find, patch.findSize) != 0) { return false; }
+
+        // Instruction-form verification: the masked context is an anchor, the site itself must still be the
+        // instruction the semantic kind describes.
+        if (patch.kind == kSemanticGLHwInfo) {
+            if (patch.siteOffset < 6 || bytes[static_cast<size_t>(found) + patch.siteOffset - 6] != 0xC7) {
+                return false;
+            }
+        } else if (patch.kind == kSemanticGLDualQuad) {
+            if (candidate + 5 > kPageSize || bytes[candidate + 3] != 0x09 || bytes[candidate + 4] != 0xC8) {
+                return false;
+            }
+        }
+
+        site = candidate;
+        return true;
+    };
+
+    auto applySites = [&](const SemanticPatch* const* entries, const size_t* sites, const size_t count) -> bool {
+        if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) { return false; }
+
+        for (size_t index = 0; index < count; index++) {
+            memcpy(const_cast<UInt8*>(bytes) + sites[index], entries[index]->replace, entries[index]->replaceSize);
+        }
+
+        if (MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+            SYSLOG("UserPatch", "Semantic: failed to restore kernel write protection");
+        }
+        return true;
+    };
+
+    bool patched = false;
+    bool glDriver = false;
+    bool glChecked = false;
+    size_t index = 0;
+    while (index < this->semanticPatchCount) {
+        const auto& first = this->semanticPatches[index];
+
+        if (first.cachePage) {
+            if (!cachePage || !this->semanticMTLEnabled) { index++; continue; }
+        } else if (cachePage) {
+            index++;
+            continue;
+        }
+
+        if (first.group == 0) {
+            size_t site = 0;
+            if (!matchSite(first, site)) { index++; continue; }
+
+            if (!first.cachePage) {
+                if (!glChecked) {
+                    glDriver  = this->isGLDriverVnode(vnode);
+                    glChecked = true;
+                }
+                if (!glDriver) { index++; continue; }
+            }
+
+            const SemanticPatch* entry = &first;
+            if (applySites(&entry, &site, 1)) {
+                patched = true;
+                NRed::singleton().setProp32("NRedGLFixSemantic", 1);
+                SYSLOG("UserPatch", "Semantic patch applied: %s at page offset 0x%zX", first.name, site);
+            }
+            index++;
+            continue;
+        }
+
+        // A group only applies when every site in it matches the same page.  That is what makes the Metal
+        // variants safe on the shared-cache range: a partial or foreign page is left untouched.
+        size_t end = index + 1;
+        while (end < this->semanticPatchCount && this->semanticPatches[end].group == first.group) { end++; }
+        if (end - index > 8) { index = end; continue; }
+
+        const SemanticPatch* entries[8]{};
+        size_t               sites[8]{};
+        bool                 groupMatched = true;
+        for (size_t entryIndex = index; entryIndex < end; entryIndex++) {
+            const auto& patch = this->semanticPatches[entryIndex];
+            if (!matchSite(patch, sites[entryIndex - index])) {
+                groupMatched = false;
+                break;
+            }
+            entries[entryIndex - index] = &patch;
+        }
+
+        if (groupMatched && applySites(entries, sites, end - index)) {
+            NRed::singleton().setProp32("NRedGLFixSemanticMetal", 1);
+            SYSLOG("UserPatch", "Semantic Metal group %u applied (%zu site(s))", first.group, end - index);
+            // Exactly one Metal variant applies per page; the Tahoe direct form is ordered before the
+            // gate/allow pair so a 26.x page takes the direct-field patch only.
+            return true;
+        }
+
+        index = end;
+    }
+
+    return patched;
+}
+
+void UserPatches::patchNativePage(const void* const data, void* const vnode, const bool cachePage)
 {
     if (data == nullptr) { return; }
 
@@ -1306,6 +1549,15 @@ void UserPatches::patchNativePage(const void* const data)
 
         DBGLOG("UserPatch", "Patched %zu site(s) in a user-space driver page", page.siteCount);
 
+        // The exact page is the strongest match.  Only now is it safe to stop the semantic scanner:
+        // a PatchSet range can match a sub-build whose exact page does not, and that build must still
+        // get the semantic fallback.
+        if (!page.vda && (this->semanticEnabled || this->semanticMTLEnabled)) {
+            this->semanticEnabled    = false;
+            this->semanticMTLEnabled = false;
+            SYSLOG("UserPatch", "Exact GL/Metal page applied; semantic scanning disabled");
+        }
+
         if (page.vda) {
             const auto applied = static_cast<UInt32>(OSIncrementAtomic(&this->vdaAppliedCount) + 1);
             NRed::singleton().setProp32("NRedVCNUserApplied", applied);
@@ -1313,6 +1565,16 @@ void UserPatches::patchNativePage(const void* const data)
 
         return;
     }
+
+    // The page may already contain our replacement bytes from an earlier validation (the page cache is
+    // shared); do not scan it again.
+    for (size_t pageIndex = 0; pageIndex < this->nativePageCount; pageIndex++) {
+        if (this->isPatchedPage(this->nativePages[pageIndex], static_cast<const UInt8*>(data))) { return; }
+    }
+
+    // Generic fallback: locate the sites by instruction context instead of a build-specific page image.
+    // This is what makes the GL fix work on macOS builds that have no page table entry.
+    this->patchSemanticPage(data, vnode, cachePage);
 }
 
 void UserPatches::wrapCsValidatePage(void* const vnode, void* const pager, const UInt64 pageOffset,
@@ -1322,7 +1584,7 @@ void UserPatches::wrapCsValidatePage(void* const vnode, void* const pager, const
                                                                     nx);
 
     // Only patch pages that passed validation, so that a rejected page is never turned into a valid-looking one.
-    if (validated != nullptr && *validated != 0) { singleton().patchNativePage(data); }
+    if (validated != nullptr && *validated != 0) { singleton().patchNativePage(data, vnode, false); }
 }
 
 boolean_t UserPatches::wrapCsValidateRange(void* const vnode, void* const pager, const UInt64 pageOffset,
@@ -1335,7 +1597,7 @@ boolean_t UserPatches::wrapCsValidateRange(void* const vnode, void* const pager,
 
     const auto* const bytes = static_cast<const UInt8*>(data);
     for (size_t offset = 0; offset + kPageSize <= dataSize; offset += kPageSize) {
-        singleton().patchNativePage(bytes + offset);
+        singleton().patchNativePage(bytes + offset, vnode, true);
     }
 
     return result;

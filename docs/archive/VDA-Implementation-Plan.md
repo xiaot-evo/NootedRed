@@ -5,17 +5,22 @@ layer from `feature/device-profile`.
 
 ## Current state
 
-Implementation is complete and **hardware-validated on 15.8.1 / Renoir `0x1638`** (2026-10-19). Evidence:
-[`analysis/vda-1581-hardware-validation.md`](../analysis/vda-1581-hardware-validation.md). The final
-default-off boot and the wider acceptance matrix (Chromium, DRM, 10-bit, other APUs) remain follow-ups.
+Implementation is complete and **hardware-validated on 15.8.1 / Renoir `0x1638`** (2026-10-19); a
+multi-version layer now selects per-build data for **macOS 15.8.1 (24H32)** and **macOS 14.8.9 (23J631)**.
+Evidence:
+[`analysis/vda-1581-hardware-validation.md`](../analysis/vda-1581-hardware-validation.md) and
+[`analysis/vcn-multiversion.md`](../analysis/vcn-multiversion.md). The final default-off boot and the wider
+acceptance matrix (Chromium, DRM, 10-bit, other APUs) remain follow-ups.
 
 - Phase 1 (capability skeleton): `DeviceProfile::MediaPolicy` carries `vcnGeneration`
   (`0x0100`/`0x0202`), `vcnFirmware` (`ativvaxy_rv.dat`/`ativvaxy_nv.dat`), ring/fence sizes and
-  H.264/HEVC/AV1 flags. Only `0x1638` enables `hasVCN0`; all other profiles stay off.
-- Phase 2 (firmware/PSP + 15.8.1 data): `tools/gen_vcn_kernel_data.py` derives the kernel vtable/getter
+  H.264/HEVC/AV1 flags. `0x1638` enables `hasVCN0`; the other VCN 2.x profiles now do too (experimental),
+  while VCN 1.x profiles stay off.
+- Phase 2 (firmware/PSP + kernel data): `tools/gen_vcn_kernel_data.py` derives the kernel vtable/getter
   ABI guards and 20 cross-driver call-site patches from the live 15.8.1 `SystemKernelExtensions.kc`;
-  `NootedRed/VCNKernelData.hpp` is generated and self-checked. The existing `HWLibs` `ativvaxy_nv.dat`
-  (`ipVersion 0x0202`) injection stays in place.
+  `NootedRed/VCNKernelData.hpp` also carries the imported 14.8.9 Sonoma call-site table and a
+  `getCallPatches()` selector. The existing `HWLibs` `ativvaxy_nv.dat` (`ipVersion 0x0202`) injection stays
+  in place.
 - Phase 3 (engine): `NootedRed/VCNBridge.{hpp,cpp}` force-loads `AMDRadeonX6000` from inside the X5000
   accelerator start, verifies both drivers' ABI, applies the generated call-site patches with rollback,
   allocates `AMDVCN2HWEngine` into the X5000 PM4 engine array at `kAMDHWEngineTypeVCN0`, bridges the
@@ -24,10 +29,12 @@ default-off boot and the wider acceptance matrix (Chromium, DRM, 10-bit, other A
   Apple's engine/power path remains the hardware risk and is covered by the staged runbook.
 - Phase 4 (user space): `tools/gen_vda_va_data.py` and `tools/gen_vda_gva_data.py` derive the 15.8.1
   `AMDRadeonVADriver2` and AppleGVA patches (9 + 1 patch records, 9 page images; the last three VA
-  records are the follow-up encode feedback-stride fixes). `UserPatches` now
-  supports multiple patch tables, applies the VA/GVA tables only when `-NRedVDA` is set, the target is
-  0x1638 and the kernel VCN bridge has prepared/loaded both drivers, and keeps the GL table behaviour
-  unchanged. A failed native engine hardware-init disables the bridge and clears `hasVCN0`.
+  records are the follow-up encode feedback-stride fixes). The 14.8.9 counterparts are imported from the
+  multi-OS fork `weachy/NootedRed` (same generators, same source record format). `UserPatches` supports
+  multiple patch tables and registers the set for Darwin 23 or 24 in `NRed::init()`; it applies the
+  VA/GVA tables only when `-NRedVDA`/`-NRedAVC` is set, the profile enables VCN 2.x and the kernel VCN
+  bridge has prepared/loaded both drivers. A failed native engine hardware-init disables the bridge and
+  clears `hasVCN0`.
 - Default behaviour is unchanged: without `-NRedVDA` no VCN engine, capability, property or user-space
   hook is installed by the new code.
 - Builds pass in release, debug and releasedbg (CommandLineTools toolchain on this machine).
@@ -41,10 +48,12 @@ default-off boot and the wider acceptance matrix (Chromium, DRM, 10-bit, other A
   start can allocate a fresh engine.
 - The native page backend matches a first-word fingerprint before the full 4 KiB image, installs the
   combined table atomically (no zero-site/partial pages), and counts applied VDA pages atomically.
-- `-NRedVDA` is rejected unless the running kernel is exactly 15.8.1 24H32 and there is no external video
-  device. The exact build string is checked at accelerator-start time, because the early kext-load phase can
-  run before `osversion` is populated; if it is still empty there, the ABI guards remain the protection.
-  The native backend also rechecks the external-device condition before building VDA pages.
+- `-NRedVDA`/`-NRedAVC` is rejected unless the running kernel is Darwin 24.6 (15.8.x / 24H series) or
+  Darwin 23.6 (14.8.x / 23J series) and there is no external video device. The build family is checked at
+  accelerator-start time, because the early kext-load phase can run before `osversion` is populated; every
+  `original` call-site byte and the vtable guards are still verified, so a mismatched build is rejected
+  rather than patched. The native backend also rechecks the external-device condition before building VDA
+  pages.
 - The VA/AppleGVA generators recover stock pages from the committed tables while the runtime page cache is
   patched; the VA generator verifies the stock `__text` hash in `--check`.
 
@@ -209,15 +218,20 @@ validated on the target.
   (64×64 H.264, Hackintool create/destroy, ≥5 min idle then start, continuous playback, 10-bit HEVC).
 - Check the Chromium hardware decode path.
 
-### Phase 5 — multi-APU / multi-macOS
+### Phase 5 — multi-APU / multi-macOS (in progress)
 
-- Add MediaPolicy values per APU profile.
-- Add OS/version-specific media data where required.
+- MediaPolicy values per APU profile: done for VCN 2.x; VCN 1.x remains unsupported.
+- OS-specific media data: **15.8.1 (24H32) and 14.8.9 (23J631) implemented**; 26.x/Tahoe data is not
+  generated yet and the bridge rejects it. Selection is by Darwin version + build family, and every kernel
+  call-site/guard is verified before patching.
 - Keep DeviceProfile as the only device selector.
+- `-NRedAVC` was added for AVC-only hardware decode (HEVC stays software) on builds where the HEVC path is
+  not yet proven.
 
 ## Required data collection
 
-Use `tools/collect_platform_data.py` on each target machine. The zip includes:
+Use `tools/collect_compat_data.py` on each target machine (see
+[`tools/README-collect-compat-data.md`](../tools/README-collect-compat-data.md)). The archive includes:
 
 - GPU/APU identity and `GPUConfigurationVariable`;
 - X5000/X6000 kexts, PlugIns, Info.plists and firmware resources;
@@ -265,9 +279,9 @@ When starting a new session:
    `xmake f -m release -y && xmake -y` (and debug/releasedbg before handing off);
 4. The recorded decision is **Option A** (native X6000 engine bridge), implemented in `VCNBridge`; do not
    switch to Option B without a new decision;
-5. Phases 1-4 are implemented and hardware-validated on macOS 15.8.1 / Renoir `0x1638`. The next steps are
-   the wider acceptance matrix: boot once with `-NRedVDA` removed to confirm the default-off path on this
-   build, then Chromium/real-application playback, DRM/Apple TV, 10-bit HEVC, longer playback/desktop
-   responsiveness and Hackintool create/destroy. If the OS or AMD drivers change, regenerate
-   `VCNKernelData.hpp`, `VDAVAData.hpp` and `VDAGVAData.hpp`; never reuse this data across builds. The
-   development machine is a Renoir `0x1638` on macOS 15.8.1 (Darwin 24.6).
+5. Phases 1-4 are implemented and hardware-validated on macOS 15.8.1 / Renoir `0x1638`; 14.8.9 data is
+   integrated from the multi-OS fork but not hardware-validated here. The next steps are the wider
+   acceptance matrix (Sonoma boot + decode, then Chromium/real-application playback, DRM/Apple TV, 10-bit
+   HEVC, Hackintool create/destroy). If the OS or AMD drivers change, regenerate all three data headers
+   and add the new build to `getCallPatches()` / `NRed::init()` / `VCNBridge::isSupportedBuild()`; never
+   reuse a table across builds. The development machine is a Renoir `0x1638` on macOS 15.8.1 (Darwin 24.6).

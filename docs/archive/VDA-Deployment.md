@@ -1,9 +1,20 @@
 # VDA Hardware Decode — Deployment and Validation Runbook
 
-Status: the kernel bridge and the 15.8.1 user-space patch pipeline are implemented in
-`feature/vda-hardware-decode`. Everything is opt-in and default-off; a normal boot without `-NRedVDA` is
-unchanged. This runbook is for the first hardware bring-up on a Renoir `0x1638` test machine
-(macOS 15.8.1 / Darwin 24.6).
+Status: the kernel bridge and the user-space patch pipeline are implemented and multi-version aware.
+Everything is opt-in and default-off; a normal boot without `-NRedVDA`/`-NRedAVC` is unchanged.
+
+| macOS build | Darwin | VCN data | Hardware state |
+| --- | --- | --- | --- |
+| 15.8.1 / 24H32 | 24.6 | Sequoia tables (VA 9 records / 8 pages, GVA 1) | ✅ validated on Renoir 0x1638 |
+| 14.8.9 / 23J631 | 23.6 | Sonoma tables (VA 9 records / 8 pages, GVA 1) | 🟡 integrated from `weachy/NootedRed`, not hardware-tested here |
+| other 23J / 24H builds | 23.6 / 24.6 | same per-family tables | 🟡 build-family gate + ABI/call-site verification; untested |
+| 26.x / Tahoe | 25.x | none | ⛔ rejected |
+
+Supported APUs: Renoir `0x1636`, Renoir/Green Sardine `0x1638` (validated), Cezanne `0x164C`, Barcelo
+`0x15E7` (experimental) — all require VCN 2.x and no external GPU. Raven/Raven2/Picasso (VCN 1.x) are not
+supported.
+
+This runbook uses a Renoir `0x1638` test machine (macOS 15.8.1 / Darwin 24.6) as the baseline.
 
 > **Safety first:** keep a bootable EFI backup and know how to remove `-NRedVDA` from the OpenCore
 > config/NVRAM before booting with the new kext. If the accelerator hangs during boot, boot with the
@@ -29,6 +40,7 @@ collection, generated data and build artifact:
 
 ```sh
 tools/vda_preflight.sh
+python3 tools/test_vcn_multibuild.py   # static per-build data checks
 ```
 
 ## 2. Back up the working EFI kext
@@ -55,6 +67,12 @@ shasum -a 256 /Volumes/EFI/EFI/OC/Kexts/NootedRed.kext/Contents/MacOS/NootedRed
 Add `-NRedVDA` to the OpenCore `NVRAM/Add/7C436110-AB2A-4BBB-A880-FE41995C9F82/boot-args` value (keep the
 existing arguments, e.g. `-NRedGLFix` if used). Do **not** add `-NRedNoAccel` at the same time.
 
+Use `-NRedVDA` for full hardware AVC + HEVC decode. Use `-NRedAVC` instead to keep only AVC/H.264 on the
+hardware engine and leave HEVC to software (the HEVC path is less proven on Sonoma-era builds; the injected
+X5000 personality has its HEVC capabilities removed in this mode). Both flags are aliases for enabling the
+bridge; do not use them together.
+
+
 The helper script backs up and lint-checks the config before/after the change:
 
 ```sh
@@ -78,7 +96,7 @@ Run [`tools/vda_selftest.sh`](../tools/vda_selftest.sh) after boot (basic diagno
 - `ffmpeg -hwaccels` (if ffmpeg is installed);
 - recent `.gpuRestart`/WindowServer watchdog reports.
 
-Expected progression on a successful boot with `-NRedVDA`:
+Expected progression on a successful boot with `-NRedVDA` (or `-NRedAVC`):
 
 ```text
 VCN: X5000 VCN entry points prepared
@@ -114,7 +132,10 @@ adverse case from the community fork). Watch for:
 - `Kernel_*.gpuRestart` reports;
 - system network/audio panics (reported by the fork for Apple TV DRM).
 
-## 7. Validated results (2026-10-19)
+## 7. Validated results (15.8.1 baseline, 2026-10-19)
+
+The 14.8.9 tables are imported and statically validated by `tools/test_vcn_multibuild.py`, but have not
+been booted here; use the same staged runbook on a Sonoma machine before trusting them.
 
 The target passed the real-hardware runs on 2026-10-19 (latest loaded kext SHA-256
 `3495df006ca54f4d9cfd4899e23126efeb1009c9a0ea51660b4bf3c27a9121ba`):

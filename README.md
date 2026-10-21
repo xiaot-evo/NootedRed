@@ -42,13 +42,19 @@ along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowled
 
 ## Documentation
 
-- [Compatibility architecture](docs/Compatibility-Architecture.md) — multi-macOS × multi-APU design:
-  target identity vs hardware capability, verification ladder, manifest pipeline and milestones.
-- [Contributing to UserPatches](docs/CONTRIBUTING-USERPATCHES.md) — architecture, adding macOS builds,
-  APU families, patch-data generation, resolver rules, and testing checklist.
-- [Chromium/Electron fix usage](docs/Chromium-Fix-Usage.md) — end-user installation and rollback.
-- [Device profile / media capability layer](docs/Device-Profile.md) — graphics + future VDA capability model.
-- [Platform data collector](tools/README-collect-platform-data.md) — collect a target machine's drivers, kexts, firmware and capabilities for new macOS/APU support.
+- [Architecture](docs/ARCHITECTURE.md) — kernel plane vs root-patch plane, the research behind the
+  redesign, data contracts, support policy and migration plan.
+- [Compatibility matrix](docs/COMPATIBILITY.md) — per-build, per-APU status for GLFIX, VDA/VCN, and what
+  macOS 26 does and does not support today.
+- [Root patch pipeline](docs/ROOT-PATCH-PIPELINE.md) — design of the companion user-space patcher:
+  versioned payloads, manifests, APFS snapshot install/revert, KDK/kmutil/cache handling and CI gates.
+- [Build artifacts](docs/Build-Artifacts.md) — kext build layout and artifact locations.
+- [Platform data index](docs/Platform-Data-Index.md) — collected platform data used to derive payloads.
+- [Compatibility data collector](tools/README-collect-compat-data.md) — collect a target machine's
+  drivers, kernel data, VDA data and capabilities for a new macOS/APU payload.
+- [Archived documentation](docs/archive/README.md) — historical in-memory patching documents, kept for
+  reference only.
+- Research notes live in the local `analysis/` directory and are intentionally not tracked.
 
 ## Build artifacts
 

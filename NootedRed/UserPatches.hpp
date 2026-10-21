@@ -98,6 +98,36 @@ public:
         size_t count;
     };
 
+    // Semantic patch kinds.  The runtime verifies the instruction form before writing anything, so a
+    // masked context that happens to match unrelated instructions cannot corrupt a page.
+    enum SemanticKind : UInt8 {
+        kSemanticGLHwInfo = 0,
+        kSemanticGLDualQuad,
+        kSemanticMTLGate,
+        kSemanticMTLAllow,
+        kSemanticMTLDirect,
+    };
+
+    // Instruction-context patch used by the generic (symbol/semantics based) backend.  A masked context
+    // window identifies a site by the surrounding instruction semantics; `find` is then verified verbatim
+    // at `siteOffset` and replaced with same-length `replace` bytes.  `group` 0 means a standalone site,
+    // non-zero sites share a group and only apply when every site in that group matches the same page.
+    struct SemanticPatch
+    {
+        const char*   name;
+        const UInt8*  context;
+        const UInt8*  mask;
+        size_t        contextSize;
+        size_t        siteOffset;
+        const UInt8*  find;
+        size_t        findSize;
+        const UInt8*  replace;
+        size_t        replaceSize;
+        UInt8         group;
+        bool          cachePage;
+        SemanticKind  kind;
+    };
+
     // User-space OpenGL driver this module exists to patch.
     static constexpr const char* kGLDriverPath =
         "/System/Library/Extensions/AMDRadeonX5000GLDriver.bundle/Contents/MacOS/AMDRadeonX5000GLDriver";
@@ -164,6 +194,14 @@ private:
     const PatchSet* patchSets{nullptr};
     size_t          patchSetCount{0};
 
+    // Generic semantic backend.  GL entries are enabled together with the GL fix and only patch the
+    // vnode-backed AMDRadeonX5000GLDriver; Metal variants scan shared-cache pages and are opt-in because
+    // that backend validates much more data per boot.
+    const SemanticPatch* semanticPatches{nullptr};
+    size_t               semanticPatchCount{0};
+    bool                 semanticEnabled{false};
+    bool                 semanticMTLEnabled{false};
+
     const PagePatch* patches{nullptr};
     size_t           patchCount{0};
 
@@ -199,7 +237,18 @@ private:
     auto installUserPatcher() -> bool;
     auto installNativePagePatcher(KernelPatcher& patcher) -> bool;
     auto buildNativePatches() -> bool;
-    void patchNativePage(const void* data);
+    void patchNativePage(const void* data, void* vnode, bool cachePage);
+
+    // Generic semantic backend: matches instruction-context windows instead of full page images.  Returns
+    // true when at least one site was patched.  `vnode` is the code-signing vnode for file-backed pages and
+    // nullptr for shared-cache ranges; GL entries are only applied when the vnode is the X5000 GL driver.
+    auto patchSemanticPage(const void* data, void* vnode, bool cachePage) -> bool;
+    auto isGLDriverVnode(void* vnode) const -> bool;
+
+    // Returns true when `data` is an already-patched version of an exact native page.  This is the normal
+    // state for a page after the first process validated it: the kernel keeps the patched bytes, so a later
+    // validation must not scan the page again.
+    auto isPatchedPage(const NativePage& page, const UInt8* data) const -> bool;
 
     static void      wrapCsValidatePage(void* vnode, void* pager, UInt64 pageOffset, const void* data, int* validated,
                                         int* tainted, int* nx);

@@ -1,68 +1,86 @@
-### macOS
-# Finder metadata
+# ---------------------------------------------------------------------------
+# Build and toolchain output
+# ---------------------------------------------------------------------------
+build/
+.xmake/
+compile_commands.json
+.cache/
+*.dSYM/
+
+# ---------------------------------------------------------------------------
+# Local decompiler / toolchain installations (large, not part of the project)
+# ---------------------------------------------------------------------------
+/tools/ghidra/
+/tools/ghidra-dl/
+/tools/ghidra-home/
+/tools/gradle-home/
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# Local git worktrees
+# ---------------------------------------------------------------------------
+/.worktrees/
+
+# ---------------------------------------------------------------------------
+# External tester datasets (Apple binaries, nvram, hardware identifiers)
+# ---------------------------------------------------------------------------
+/platform-data/
+
+# ---------------------------------------------------------------------------
+# Local workspace / agent instructions
+# ---------------------------------------------------------------------------
+/AGENTS.md
+
+# ---------------------------------------------------------------------------
+# Local research notes (kept on the developer machine, not tracked)
+# ---------------------------------------------------------------------------
+/analysis/
+/Chromium-OpenGL-Issue-Report.md
+
+# ---------------------------------------------------------------------------
+# macOS
+# ---------------------------------------------------------------------------
 .DS_Store
-
-# Thumbnails
 ._*
-
-# Custom folder icons
 Icon
-
-
-# Volume root files
-.DocumentRevisions-V100
-.fseventsd
-.Spotlight-V100
-.TemporaryItems
-.Trashes
+.DocumentRevisions-V100/
+.fseventsd/
+.Spotlight-V100/
+.TemporaryItems/
+.Trashes/
 .VolumeIcon.icns
 .com.apple.timemachine.donotpresent
 
-### Windows
-# Windows thumbnail cache files
+# ---------------------------------------------------------------------------
+# Windows
+# ---------------------------------------------------------------------------
 Thumbs.db
-
-# Folder config file
 [Dd]esktop.ini
-
-# Recycle Bin used on file shares
 $RECYCLE.BIN/
-
-# Windows shortcuts
 *.lnk
 
-### Linux
-# Backup files
+# ---------------------------------------------------------------------------
+# Linux
+# ---------------------------------------------------------------------------
 *~
-
-# Temporary files from deleted open files
 .fuse_hidden*
-
-# KDE directory preferences
 .directory
-
-# Linux trash folder
 .Trash-*
-
-# NFS temporary files
 .nfs*
 
-### Xmake
-# Config cache
-.xmake/
-
-# Build folder
-build/
-
-# Compile commands for LSP
-compile_commands.json
-
-### clangd
-# Cache
-.cache/
-
-# External tester datasets (Apple binaries, nvram, hardware identifiers)
-platform-data/
-
-# Local git worktrees
-.worktrees/
+# ---------------------------------------------------------------------------
+# Editors and patch/merge leftovers
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*.orig
+*.rej

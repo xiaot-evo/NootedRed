@@ -1,4 +1,7 @@
-# Platform data collector
+# Platform data collector (legacy)
+
+> Superseded by [`collect_compat_data.py`](README-collect-compat-data.md) for current Chromium-fix and
+> VDA work.  This script is kept for the historical `platform-data/` datasets.
 
 `collect_platform_data.py` collects everything needed to add a new macOS build / APU family to the
 DeviceProfile and PatchSet tables. It does **not** install or patch anything.

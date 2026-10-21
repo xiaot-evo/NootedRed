@@ -6,6 +6,11 @@
 It does **not** guess offsets. The spec must supply the page offset/VA and the
 exact find/replace bytes for that build.
 
+If the build has no spec yet, check whether the semantic fallback already covers the GL sites
+(`Semantic patch applied` in the log; see the local analysis notes) before spending time on a
+new page snapshot. The semantic data is instruction-context based and validated for macOS 14, 15.8.1 and
+26.7.1 GL drivers.
+
 ## Requirements
 
 - Run on the target macOS install, with the **unmodified** `AMDRadeonX5000GLDriver`
@@ -56,7 +61,7 @@ python3 tools/gen_patch_data.py spec.json --out /tmp/new-set.cpp
 
 Add the generated arrays and `kGeneratedPatches` to `NootedRed/UserPatches.cpp`,
 then add its `PatchSet` to `kGLDriverPatchSets` with the correct Darwin
-`major.minor` and APU mask. See `analysis/multi-os-multi-apu.md`.
+`major.minor` and APU mask. See the local analysis notes.
 
 ## Safety
 

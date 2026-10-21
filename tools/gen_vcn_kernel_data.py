@@ -21,7 +21,7 @@
 # You should have received a copy of the ChefKiss Open Knowledge License
 # along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowledge/raw/branch/master/LICENSE-v1.md.
 
-"""Generate NootedRed/VCNKernelData.hpp from the live macOS 15.8.1 kernel collection.
+"""Generate NootedRed/VCNData/24H32.hpp from the live macOS 15.8.1 kernel collection.
 
 The header carries the version-specific data required by the native
 AMDRadeonX6000 VCN2 engine bridge inside the AMDRadeonX5000 accelerator
@@ -57,7 +57,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KC = Path("/System/Library/KernelCollections/SystemKernelExtensions.kc")
-DEFAULT_HEADER = REPO_ROOT / "NootedRed" / "VCNKernelData.hpp"
+DEFAULT_HEADER = REPO_ROOT / "NootedRed" / "VCNData" / "24H32.hpp"
 
 MH_MAGIC_64 = 0xFEEDFACF
 CPU_TYPE_X86_64 = 0x01000007
@@ -633,12 +633,18 @@ def format_hex_array(name, values, indent="    "):
 
 def emit_header(data):
     source = data["source"]
-    lines = [LICENSE_HEADER.rstrip("\n"), "", "#pragma once", "", "#include <IOKit/IOTypes.h>", ""]
-    lines += ["namespace VCNKernelData {", "    struct CallPatch {",
-              "        const char* symbol;", "        UInt32 offset;", "        UInt8 original[6];",
-              "        UInt32 newSlot;", "    };", ""]
-    lines += ["    struct SlotGuard {", "        UInt32 slot;", "        const char* methodSymbol;",
-              "        const UInt8* getter;", "        UInt32 getterSize;", "    };", ""]
+    if source["build"] != "24H32":
+        fail("this generator only emits the validated 24H32 variant (got {})".format(source["build"]))
+    kernel_parts = source["kernel"].split(".")
+    if len(kernel_parts) < 2:
+        fail("cannot parse Darwin version {!r}".format(source["kernel"]))
+    darwin_major, darwin_minor = int(kernel_parts[0]), int(kernel_parts[1])
+
+    lines = [LICENSE_HEADER.rstrip("\n"), "", "#pragma once", "#include <VCNData.hpp>", ""]
+    lines += ["namespace VCNData::Build24H32", "{",
+              '    inline constexpr char Build[] = "{}";'.format(source["build"]),
+              "    inline constexpr UInt32 DarwinMajor = {};".format(darwin_major),
+              "    inline constexpr UInt32 DarwinMinor = {};".format(darwin_minor), ""]
     for kext_id in (X5000_ID, X6000_ID):
         for entry in data["guards"][kext_id]:
             if entry["getter_name"] is not None:
@@ -668,6 +674,11 @@ def emit_header(data):
         lines.append("        },")
     lines += ["    };", ""]
     lines += ['    inline constexpr char SignalSymbol[] = "{}";'.format(SIGNAL_SYMBOL), ""]
+    lines += ["    inline constexpr UInt32 kCallPatchCount = sizeof(CallPatches) / sizeof(CallPatches[0]);",
+              '    static_assert(kCallPatchCount <= kMaxCallPatches, "call-site table must fit the bridge array");',
+              '    static_assert(sizeof(Guards5000) / sizeof(Guards5000[0]) == 6, "X5000 guard table must contain 6 entries");',
+              '    static_assert(sizeof(Guards6000) / sizeof(Guards6000[0]) == 6, "X6000 guard table must contain 6 entries");',
+              ""]
     source_parts = (
         "macOS {} ({}) x86_64, Darwin {}; ".format(
             source["product"], source["build"], source["kernel"]),
@@ -680,8 +691,6 @@ def emit_header(data):
         suffix = ";" if index == len(source_parts) - 1 else ""
         lines.append("        \"{}\"{}".format(part, suffix))
     lines.append("")
-    lines.append("    // Source identity for runtime diagnostics; the bridge must compare these against")
-    lines.append("    // the loaded kernel collection/kexts before installing any guard or patch.")
     lines.append('    inline constexpr char KernelCollectionUUID[] = "{}";'.format(source["kc_uuid"]))
     lines.append('    inline constexpr char DriverUUID5000[] = "{}";'.format(
         source["kexts"][X5000_ID]["uuid"]))
@@ -695,8 +704,17 @@ def emit_header(data):
         source["kexts"][X5000_ID]["sha256"]))
     lines.append('    inline constexpr char DriverSHA256_6000[] = "{}";'.format(
         source["kexts"][X6000_ID]["sha256"]))
-    lines.append("}    // namespace VCNKernelData")
     lines.append("")
+    lines += ["    inline constexpr Variant kData = {",
+              "        2,", "        Build,", "        DarwinMajor,", "        DarwinMinor,",
+              "        SourceDescription,", "        CallPatches,", "        kCallPatchCount,",
+              "        Guards5000,", "        sizeof(Guards5000) / sizeof(Guards5000[0]),",
+              "        Guards6000,", "        sizeof(Guards6000) / sizeof(Guards6000[0]),",
+              "        Table5000,", "        Table6000,", "        SignalSymbol,",
+              "        true,", "        KernelCollectionUUID,", "        DriverUUID5000,",
+              "        DriverUUID6000,", "        DriverVersion5000,", "        DriverVersion6000,",
+              "        DriverSHA256_5000,", "        DriverSHA256_6000,", "    };",
+              "}    // namespace VCNData::Build24H32", ""]
     return "\n".join(lines)
 
 
@@ -786,6 +804,14 @@ def check_header(kc, data, expected_text, output):
         original = bytes(int(token, 16) for token in re.findall(r"0x([0-9A-F]{2})", match.group(3)))
         patches.append((match.group(1), int(match.group(2), 16), original, int(match.group(4), 16)))
 
+    build_match = re.search(r'inline constexpr char Build\[\] = "([^"]+)";', actual_text)
+    if build_match is None or build_match.group(1) != source["build"]:
+        fail("header Build does not match the kernel collection build")
+    kernel_parts = source["kernel"].split(".")
+    for label, expected in (("DarwinMajor", int(kernel_parts[0])), ("DarwinMinor", int(kernel_parts[1]))):
+        match = re.search(r'inline constexpr UInt32 {}\s*=\s*(\d+);'.format(label), actual_text)
+        if match is None or int(match.group(1)) != expected:
+            fail("header {} does not match the kernel Darwin version".format(label))
     signal_match = re.search(r'inline constexpr char SignalSymbol\[\] = "([^"]+)";',
                                            actual_text)
     kc_uuid_match = re.search(r'inline constexpr char KernelCollectionUUID\[\] = "([^"]+)";',
@@ -865,7 +891,7 @@ def check_header(kc, data, expected_text, output):
 
 def main(argv):
     parser = argparse.ArgumentParser(
-        description="Generate/verify NootedRed/VCNKernelData.hpp from the 15.8.1 kernel collection.")
+        description="Generate/verify NootedRed/VCNData/24H32.hpp from the 15.8.1 kernel collection.")
     parser.add_argument("--check", action="store_true",
                         help="re-read the kernel collection and header and fail on any mismatch")
     parser.add_argument("--kc", type=Path, default=DEFAULT_KC,

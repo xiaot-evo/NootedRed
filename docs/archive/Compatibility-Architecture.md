@@ -29,15 +29,15 @@ The goal is one kext binary and one data model that:
 | Component | `master` | Feature branches | Problem |
 | --- | --- | --- | --- |
 | Patch selection | single `PagePatch` table, `-NRedGLFix` | `PatchSet{minVersion,maxVersion,ApuMask}` in `feature/multi-os-multi-apu`, `feature/tahoe-26.7.1` | version and APU are one conjunctive key |
-| Site location | exact 4 KiB page image + `find`/`replace` | `SignaturePatch` (32 B masked context) in `research/patch-resolver` | per-build snapshots; resolver is a smaller snapshot |
+| Site location | exact 4 KiB page image + `find`/`replace`; semantic context fallback in `master` | `SignaturePatch` (32 B masked context) | exact tables need per-build snapshots; semantic data is instruction-level |
 | Hardware model | `DeviceProfile` (device ID key, media all false) | VDA branch adds VCN generation/firmware/ring fields | version range unused; media fields unreachable |
 | VCN data | none | `VCNKernelData.hpp`, `VDAVAData.hpp`, `VDAGVAData.hpp`, generators with `--check` | all data pinned to 15.8.1 / `0x1638` |
-| Data collection | `platform-data/`, `tools/collect_platform_data.py`, importer | — | captures binaries but no generated consumer; `kexts.json` has `binary: null` |
+| Data collection | `platform-data/`, `tools/collect_compat_data.py`, importer | — | older datasets predate the focused collector; see [collector](../tools/README-collect-compat-data.md) |
 | Media capability | personality advertises `IOGVACodec=AMDVCN2` unconditionally | `hasVCN0` from profile, all false | advertisement and kernel capability have different sources |
 
 This section records the state before the branch integration described in §8. After that integration,
-`master` carries the `PatchSet` framework, the Tahoe page data and the VDA module; the resolver and the
-iGPU/HwInfo research remain on their research branches.
+`master` carries the `PatchSet` framework, the Tahoe page data, the VDA module and the resolver prototype
+as an opt-in fallback; the iGPU/HwInfo research remains on its research branch.
 
 Recent data points that motivate the redesign:
 - `0x1638` and `0x164c` on the same macOS 26.7.1 build have identical GL/MTL driver hashes but different
@@ -208,8 +208,13 @@ has C++ symbols. A function-scoped search makes unrelated code churn irrelevant 
 positives by orders of magnitude. `PatcherPlus.hpp` already has `jumpInstDestination()`, so the
 instruction decoder has a place to live.
 
-The `research/patch-resolver` prototype is the seed of L1–L3. Its 32-byte full-mask contexts are still
-per-build snapshots, and its Metal signatures have no module scope; both are Milestone 3 work.
+The `research/patch-resolver` prototype was the seed of L1–L3 and is still available as an opt-in
+resolver (`-NRedGLFixResolve`). The semantic backend (`GLFixSemanticData.hpp` + `patchSemanticPage`) is
+the L1 path for the Chromium GL sites: it uses instruction-context windows, verifies the instruction form
+at the site, rejects ambiguity, and keeps the exact-page tables as the L0 fast path. Its Metal variants
+are grouped per build (Sonoma/Sequoia/Tahoe) and only apply when every site in the group matches the same
+cache page; Metal scanning is automatic on builds without a patch set and can be forced with
+`-NRedGLFixSemanticMTL`. See [`analysis/gl-semantic-patches.md`](../analysis/gl-semantic-patches.md).
 
 ### 4.8 Support levels and logging contract
 
@@ -269,7 +274,7 @@ with codec capabilities matching the VCN generation.
 Target state:
 
 ```
-collect_platform_data.py  ->  platform-data/<dataset>/
+collect_compat_data.py   ->  <dataset>/ (Chromium sites, VDA headers, metadata)
         |
         v
 build_compat_manifest.py  ->  compat/compat-manifest.json   (git tracked, deterministic, diffable)
@@ -300,7 +305,13 @@ illustrative until Milestone 4):
 | --- | --- | --- | --- | --- |
 | 15.8.1 (24H32) | Renoir `0x1638` | GL/Metal fix | validated | `analysis/hwinfo-capability-source.md` |
 | 15.8.1 (24H32) | Renoir `0x1638` | VDA decode/encode | validated (`-NRedVDA`, default off) | `analysis/vda-1581-hardware-validation.md` |
+| 15.8.1 (24H32) | other VCN 2.x APUs (`0x1636`/`0x164C`/`0x15E7`) | VDA decode/encode | experimental (profile enables VCN0; bridge/ABI gates still apply) | `DeviceProfile` media policy |
+| 14.8.9 (23J631) | Renoir `0x1638` | VDA decode/encode | data integrated, not hardware-validated (`-NRedVDA`/`-NRedAVC`) | `analysis/vcn-multiversion.md` |
+| 14.8.9 (23J631) | other VCN 2.x APUs (`0x1636`/`0x164C`/`0x15E7`) | VDA decode/encode | experimental (profile enables VCN0; ABI/call-site gates) | `analysis/vcn-multiversion.md` |
+| 26.x | any | VDA | unavailable | no VCN data generated; bridge rejects |
 | 26.7.1 | `0x1638`/`0x164c` | GL/Metal fix | experimental | `feature/tahoe-26.7.1` data, unverified |
+| 14.x / 15.8.1 / 26.7.1 | any gfx9 APU | GL fix (A1/A2) | semantic fallback validated offline | `analysis/gl-semantic-patches.md` |
+| 14.x / 15.8.1 / 26.7.1 | any gfx9 APU | Metal fix | semantic variants, experimental | Metal contexts per known build; 26.x uses the direct-field variant |
 | any | Raven/Raven2/Picasso | GL/Metal fix | experimental | code-compatible, no hardware validation |
 | any | Raven/Raven2/Picasso | VDA | unavailable | VCN1 not implemented |
 | other builds | any | any | no-op | no target identity match |
@@ -323,8 +334,8 @@ this order:
    verification and feed its decisions through the same plan/log path.
 5. **Research branches** (`research/igpu-hwinfo-logic`): documentation/analysis, merge last.
 
-Status: steps 1, 3 and 4 are merged into `master` (2026-10-19); step 2
-(`research/patch-resolver`) and step 5 remain on their research branches. No branch was rebased: the
+Status: steps 1, 2, 3 and 4 are integrated into `master` (2026-10-19) — the resolver prototype was ported
+from `research/patch-resolver` as an opt-in fallback; step 5 remains on its research branch. No branch was rebased: the
 conflicts were resolved by keeping the framework's `PatchSet` selection and the VDA module's direct
 `processPatcher` wiring, and by merging both halves of `DeviceProfile` (capability/version model from
 this work plus the media data from the VDA work).
@@ -347,9 +358,10 @@ this work plus the media data from the VDA work).
     to the hardware-validated profile.
 - `CompatTarget` target-identity type and bounds-checked Mach-O `LC_UUID` parser
   (`NootedRed/CompatTarget.{hpp,cpp}`). Boot-time capture is deliberately **not** wired yet: the first
-  implementation read the driver file through the VFS during Lilu's patcher-load phase, which turned out to
-  be the only new early-boot side effect in the merged tree and is suspected of stalling boot, so it was
-  removed. Identity capture returns in Milestone 2 using in-memory page/vnode data.
+  implementation read the driver file through the VFS during Lilu's patcher-load phase, which was the only
+  new early-boot side effect in the merged tree and stalled boot on the target machine (confirmed by
+  removing it: the merged build then booted with both `-NRedGLFix` and `-NRedVDA`), so it was removed.
+  Identity capture returns in Milestone 2 using in-memory page/vnode data.
 - Canonical decision log + IORegistry properties (`DeviceProfile::logCurrent()`), emitted once after
   device detection.
 - No behaviour change: all existing profiles keep the same graphics policy and disabled media; the log
@@ -375,11 +387,17 @@ turns the feature off with a reason; adding a build only touches generated data.
 
 - Function/symbol-scoped anchors, masked contexts, instruction decode before/after write, ambiguity
   rejection, module/page scoping for both GL and MTL.
-- Upgrade `research/patch-resolver` to L1–L3 and keep L0 as the validated fast path.
-- Generate anchors from symbols in `gen_patch_data.py`; validate anchor uniqueness offline.
+- The semantic backend is now in `master` (`GLFixSemanticData.hpp` + `patchSemanticPage`) as the L1
+  path for the Chromium GL sites, with the exact-page tables kept as the L0 fast path.
+- Metal variants are grouped per known build (Sonoma/Sequoia/Tahoe); the Tahoe direct-field variant is
+  preferred for 26.x, and the gate/allow groups remain as fallbacks. A new build needs a new context
+  variant derived from its MTL image.
+- The resolver prototype remains available as an opt-in QA path (`-NRedGLFixResolve` /
+  `-NRedGLFixResolveOnly`).
 
-Acceptance: resolver QA mode (`-NRedGLFixResolveOnly`) still passes on 15.8.1; a build whose page
-changed but whose function bytes did not is handled without new snapshots; ambiguity is a no-op.
+Acceptance: resolver QA mode still passes on 15.8.1; `tools/test_gl_semantic_data.py` validates the GL
+contexts against 14/15.8.1/26.7.1 and the Metal fixtures; a build whose page changed but whose
+instruction context did not is handled without new snapshots; ambiguity is a no-op.
 
 ### Milestone 4 — Manifest pipeline
 
@@ -413,11 +431,13 @@ validated matrix; VCN1 either works on hardware or is explicitly unavailable.
 ## 11. References
 
 - [Contributing to UserPatches](CONTRIBUTING-USERPATCHES.md)
+- [Patch architecture: GLFIX and VDA/VCN](Patch-Architecture.md)
 - [Chromium/Electron fix usage](Chromium-Fix-Usage.md)
 - [Device profile / media capability layer](Device-Profile.md)
 - [`analysis/multi-os-multi-apu.md`](../analysis/multi-os-multi-apu.md)
-- `analysis/patch-resolver.md` (`research/patch-resolver`, research branch only)
+- [`analysis/gl-semantic-patches.md`](../analysis/gl-semantic-patches.md)
+- [`analysis/patch-resolver.md`](../analysis/patch-resolver.md)
 - [VDA implementation plan](VDA-Implementation-Plan.md) and
   [`analysis/vda-1581-hardware-validation.md`](../analysis/vda-1581-hardware-validation.md)
-- [Platform data collector](../tools/README-collect-platform-data.md)
+- [Compatibility data collector](../tools/README-collect-compat-data.md)
 - [Platform data index](Platform-Data-Index.md)

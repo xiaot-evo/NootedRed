@@ -30,9 +30,9 @@ namespace
     constexpr auto kProfileMinVersion = MACOS_10_4_X;
     constexpr auto kProfileMaxVersion = MACOS_26_X;
 
-    // VCN capability data for every supported APU family.  The engine enablement flag is only set on the
-    // hardware-validated profile: 0x1638.  Everything else carries the data but stays disabled until its own
-    // hardware validation.
+    // VCN capability data for every supported APU family.  The engine enablement flag is set for the VCN 2.x
+    // family: 0x1638 is the hardware-validated target and the other VCN 2.x APUs are experimental.  VCN 1.x
+    // carries the data but stays disabled until a VCN 1.x path exists.
     //
     // The ring/fence sizes are the allocation sizes the future VCN submission path will request.  They are
     // carried in the profile now so the media path has a single source of truth; nothing allocates them yet.
@@ -53,28 +53,30 @@ namespace
 
     // HWLibs embeds `Firmware/ativvaxy_rv.dat` for VCN 1.0 and `Firmware/ativvaxy_nv.dat` for VCN 2.2.
     constexpr auto kVcn1Media     = makeVcnMedia(DeviceProfile::kVcn1_0, "ativvaxy_rv.dat");
-    constexpr auto kVcn2Media     = makeVcnMedia(DeviceProfile::kVcn2_2, "ativvaxy_nv.dat");
     constexpr auto kVcn2MediaVcn0 = makeVcnMedia(DeviceProfile::kVcn2_2, "ativvaxy_nv.dat", true);
 
-    // Profiles for the APUs NootedRed supports today.  Only Renoir/Green Sardine 0x1638 (the hardware-validated
-    // VDA target) enables VCN0; the other profiles keep it off until validated.
+    // Profiles for the APUs NootedRed supports today.  The VCN 2.x family (Renoir, Renoir/Green Sardine,
+    // Cezanne and Barcelo) enables the media engine so the same VDA implementation can be tried on every
+    // VCN 2.x APU; 0x1638 is the hardware-validated target and the others are experimental.  Raven, Raven2
+    // and Picasso are VCN 1.x, which the X6000 VCN2 bridge cannot serve, so they keep media disabled until
+    // a VCN 1.x strategy exists.
     //
     // The table is keyed by device ID only.  The [minVersion, maxVersion] window is metadata for now; the
     // authoritative selector for patch data becomes the identity of the Apple binary being patched
     // (docs/Compatibility-Architecture.md).  The support level is a coarse per-profile roll-up: the only
     // hardware-validated combination is the conditional GL/Metal fix on macOS 15.8.1 / 0x1638, but that is a
     // per-build fact and this entry is version-wide, so no profile is marked kValidated until the generated
-    // manifest can express per-build levels.  Media engine enablement is limited to the validated profile,
-    // which also keeps the roll-up at experimental.
+    // manifest can express per-build levels.  Media enablement is limited to VCN 2.x, which also keeps the
+    // roll-up at experimental.
     constexpr DeviceProfile::Profile kProfiles[] = {
         {"Renoir", 0x1636, DeviceProfile::kRenoir, DeviceProfile::kExperimental, kProfileMinVersion,
-         kProfileMaxVersion, {}, kVcn2Media},
+         kProfileMaxVersion, {}, kVcn2MediaVcn0},
         {"Renoir/Green Sardine", 0x1638, DeviceProfile::kGreenSardine, DeviceProfile::kExperimental,
          kProfileMinVersion, kProfileMaxVersion, {}, kVcn2MediaVcn0},
         {"Cezanne", 0x164C, DeviceProfile::kCezanne, DeviceProfile::kExperimental, kProfileMinVersion,
-         kProfileMaxVersion, {}, kVcn2Media},
+         kProfileMaxVersion, {}, kVcn2MediaVcn0},
         {"Barcelo", 0x15E7, DeviceProfile::kBarcelo, DeviceProfile::kExperimental, kProfileMinVersion,
-         kProfileMaxVersion, {}, kVcn2Media},
+         kProfileMaxVersion, {}, kVcn2MediaVcn0},
         {"Raven", 0x15DD, DeviceProfile::kRaven, DeviceProfile::kExperimental, kProfileMinVersion,
          kProfileMaxVersion, {}, kVcn1Media},
         // 0x15D8 covers Raven2 and Picasso; NRed::hwLateInit() refines the distinction from devRevision.
@@ -124,15 +126,27 @@ namespace
         return !media.hasUVD0 && !media.hasVCE && !media.hasVCN0;
     }
 
+    // Media enablement is limited to VCN 2.x profiles until a VCN 1.x path exists; the validated 0x1638
+    // target must keep it on so a regression there cannot slip through silently.
     template<size_t N>
-    constexpr auto onlyValidatedProfileEnabled(const DeviceProfile::Profile (&profiles)[N]) -> bool
+    constexpr auto onlyVcn2ProfilesEnableMedia(const DeviceProfile::Profile (&profiles)[N]) -> bool
     {
         for (const auto& profile : profiles) {
-            const auto enabled = !mediaDisabled(profile.media);
-            if (enabled != (profile.deviceID == 0x1638)) { return false; }
+            if (mediaDisabled(profile.media)) { continue; }
+            if (profile.media.vcnGeneration != DeviceProfile::kVcn2_2) { return false; }
         }
 
         return true;
+    }
+
+    template<size_t N>
+    constexpr auto profileEnablesMedia(const DeviceProfile::Profile (&profiles)[N], const UInt16 deviceID) -> bool
+    {
+        for (const auto& profile : profiles) {
+            if (profile.deviceID == deviceID) { return !mediaDisabled(profile.media); }
+        }
+
+        return false;
     }
 
     template<size_t N>
@@ -155,8 +169,10 @@ namespace
     static_assert(uniqueDeviceIDs(), "Device profile device IDs must be unique");
     static_assert(versionRangesValid(), "Device profile version ranges must be ordered");
     static_assert(graphicsPoliciesEnabled(), "Current profiles must keep the graphics policy enabled");
-    static_assert(onlyValidatedProfileEnabled(kProfiles),
-                  "Only the hardware-validated 0x1638 profile may enable VCN0 until the others are tested");
+    static_assert(onlyVcn2ProfilesEnableMedia(kProfiles),
+                  "Media enablement is limited to VCN 2.x profiles until a VCN 1.x path exists");
+    static_assert(profileEnablesMedia(kProfiles, 0x1638),
+                  "The hardware-validated 0x1638 profile must keep VCN0 enabled");
     static_assert(allVcnDataPresent(kProfiles),
                   "Every profile needs VCN data, H.264/HEVC decode and no AV1 before media can be enabled");
     static_assert(mediaDisabled(kFallbackProfile.media), "The fallback profile must not enable any media engine");

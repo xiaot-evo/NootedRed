@@ -23,6 +23,7 @@
 #include <DriverInjector.hpp>
 #include <Headers/kern_patcher.hpp>
 #include <Headers/kern_util.hpp>
+#include <VDA.hpp>
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSDictionary.h>
@@ -88,6 +89,25 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
             singleton().matchedDrivers |= getBit(identifierIndex);
 
             DBGLOG("DriverInjector", "Matched %s, injecting.", driver.identifier);
+
+            // AVC-only mode keeps the hardware path usable on builds/APUs where the HEVC engine path is
+            // unstable: remove the HEVC capabilities from the X5000 personality so VideoToolbox selects
+            // software for HEVC while AVC/H.264 still goes through VCN.
+            if (VDA::singleton().isAVCOnly()
+                && strcmp(driver.identifier, "com.apple.kext.AMDRadeonX5000") == 0) {
+                const auto personalityCount = driver.personalities->getCount();
+                for (UInt32 personalityIndex = 0; personalityIndex < personalityCount; ++personalityIndex) {
+                    auto* const personality =
+                        OSDynamicCast(OSDictionary, driver.personalities->getObject(personalityIndex));
+                    if (personality != nullptr) {
+                        personality->removeObject("IOGVAHEVCDecode");
+                        personality->removeObject("IOGVAHEVCDecodeCapabilities");
+                        personality->removeObject("IOGVAHEVCEncode");
+                        personality->removeObject("IOGVAHEVCEncodeCapabilities");
+                    }
+                }
+                DBGLOG("DriverInjector", "-NRedAVC active: stripped HEVC capabilities from %s", driver.identifier);
+            }
 
             array->merge(driver.personalities);
 

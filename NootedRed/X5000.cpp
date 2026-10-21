@@ -212,18 +212,8 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
     PANIC_COND(!PenguinWizardry::PatternRouteRequest::routeAll(patcher, id, requests, slide, size), "X5000",
                "Failed to route symbols");
 
-    if (currentKernelVersion() >= MACOS_11) {
-        PenguinWizardry::PatternSolveRequest solveRequest{"__ZN30AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv",
-                                                          this->notifyGfxAccess};
-        PANIC_COND(!solveRequest.solve(patcher, id, slide, size), "X5000", "Failed to resolve notifyGfxAccess");
-        PANIC_COND(MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS, "X5000",
-                   "Failed to enable kernel writing");
-        this->orgPM4SubmitCommandBuffer = this->hwChannelSubmitCommandBuffer(pm4ComputeChannelVT);
-        this->hwChannelSubmitCommandBuffer(pm4ComputeChannelVT) =
-            reinterpret_cast<mach_vm_address_t>(computeSubmitCommandBuffer);
-        MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-    }
-
+    // Disabled for the Quick Look / Metal compute hang bisect.
+    // Re-enable with a version-correct vtable offset (0x198 on 15.8.1) afterwards.
     if (currentKernelVersion() >= MACOS_13_4) {
         PenguinWizardry::PatternRouteRequest request{
             "__ZN37AMDRadeonX5000_AMDGraphicsAccelerator23obtainAccelChannelGroupE11SS_"

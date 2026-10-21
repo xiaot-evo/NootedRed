@@ -19,7 +19,7 @@ For example:
 
 ```text
 build/branches/feature-tahoe-26.7.1/macosx/x86_64/release/NootedRed.kext
-build/branches/feature-tahoe-26.7.1/macosx/x86_64/release/NootedRed-0.9.0-RELEASE.zip
+build/branches/feature-tahoe-26.7.1/macosx/x86_64/release/NootedRed-0.9.0-RELEASE-20261020-231422.zip
 ```
 
 A detached HEAD uses `detached-<short-sha>`. To override:
@@ -28,8 +28,10 @@ A detached HEAD uses `detached-<short-sha>`. To override:
 NRED_BUILD_BRANCH=my-test tools/build-branch.sh -y
 ```
 
-Direct `xmake -y` (without the wrapper) uses `build/branches/shared/...`; the wrapper is the supported
-interface for per-branch output.
+The wrapper appends the local build time to the archive name (`...-YYYYMMDD-HHMMSS.zip`), so repeated
+default builds never silently overwrite each other. Direct `xmake -y` (without the wrapper) uses
+`build/branches/shared/...` and keeps AppleForge's canonical archive name; the wrapper is the supported
+interface for per-branch, timestamped output.
 
 ## Why
 

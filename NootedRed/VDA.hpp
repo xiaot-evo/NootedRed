@@ -30,18 +30,22 @@
 class VDA
 {
     bool requested{false};
+    bool avcOnly{false};
 
 public:
     static VDA& singleton();
 
-    // Parses the -NRedVDA boot argument.  Called from `NRed::init()`, before the device is known.
+    // Parses the -NRedVDA and -NRedAVC boot arguments.  Called from `NRed::init()`, before the device is known.
     void init();
 
     // Resolves the running device profile and logs the media policy.  Called from `NRed::processPatcher()`
     // once the device ID is known.
     void processPatcher();
 
-    // True when the user explicitly opted in with -NRedVDA.
+    // True when the user explicitly opted in with -NRedVDA or -NRedAVC.
     bool isRequested() const { return this->requested; }
+
+    // True when the user opted in with -NRedAVC: hardware AVC/H.264 only, HEVC stays on the software path.
+    bool isAVCOnly() const { return this->avcOnly; }
 
 };

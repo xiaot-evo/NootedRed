@@ -96,9 +96,9 @@ public:
 
     struct MediaPolicy
     {
-        // Media engine enablement flags.  Current NootedRed behaviour is graphics-only: only the
-        // hardware-validated 0x1638 profile may enable VCN0, every other profile carries VCN capability
-        // data but keeps the engine disabled until its own hardware validation.
+        // Media engine enablement flags.  The VCN 2.x profiles enable VCN0 so the same VDA implementation
+        // can be tried on every VCN 2.x APU (0x1638 is hardware-validated, the others are experimental).
+        // VCN 1.x profiles keep the engine disabled because the X6000 VCN2 bridge cannot serve them.
         bool hasUVD0{false};
         bool hasVCE{false};
         bool hasVCN0{false};
