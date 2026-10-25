@@ -46,7 +46,6 @@
 #include <Regs/GC.hpp>
 #include <Regs/NBIO.hpp>
 #include <Regs/SMU.hpp>
-#include <UserPatches.hpp>
 #include <VCNBridge.hpp>
 #include <VDA.hpp>
 #include <X5000.hpp>
@@ -55,29 +54,6 @@
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <mach/i386/vm_types.h>
-
-// Generated user-space VDA patch tables, one set per supported macOS build.  The 15.8.1 set is produced
-// by tools/gen_vda_*_data.py in this tree; the 14.8.9 set is imported from the multi-OS fork
-// weachy/NootedRed and generated there by the same pipeline.  VDA user-space patching is a no-op if the
-// selected set is absent.
-#if __has_include(<VDAVADataSonoma.hpp>)
-#include <VDAVADataSonoma.hpp>
-#endif
-#if __has_include(<VDAVAData.hpp>)
-#include <VDAVAData.hpp>
-#endif
-#if __has_include(<VDAGVADataSonoma.hpp>)
-#include <VDAGVADataSonoma.hpp>
-#endif
-#if __has_include(<VDAGVAData.hpp>)
-#include <VDAGVAData.hpp>
-#endif
-#if __has_include(<VDAVADataTahoe.hpp>)
-#include <VDAVADataTahoe.hpp>
-#endif
-#if __has_include(<VDAGVADataTahoe.hpp>)
-#include <VDAGVADataTahoe.hpp>
-#endif
 
 static NRed moduleInstance;
 
@@ -92,54 +68,6 @@ void NRed::init()
     SYSLOG("NRed", "|-----------------------------------------------------------------|");
 
     Backlight::singleton().init();
-
-    // Select the user-space VDA table set for the running Darwin generation.  The bridge separately
-    // rejects builds it has no kernel/ABI data for, so an unsupported major version only leaves these
-    // tables unregistered (no-op).
-    if (currentKernelVersion().major() == 23) {
-#if __has_include(<VDAVADataSonoma.hpp>)
-        if constexpr (sizeof(VDAVADataSonoma::Patches) / sizeof(VDAVADataSonoma::Patches[0]) > 0) {
-            UserPatches::singleton().registerVDAFix(
-                VDAVADataSonoma::Patches, sizeof(VDAVADataSonoma::Patches) / sizeof(VDAVADataSonoma::Patches[0]));
-        }
-#endif
-#if __has_include(<VDAGVADataSonoma.hpp>)
-        if constexpr (sizeof(VDAGVADataSonoma::Patches) / sizeof(VDAGVADataSonoma::Patches[0]) > 0) {
-            UserPatches::singleton().registerVDAFix(
-                VDAGVADataSonoma::Patches, sizeof(VDAGVADataSonoma::Patches) / sizeof(VDAGVADataSonoma::Patches[0]));
-        }
-#endif
-    }
-    else if (currentKernelVersion().major() == 25) {
-#if __has_include(<VDAVADataTahoe.hpp>)
-        if constexpr (sizeof(VDAVADataTahoe::Patches) / sizeof(VDAVADataTahoe::Patches[0]) > 0) {
-            UserPatches::singleton().registerVDAFix(VDAVADataTahoe::Patches,
-                                                    sizeof(VDAVADataTahoe::Patches) / sizeof(VDAVADataTahoe::Patches[0]));
-        }
-#endif
-#if __has_include(<VDAGVADataTahoe.hpp>)
-        if constexpr (sizeof(VDAGVADataTahoe::Patches) / sizeof(VDAGVADataTahoe::Patches[0]) > 0) {
-            UserPatches::singleton().registerVDAFix(VDAGVADataTahoe::Patches,
-                                                    sizeof(VDAGVADataTahoe::Patches) / sizeof(VDAGVADataTahoe::Patches[0]));
-        }
-#endif
-    }
-    else if (currentKernelVersion().major() == 24) {
-#if __has_include(<VDAVAData.hpp>)
-        if constexpr (sizeof(VDAVAData::Patches) / sizeof(VDAVAData::Patches[0]) > 0) {
-            UserPatches::singleton().registerVDAFix(VDAVAData::Patches,
-                                                    sizeof(VDAVAData::Patches) / sizeof(VDAVAData::Patches[0]));
-        }
-#endif
-#if __has_include(<VDAGVAData.hpp>)
-        if constexpr (sizeof(VDAGVAData::Patches) / sizeof(VDAGVAData::Patches[0]) > 0) {
-            UserPatches::singleton().registerVDAFix(VDAGVAData::Patches,
-                                                    sizeof(VDAGVAData::Patches) / sizeof(VDAGVAData::Patches[0]));
-        }
-#endif
-    }
-
-    UserPatches::singleton().init();
 
     VDA::singleton().init();
 
@@ -226,7 +154,7 @@ void NRed::hwLateInit()
     DBGLOG("NRed", "enumRevision = 0x%X", this->enumRevision);
 }
 
-void NRed::processPatcher(KernelPatcher& patcher)
+void NRed::processPatcher(KernelPatcher&)
 {
     const auto devInfo = DeviceInfo::create();
     assert(devInfo != nullptr);
@@ -289,7 +217,6 @@ void NRed::processPatcher(KernelPatcher& patcher)
     }
 
     VDA::singleton().processPatcher();
-    UserPatches::singleton().processPatcher(patcher);
 
     DeviceInfo::deleter(devInfo);
 }

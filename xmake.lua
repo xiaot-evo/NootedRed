@@ -39,3 +39,34 @@ target("NootedRed")
 		target:set("targetdir", path.join("build", "branches", branch, plat, arch, mode))
 	end)
 target_end()
+
+-- Satellite kext: user-space GL/Metal/VDA exact-page patches.  It is a separate Lilu plugin with its own
+-- bundle identifier and deployment target (Catalina..Tahoe, enforced by PluginConfiguration), and is
+-- loaded only when NootedRed is present (Info.plist OSBundleLibraries dependency).
+--
+-- LILU_CUSTOM_IOKIT_INIT is defined for the whole target so Lilu's Library/plugin_start.cpp does not
+-- define the IOService subclass; Plugin.cpp defines it instead and uses IOService::start as a later
+-- retry point for the kernel build string and IORegistry data.
+--
+-- The satellite targetdir is a sibling of the per-mode directories (not nested inside them), because
+-- AppleForge's after_build recursively archives targetdir: nesting made NootedRed's zip scoop up the
+-- satellite bundle and race with its after_build moves.
+target("NootedRedUserPatch")
+	add_rules("LiluPlugIn")
+	set_kind("binary")
+	set_languages("cxx23")
+	add_cxflags("-Wno-c23-extensions")
+	add_defines("LILU_CUSTOM_IOKIT_INIT")
+
+	add_files("NootedRedUserPatch/**.cpp")
+	add_includedirs("NootedRedUserPatch")
+	set_values("BundleIdentifier", "org.ChefKiss.NootedRedUserPatch")
+	set_values("DeploymentTarget", "10.15")
+	on_load(function(target)
+		local branch = nred_branch_dir()
+		local plat = get_config("plat") or os.host()
+		local arch = get_config("arch") or "x86_64"
+		local mode = get_config("mode") or "release"
+		target:set("targetdir", path.join("build", "branches", branch, plat, arch, "userpatch", mode))
+	end)
+target_end()

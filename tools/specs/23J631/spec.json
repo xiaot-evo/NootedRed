@@ -1,0 +1,248 @@
+{
+  "schema": 1,
+  "build": "23J631",
+  "darwin": [
+    23,
+    6,
+    0
+  ],
+  "apuMask": 56,
+  "note": "VDA-only macOS 14.8.9 set: master's VDA/VA and VDA/AppleGVA headers are pinned to 23J631. GL/Metal are not deployed: master's Sonoma pages are a 14.x-range table, not an exact 23J631 build.",
+  "provenance": {
+    "kind": "derived-from-pinned-master-tables",
+    "pinnedMasterCommit": "0efa6f4f36117fb603be968c1341006bf4da8c37",
+    "sourceFiles": [
+      {
+        "path": "NootedRed/NRed.cpp",
+        "sha256": "9291125d1fab1c042fa7d0ee4f481a5f0c2dcc3c089e858e0310e0e17dc5a4d1"
+      },
+      {
+        "path": "NootedRed/VDAGVADataSonoma.hpp",
+        "sha256": "de0217128633bd52bad4d7f0ef41005d0dd233cf2dea300d3ec54072fd5ac7c2"
+      },
+      {
+        "path": "NootedRed/VDAVADataSonoma.hpp",
+        "sha256": "d583a5c389c8969337479fee2074a582efa6119cfae31bfaf2b3a0a93cef3603"
+      }
+    ],
+    "tables": [
+      {
+        "kind": 3,
+        "kindName": "vda-va",
+        "sourceFile": "NootedRed/VDAVADataSonoma.hpp",
+        "patchTable": "Patches",
+        "sourceDescription": "macOS 14.8.9 (23J631); AMDRadeonVADriver2 5.5.20; dyld cache 4C1441FD8A543DC2863D49110B946A25 base 0x7FF800000000; image base 0x7FFB0339C000"
+      },
+      {
+        "kind": 4,
+        "kindName": "vda-gva",
+        "sourceFile": "NootedRed/VDAGVADataSonoma.hpp",
+        "patchTable": "Patches",
+        "sourceDescription": "AppleGVA 113.54.1 image 49FAB7CE70CC377E8134130B27851023, dyld cache 4C1441FD8A543DC2863D49110B946A25 (macOS 14.8.9 23J631), patch site 0x7ffa002a2d3c"
+      }
+    ],
+    "registration": {
+      "api": "UserPatches::registerVDAFix",
+      "verifiedIn": "NootedRed/NRed.cpp",
+      "headers": [
+        {
+          "header": "NootedRed/VDAVADataSonoma.hpp",
+          "namespace": "VDAVADataSonoma"
+        },
+        {
+          "header": "NootedRed/VDAGVADataSonoma.hpp",
+          "namespace": "VDAGVADataSonoma"
+        }
+      ]
+    },
+    "apuMaskNote": "Renoir | RenoirE | GreenSardine, the VCN 2.2 families these VDA tables target",
+    "gaps": [
+      "GL/Metal: master has exact Sonoma pages for the Darwin 23.6 range (kGLDriverPatches_Sonoma) but does not pin them to an exact kern.osversion, so no 14.x PatchData directory is generated for kinds 1/2.",
+      "No PatchData exists for other builds. Add a pinned source + BuildSpec entry; do not guess pages.",
+      "VDA/AppleGVA data is hardware-validated only on Renoir 0x1638 (15.8.1). Format v1 has one apuMask per build, so other VCN 2.2 APUs rely on exact page equality and NRedVCNBridgeReady.",
+      "Driver identity in format v1 is exact 4 KiB page equality; there is no driver-bundle hash field."
+    ],
+    "note": "Pages are master's stock byte arrays; site offsets/occurrences are derived from the PagePatch find/replace/skip/count fields. No driver bytes are invented. Regenerate with tools/convert_master_patchdata.py."
+  },
+  "tables": [
+    {
+      "kind": 3,
+      "note": "vda-va: 8 exact page(s) from master NootedRed/VDAVADataSonoma.hpp:Patches",
+      "pages": [
+        {
+          "source": "pages/vda-va-00-page0.bin",
+          "sha256": "be87e6af3629b0f7209ff7e06c1b0799101834faf2c831575baf6258f1f56bc2",
+          "note": "Page 0: AMDRadeonVADriver2 __TEXT file page at image offset 0x001000 (cache file page). [recorded image offset 0x1000]",
+          "sites": [
+            {
+              "offset": 1350,
+              "find": "bb0b000000e991feffff",
+              "replace": "bb05000000e991feffff",
+              "findOccurrence": 0,
+              "name": "Find0 -> Replace0",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find0 occurrence 0 of 1"
+            }
+          ]
+        },
+        {
+          "source": "pages/vda-va-01-page1.bin",
+          "sha256": "bfef4cf2cc156ad0980d6f5d84e241c7b7a6d500ffc75ebdebcf4d00a00caebd",
+          "note": "Page 1: AMDRadeonVADriver2 __TEXT file page at image offset 0x002000 (cache file page). [recorded image offset 0x2000]",
+          "sites": [
+            {
+              "offset": 3484,
+              "find": "4181fc8d000000",
+              "replace": "4181fc8e000000",
+              "findOccurrence": 0,
+              "name": "Find1 -> Replace1",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find1 occurrence 0 of 1"
+            }
+          ]
+        },
+        {
+          "source": "pages/vda-va-02-page2.bin",
+          "sha256": "9081628fb873660e1b85bd1b398e577d6fd51cc5514df2c051625bfa89e08817",
+          "note": "Page 2: AMDRadeonVADriver2 __TEXT file page at image offset 0x00A000 (cache file page). [recorded image offset 0xa000]",
+          "sites": [
+            {
+              "offset": 1223,
+              "find": "8d46ff83f802721f",
+              "replace": "8d46ff83f802eb1f",
+              "findOccurrence": 0,
+              "name": "Find2 -> Replace2",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find2 occurrence 0 of 3"
+            },
+            {
+              "offset": 1417,
+              "find": "8d46ff83f802721f",
+              "replace": "8d46ff83f802eb1f",
+              "findOccurrence": 1,
+              "name": "Find2 -> Replace2",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find2 occurrence 1 of 3"
+            },
+            {
+              "offset": 1547,
+              "find": "8d46ff83f802721f",
+              "replace": "8d46ff83f802eb1f",
+              "findOccurrence": 2,
+              "name": "Find2 -> Replace2",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find2 occurrence 2 of 3"
+            },
+            {
+              "offset": 1808,
+              "find": "488b86600400008b400c8d48ff83",
+              "replace": "b80200000090909090908d48ff83",
+              "findOccurrence": 0,
+              "name": "Find3 -> Replace3",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find3 occurrence 0 of 2"
+            },
+            {
+              "offset": 1961,
+              "find": "488b86600400008b400c8d48ff83",
+              "replace": "b80200000090909090908d48ff83",
+              "findOccurrence": 1,
+              "name": "Find3 -> Replace3",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find3 occurrence 1 of 2"
+            }
+          ]
+        },
+        {
+          "source": "pages/vda-va-03-page3.bin",
+          "sha256": "7aada7943ca4522c773e6f1b95bc195ec966f6a57afbeda7b417373ab902e18a",
+          "note": "Page 3: AMDRadeonVADriver2 __TEXT file page at image offset 0x049000 (cache file page). [recorded image offset 0x49000]",
+          "sites": [
+            {
+              "offset": 2552,
+              "find": "b8a40000005dc3",
+              "replace": "b8300000005dc3",
+              "findOccurrence": 0,
+              "name": "Find4 -> Replace4",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find4 occurrence 0 of 1"
+            }
+          ]
+        },
+        {
+          "source": "pages/vda-va-04-page4.bin",
+          "sha256": "37f95738cdd946c6efaa60f370776e2c43054d235b390a113b2ab5151c47a039",
+          "note": "Page 4: AMDRadeonVADriver2 __TEXT file page at image offset 0x04B000 (cache file page). [recorded image offset 0x4b000]",
+          "sites": [
+            {
+              "offset": 164,
+              "find": "4869c0a4000000",
+              "replace": "4869c030000000",
+              "findOccurrence": 0,
+              "name": "Find5 -> Replace5",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find5 occurrence 0 of 1"
+            }
+          ]
+        },
+        {
+          "source": "pages/vda-va-05-page5.bin",
+          "sha256": "7a096cc6c14cf845106adf8d72cac35f9e7abdfe7d99d72ff407771baedbabb9",
+          "note": "Page 5: AMDRadeonVADriver2 __TEXT file page at image offset 0x04C000 (cache file page). [recorded image offset 0x4c000]",
+          "sites": [
+            {
+              "offset": 636,
+              "find": "4869c0a4000000",
+              "replace": "4869c030000000",
+              "findOccurrence": 0,
+              "name": "Find6 -> Replace6",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find6 occurrence 0 of 1"
+            }
+          ]
+        },
+        {
+          "source": "pages/vda-va-06-page6.bin",
+          "sha256": "b62c8523fa268a1bba5e1689e003de4bf4142b44fb75a969ccfc510bfd3b9f1e",
+          "note": "Page 6: AMDRadeonVADriver2 __TEXT file page at image offset 0x063000 (cache file page). [recorded image offset 0x63000]",
+          "sites": [
+            {
+              "offset": 3093,
+              "find": "3d8d0000000f85",
+              "replace": "3d8e0000000f85",
+              "findOccurrence": 0,
+              "name": "Find7 -> Replace7",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find7 occurrence 0 of 1"
+            }
+          ]
+        },
+        {
+          "source": "pages/vda-va-07-page7.bin",
+          "sha256": "fbe78e6699741311c939404570dcbc9f9015ce596bb498b03e46df7fa787076a",
+          "note": "Page 7: AMDRadeonVADriver2 __TEXT file page at image offset 0x079000 (cache file page). [recorded image offset 0x79000]",
+          "sites": [
+            {
+              "offset": 1264,
+              "find": "81fe8d0000000f8588000000",
+              "replace": "81fe8e0000000f8588000000",
+              "findOccurrence": 0,
+              "name": "Find8 -> Replace8",
+              "note": "NootedRed/VDAVADataSonoma.hpp: Find8 occurrence 0 of 1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": 4,
+      "note": "vda-gva: 1 exact page(s) from master NootedRed/VDAGVADataSonoma.hpp:Patches",
+      "pages": [
+        {
+          "source": "pages/vda-gva-00-page0.bin",
+          "sha256": "f5a1c3c9d226997cacd72e2565e181a0505c3c643eb4c300a240cb6dd042482e",
+          "note": "Exact 4 KiB dyld_shared_cache_x86_64h.02 file page 0x7ffa002a2000 that contains the",
+          "sites": [
+            {
+              "offset": 3388,
+              "find": "0f8499000000",
+              "replace": "0f8470000000",
+              "findOccurrence": 0,
+              "name": "Find0 -> Replace0",
+              "note": "NootedRed/VDAGVADataSonoma.hpp: Find0 occurrence 0 of 1"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

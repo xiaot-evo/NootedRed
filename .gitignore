@@ -37,6 +37,7 @@ venv/
 # Local workspace / agent instructions
 # ---------------------------------------------------------------------------
 /AGENTS.md
+/.agents/
 
 # ---------------------------------------------------------------------------
 # Local research notes (kept on the developer machine, not tracked)

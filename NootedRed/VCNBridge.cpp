@@ -51,8 +51,8 @@ namespace
     // Diagnostic: keep the X5000 GFXOFF state disabled while the bridged VCN0 engine is active.
     const char* const kBootArgNoGfxOff = "-NRedVCNNoGfxOff";
 
-    // Data is compiled per exact macOS build.  There is no family-prefix fallback: osversion must name
-    // one of the builds for which a complete table set exists.
+    // VCNData selects either an exact build table or a family-prefix adapter for nearby patch releases;
+    // every guard and original call-site byte is still verified against the live driver before patching.
     bool isSupportedOS()
     {
         const auto& version = currentKernelVersion();
@@ -106,6 +106,35 @@ namespace
     {
         if (NRed::singleton().getDeviceID() != 0) {
             NRed::singleton().setProp32("NRedVCNReject", reason);
+        }
+    }
+
+    // Readiness contract with the NootedRedUserPatch satellite kext: while VCNBridge::loadReady() is true,
+    // publish a 32-bit non-zero `NRedVCNBridgeReady` on the AMD iGPU IOPCIDevice.  The satellite reads that
+    // property before applying VDA/AppleGVA user-space pages, so it is refreshed on every readiness
+    // transition (X6000 load completion, accelerator start rollback, failed engine allocation, failed
+    // initHardware and accelerator stop), not only when the engine is allocated.  Absent or zero means
+    // "not ready" and leaves VDA pages unpatched.  The main kext itself does not read this property.
+    const char* const kBridgeReadyProperty = "NRedVCNBridgeReady";
+
+    // acceleratorStop() withdraws readiness because no accelerator exists while stopped.  The X6000 kext
+    // and both ABI preparations stay valid for a restart, so a later acceleratorStart() restores readiness
+    // instead of treating the bridge as permanently failed.  This flag distinguishes a stop-induced
+    // withdrawal from an initHardware() failure, which must keep the bridge disabled until reboot.
+    bool readinessWithdrawnByStop{false};
+
+    void publishBridgeReady()
+    {
+        if (NRed::singleton().getDeviceID() == 0) { return; }
+
+        const auto ready = VCNBridge::singleton().loadReady() ? 1U : 0U;
+        NRed::singleton().setProp32(kBridgeReadyProperty, ready);
+
+        static volatile UInt32 published{0};
+        if (published != ready) {
+            published = ready;
+            SYSLOG("VCN", "VCN bridge readiness %s; %s=%u published on the iGPU", ready ? "reached" : "lost",
+                   kBridgeReadyProperty, ready);
         }
     }
 
@@ -238,6 +267,8 @@ void* VCNBridge::allocateEngine(void* const hardware)
         publishStage(9);
     }
 
+    publishBridgeReady();
+
     return engine;
 }
 
@@ -279,6 +310,18 @@ bool VCNBridge::acceleratorStart(void* const self, IOService* const provider)
         if (!bridge.loadCompleted) { publishReject(6); }
         SYSLOG("VCN", "X6000 native load status=0x%X prepared5=%u prepared6=%u", status, bridge.x5000Prepared,
                bridge.x6000Prepared);
+
+        // The actual readiness transition: loadCompleted just became true, so make it visible to the
+        // satellite immediately (before the original accelerator start runs).
+        publishBridgeReady();
+    }
+    else if (readinessWithdrawnByStop && bridge.x5000Prepared && bridge.x6000Prepared) {
+        // Restart after acceleratorStop().  The X6000 kext is still loaded and both driver ABI
+        // preparations (and their call-site patches) are unchanged, so readiness returns before the
+        // original accelerator start runs and a fresh engine can be allocated.
+        bridge.loadCompleted     = true;
+        readinessWithdrawnByStop = false;
+        publishBridgeReady();
     }
 
     const auto result = FunctionCast(acceleratorStart, bridge.orgAcceleratorStart)(self, provider);
@@ -295,6 +338,9 @@ bool VCNBridge::acceleratorStart(void* const self, IOService* const provider)
         }
     }
 
+    // Publishes the final state for this start, including the rollback to "not ready" above.
+    publishBridgeReady();
+
     return result;
 }
 
@@ -308,8 +354,18 @@ void VCNBridge::acceleratorStop(void* const self, IOService* const provider)
     // allocate a fresh engine.
     bridge.engineAllocated = false;
     bridge.hardwareHandle  = nullptr;
+
+    // Withdraw readiness with the accelerator so the satellite cannot apply VDA pages while no accelerator
+    // exists.  Only a stop-induced withdrawal is restored by the next acceleratorStart; an
+    // initHardware() failure clears loadCompleted without setting this flag, so it stays disabled.
+    if (bridge.loadCompleted) {
+        bridge.loadCompleted     = false;
+        readinessWithdrawnByStop = true;
+    }
+
     NRed::singleton().setProp32("NRedVCNEngineAllocated", 0);
     NRed::singleton().setProp32("NRedVDAMediaEnabled", 0);
+    publishBridgeReady();
 }
 
 void* VCNBridge::newShared()
@@ -424,9 +480,9 @@ bool VCNBridge::initHardware(void* const self, const UInt32 channel)
     publishStage(12);
     publishReject(8);
 
-    // The engine did not come up.  Stop advertising VCN0 and gate future user-space patches on the failed
-    // bridge; already patched decoder processes keep the patched VA/GVA code until they exit, which is the
-    // best that can be done without a reboot.
+    // The engine did not come up.  Stop advertising VCN0 and withdraw readiness so the satellite stops
+    // applying VDA pages; already patched decoder processes keep the patched VA/GVA code until they exit,
+    // which is the best that can be done without a reboot.
     SYSLOG("VCN", "VCN2 initHardware channel=%u failed; disabling the VCN bridge", channel);
     bridge.engineAllocated = false;
     bridge.loadCompleted   = false;
@@ -435,6 +491,9 @@ bool VCNBridge::initHardware(void* const self, const UInt32 channel)
     if (bridge.hardwareHandle != nullptr) {
         X5000::singleton().setVCN0Capability(bridge.hardwareHandle, false);
     }
+
+    // Readiness is lost: stop advertising it so the satellite leaves VDA pages unpatched from now on.
+    publishBridgeReady();
 
     return false;
 }

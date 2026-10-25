@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Static validation for the multi-version VCN/VDA tables.
+"""Static validation for the multi-version VCN kernel tables.
 
-Checks the generated kernel call-site tables, the per-build user-space VA/AppleGVA page patches, the
-per-build source identity strings, and the build-selection code paths.  This does not execute Apple
-code; it is a consistency check for the data imported from the 14.8.9 and 15.8.1 builds.
+Checks the generated kernel call-site tables, the per-build source identity strings, and the
+build-selection code paths in the main kext. It does not execute Apple code; it is a consistency check
+for the data imported from the 14.8.9, 15.8.1 and 26.7.1 builds.
+
+The user-space VDA/AppleGVA tables moved to the NootedRedUserPatch satellite (``PatchData/``); they are
+validated by ``tools/test_userpatch_data.py`` and ``tools/test_patchdata_selection.py`` instead of here.
 """
 
 from __future__ import annotations
@@ -13,7 +16,6 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-PAGE = 0x1000
 
 KERNEL_DATA_24H32 = ROOT / "NootedRed" / "VCNData" / "24H32.hpp"
 KERNEL_DATA_23J631 = ROOT / "NootedRed" / "VCNData" / "23J631.hpp"
@@ -21,25 +23,10 @@ KERNEL_DATA_25G241 = ROOT / "NootedRed" / "VCNData" / "25G241.hpp"
 VCN_DATA = ROOT / "NootedRed" / "VCNData.hpp"
 VCN_SELECTOR = ROOT / "NootedRed" / "VCNData.cpp"
 VCN_BRIDGE = ROOT / "NootedRed" / "VCNBridge.cpp"
-HEADERS = {
-    "Sequoia VA": (ROOT / "NootedRed" / "VDAVAData.hpp", "15.8.1", "24H32", 9, 12),
-    "Sonoma VA": (ROOT / "NootedRed" / "VDAVADataSonoma.hpp", "14.8.9", "23J631", 9, 12),
-    "Sequoia GVA": (ROOT / "NootedRed" / "VDAGVAData.hpp", "15.8.1", "24H32", 1, 1),
-    "Sonoma GVA": (ROOT / "NootedRed" / "VDAGVADataSonoma.hpp", "14.8.9", "23J631", 1, 1),
-}
 
 
 class Failure(RuntimeError):
     pass
-
-
-def arrays(text: str) -> dict[str, bytes]:
-    result = {}
-    for match in re.finditer(r"(?:inline constexpr |static const )UInt8\s+(\w+)\s*\[(?:4096)?\]\s*=\s*\{(.*?)\};",
-                             text, re.S):
-        values = re.findall(r"0x([0-9A-Fa-f]{2})", match.group(2))
-        result[match.group(1)] = bytes(int(value, 16) for value in values)
-    return result
 
 
 def parse_call_patches(text: str, label: str, name: str = "CallPatches") -> list[dict]:
@@ -64,38 +51,6 @@ def parse_call_patches(text: str, label: str, name: str = "CallPatches") -> list
     if len(entries) != 20:
         raise Failure(f"{label}: parsed {len(entries)} entries, expected 20")
     return entries
-
-
-def parse_page_patches(text: str, label: str) -> tuple[int, int, set[str]]:
-    page_arrays = arrays(text)
-    match = re.search(r"inline constexpr UserPatches::PagePatch\s+Patches\[\]\s*=\s*\{(.*?)\n    \};", text, re.S)
-    if not match:
-        raise Failure(f"{label}: Patches[] not found")
-    entries = []
-    for entry in re.finditer(
-        r"\{UserPatcher::FileSegment::SegmentTextText,\s*(\w+),\s*(\w+),\s*(\w+),\s*"
-        r"sizeof\((\w+)\),\s*(\d+),\s*(\d+)\}",
-        match.group(1),
-    ):
-        page_name, find_name, replace_name, size_name, skip, count = entry.groups()
-        if page_name not in page_arrays:
-            raise Failure(f"{label}: page array {page_name} missing")
-        if find_name not in page_arrays or replace_name not in page_arrays:
-            raise Failure(f"{label}: find/replace array missing")
-        if size_name != find_name:
-            raise Failure(f"{label}: sizeof({size_name}) does not match {find_name}")
-        if len(page_arrays[page_name]) != PAGE:
-            raise Failure(f"{label}: {page_name} is not a 4 KiB page")
-        find, replace = page_arrays[find_name], page_arrays[replace_name]
-        if not find or len(find) != len(replace):
-            raise Failure(f"{label}: {find_name}/{replace_name} length mismatch")
-        page = page_arrays[page_name]
-        occurrences = page.count(find)
-        if int(skip) + int(count) > occurrences:
-            raise Failure(f"{label}: {find_name} has {occurrences} occurrence(s), skip/count out of range")
-        entries.append((page_name, find_name, int(skip), int(count)))
-    pages = {entry[0] for entry in entries}
-    return len(entries), sum(entry[3] for entry in entries), pages
 
 
 def main() -> int:
@@ -141,25 +96,7 @@ def main() -> int:
         raise Failure("VCNBridge.cpp still uses the old VCNKernelData selector")
     print("bridge: exact-build VCNData lookup present")
 
-    page_cases = {
-        "Sequoia VA": (ROOT / "NootedRed" / "VDAVAData.hpp", "15.8.1", 9, 12),
-        "Sonoma VA": (ROOT / "NootedRed" / "VDAVADataSonoma.hpp", "14.8.9", 9, 12),
-        "Sequoia GVA": (ROOT / "NootedRed" / "VDAGVAData.hpp", "15.8.1", 1, 1),
-        "Sonoma GVA": (ROOT / "NootedRed" / "VDAGVADataSonoma.hpp", "14.8.9", 1, 1),
-        "Tahoe VA": (ROOT / "NootedRed" / "VDAVADataTahoe.hpp", "26.7.1", 10, 12),
-        "Tahoe GVA": (ROOT / "NootedRed" / "VDAGVADataTahoe.hpp", "26.7.1", 1, 1),
-    }
-    for label, (path, build, expected_records, expected_sites) in page_cases.items():
-        text = path.read_text()
-        if build not in text:
-            raise Failure(f"{label}: build string {build} missing")
-        entries, applied, pages = parse_page_patches(text, label)
-        if (entries, applied) != (expected_records, expected_sites):
-            raise Failure(f"{label}: expected {expected_records} records / {expected_sites} sites, "
-                          f"got {entries} / {applied}")
-        print(f"{label}: {entries} record(s), {applied} site(s), {len(pages)} page(s)")
-
-    print("all multi-version VCN/VDA data checks passed")
+    print("all multi-version VCN kernel-table checks passed")
     return 0
 
 

@@ -7,7 +7,8 @@
 #
 # The branch name comes from NRED_BUILD_BRANCH, or git. A detached HEAD uses
 # detached-<short-sha>. Artifacts land under:
-#   build/branches/<branch>/<platform>/<arch>/<mode>/
+#   build/branches/<branch>/<platform>/<arch>/<mode>/                    (NootedRed.kext)
+#   build/branches/<branch>/<platform>/<arch>/userpatch/<mode>/          (NootedRedUserPatch.kext)
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -33,7 +34,8 @@ xmake -P "$ROOT" "$@" || exit $?
 # AppleForge names the archive "<name>-<version>-<MODE>.zip".  Append the local build time so
 # repeated default builds never silently overwrite each other.
 STAMP=$(date +%Y%m%d-%H%M%S)
-for ZIP in "$ROOT"/build/branches/"$BRANCH"/*/*/*/NootedRed-*.zip; do
+for ZIP in "$ROOT"/build/branches/"$BRANCH"/*/*/*/NootedRed-*.zip \
+           "$ROOT"/build/branches/"$BRANCH"/*/*/userpatch/*/NootedRedUserPatch-*.zip; do
     [ -f "$ZIP" ] || continue
     case "$ZIP" in
         *-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].zip)

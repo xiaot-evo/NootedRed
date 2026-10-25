@@ -1,5 +1,13 @@
 # Root patch pipeline (Plane B)
 
+> **Superseded (2026-10-23).** This document describes the abandoned OCLP-style root-patch plan
+> (APFS root mount, dyld-cache/kext replacement, snapshot/bless). It is kept for historical context and
+> is **not** implementation guidance. The approved architecture is the `NootedRedUserPatch` satellite
+> with external `PatchData/`; see [ARCHITECTURE.md](ARCHITECTURE.md),
+> [Satellite-UserPatch-Plan.md](Satellite-UserPatch-Plan.md) and
+> [UserPatch-Data-Format.md](UserPatch-Data-Format.md).
+
+
 Status: design specification for the companion user-space patcher. No code is implemented yet. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the decision and migration plan.
 

@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "description": "Pinned copy of the master-branch UserPatch table sources. These exact bytes are the provenance for the checked-in fixtures, specs and PatchData; do not edit them by hand.",
+  "sourceRepositoryTree": "master",
+  "sourceCommit": "0efa6f4f36117fb603be968c1341006bf4da8c37",
+  "sourceCommitSubject": "VCN/GLFIX: Add family fallbacks for nearby macOS builds",
+  "extraction": "git show master:<path> > tools/pinned/master/<path>",
+  "refreshCommand": "python3 tools/master_source.py --refresh",
+  "files": [
+    {
+      "path": "NootedRed/NRed.cpp",
+      "size": 12474,
+      "sha256": "9291125d1fab1c042fa7d0ee4f481a5f0c2dcc3c089e858e0310e0e17dc5a4d1"
+    },
+    {
+      "path": "NootedRed/TahoePatchData.hpp",
+      "size": 77950,
+      "sha256": "15fdf212e23a78f255d743e1e3063efb2c83049d609f4fd19cebdd6b0471d5e2"
+    },
+    {
+      "path": "NootedRed/UserPatches.cpp",
+      "size": 116180,
+      "sha256": "ee53a8ace6757de760409b8ed572f5d79de13f8c51b97eb30e0978572d0909a5"
+    },
+    {
+      "path": "NootedRed/UserPatches.hpp",
+      "size": 11351,
+      "sha256": "2819b813f5221ab2eef0d64ddc57e1bce34f88b8cf3501172e02d07fddd5c0b9"
+    },
+    {
+      "path": "NootedRed/UserPatchesSonoma.inc",
+      "size": 76965,
+      "sha256": "5533b1f4aa68962c4cb6e01c8aab5af022047ceb0ac9ea3731f02d84d52a5b92"
+    },
+    {
+      "path": "NootedRed/VDAGVAData.hpp",
+      "size": 31057,
+      "sha256": "cc5a584e4356041c9c17b716a08f47b74e6b99ad50ebad5a50b8b0706eaeb021"
+    },
+    {
+      "path": "NootedRed/VDAGVADataSonoma.hpp",
+      "size": 28911,
+      "sha256": "de0217128633bd52bad4d7f0ef41005d0dd233cf2dea300d3ec54072fd5ac7c2"
+    },
+    {
+      "path": "NootedRed/VDAGVADataTahoe.hpp",
+      "size": 31068,
+      "sha256": "c3f3dc26ee16e880f2587437faf5c30f3a478220fe9368b622c455a0878422e4"
+    },
+    {
+      "path": "NootedRed/VDAVAData.hpp",
+      "size": 222505,
+      "sha256": "637ff7df3f9e5f99b2cfd9f38b5a28e0d5af4766eed19976d34d044d9c1abe2e"
+    },
+    {
+      "path": "NootedRed/VDAVADataSonoma.hpp",
+      "size": 222707,
+      "sha256": "d583a5c389c8969337479fee2074a582efa6119cfae31bfaf2b3a0a93cef3603"
+    },
+    {
+      "path": "NootedRed/VDAVADataTahoe.hpp",
+      "size": 196282,
+      "sha256": "0157434eda9b4b91b79169662d7c5b564b2c3c664d07cc53a8eea8e232502a38"
+    }
+  ]
+}

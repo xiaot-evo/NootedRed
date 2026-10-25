@@ -56,14 +56,18 @@ GLDriver.bin  ce205f063627a4b82ee8ccee04ab7963a3efb8dec488cb3c53ed6c6719434f80
 MTL-image.bin fd46d5864a1b4c2e290b01b9c2676f6d91026ba58505b0a8393d35483afb74b4
 ```
 
-This confirms that for macOS 26.7.1 build 25G241, the same exact page images and PatchSet work for
-Renoir/Green Sardine `0x164c` and `0x1638`; APU-specific selection belongs in DeviceProfile, not in
-per-driver page data.
+This confirms that for macOS 26.7.1 build 25G241, the same exact page images work for
+Renoir/Green Sardine `0x164c` and `0x1638`; APU-specific selection belongs to the main kext's
+DeviceProfile / the satellite's `apuMask` matching, not to per-driver page data. The committed
+`PatchData/25G241` set is derived from these tables.
 
 ## Adding a dataset
 
 1. Collect a fresh dataset on the target machine with
-   [`tools/collect_compat_data.py`](../tools/README-collect-compat-data.md) (pristine boot preferred).
+   [`tools/collect_platform_data.py`](../tools/collect_platform_data.py) (pristine boot preferred).
+   For a read-only compatibility report use [`tools/adaptation_info.py`](../tools/adaptation_info.py).
+   The old archived collectors are retired with the mainline user-space code; see
+   [`tools/RETIRED.md`](../tools/RETIRED.md).
 2. Copy the archive under `platform-data/<date>_<os>_<cpu>_<device-id>/`.
 3. Record its SHA-256.
 4. Add an entry here with OS, Darwin, APU/device ID, archive hash and initial findings.
