@@ -219,6 +219,7 @@ void UserPatchRuntime::onPatcherLoad(KernelPatcher& patcher)
     }
     IOLockUnlock(this->lock_);
 
+    if (!this->disabled_) { UserPatchBackend::singleton().loadExternalProfile(); }
     if (!this->disabled_) { publish(snapshot); }
     if (needRetry) { this->startRetryCall(); }
 }
@@ -248,6 +249,7 @@ void UserPatchRuntime::serviceStart()
     }
     IOLockUnlock(this->lock_);
 
+    if (!this->disabled_) { UserPatchBackend::singleton().loadExternalProfile(); }
     if (!this->disabled_) { publish(snapshot); }
     if (needRetry) { this->startRetryCall(); }
     this->startStatusRefresh();
@@ -354,7 +356,10 @@ void UserPatchRuntime::retryCallback(thread_call_param_t, thread_call_param_t pa
         IOLockUnlock(self.lock_);
     }
 
-    if (publishState) { publish(snapshot); }
+    if (publishState) {
+        UserPatchBackend::singleton().loadExternalProfile();
+        publish(snapshot);
+    }
     if (needNext) { self.startRetryCall(); }
     if (thisCall != nullptr) { thread_call_free(thisCall); }
 }
