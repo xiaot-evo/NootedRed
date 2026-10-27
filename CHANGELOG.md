@@ -1,5 +1,33 @@
 # Change log
 
+## v0.9.1 (25/10/2026)
+
+### Enhancements
+
+- Embedded user-space PatchData now contains only the complete, validated 15.8.1 / `24H32` set.
+  Removed the incomplete `23J631` (VDA-only) and unvalidated `25G241` sets, plus the VCN
+  family-prefix fallbacks; unsupported builds are a fail-closed no-op.
+- Added the Metal HwInfo A1 exact page (`numShaderEngines 4 -> 1`) to the `24H32` set.
+- VDA/AppleGVA pages are applied when `-NRedVDA` is passed, without waiting for a readiness
+  property that is published too late for early-boot page validation.
+- Removed the obsolete AVC-only fallback, the X5000 compute-submit test instrumentation, the VCN
+  GFXOFF-hold boot argument, and the X6000 preload/readiness callback machinery.
+
+### Bug Fixes
+
+- Fixed the VDA hardware decode/encode failure where AppleGVA/VADriver pages were validated before
+  `NRedVCNBridgeReady`, permanently skipped by the readiness gate, and left the VCN engine
+  uninitialised.
+- Fixed the X5000 compute-submit vtable hook to use the Itanium C++ ABI address point
+  (`__ZTV + 2 * sizeof(void*)`) instead of the raw `__ZTV` symbol start.
+- Restored repeated `sips`/wallpaper HEIC conversion on 15.8.1 / `0x1638` without GPU resets.
+
+> [!NOTE]
+> Use the `RELEASE` build. `RESEARCH_RELEASE` is `DEBUG` with optimisations.
+> The latter two will be way slower and inefficient than the former build. Use them **only** when debugging an issue with NootedRed.
+
+**Full Changelog**: https://github.com/ChefKissInc/NootedRed/compare/v0.9.0...v0.9.1
+
 ## v0.8.10 (15/05/2026)
 
 ### Enhancements

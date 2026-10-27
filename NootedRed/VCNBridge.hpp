@@ -51,8 +51,6 @@ class VCNBridge
     bool loadAttempted{false};
     bool loadCompleted{false};
     bool engineAllocated{false};
-    bool noGfxOff{false};
-    bool gfxOffHeld{false};
 
     mach_vm_address_t orgAcceleratorStart{0};
     mach_vm_address_t orgAcceleratorStop{0};
@@ -73,8 +71,6 @@ class VCNBridge
     mach_vm_address_t clientStop5000{0};
     mach_vm_address_t surfaceCopy5000{0};
     mach_vm_address_t notifyGfxAccess{0};
-    mach_vm_address_t disableGfxOff5000{0};
-    mach_vm_address_t enableGfxOff5000{0};
 
     OSMetaClass* engineMC{nullptr};
     OSMetaClass* sharedMC{nullptr};
@@ -108,6 +104,9 @@ public:
     void* allocateEngine(void* hardware);
 
 private:
+    // Loads com.apple.kext.AMDRadeonX6000 from the X5000 accelerator start and records the bridge state.
+    bool loadX6000Now();
+
     static bool          acceleratorStart(void* self, IOService* provider);
     static void          acceleratorStop(void* self, IOService* provider);
     static void*         newShared();
@@ -119,7 +118,5 @@ private:
     static UInt64        surfaceCopy(void* self, void* input, UInt64 size, void* event);
     static void          signalWork(void* hardware);
     static bool          initHardware(void* self, UInt32 channel);
-    static void          noopEnableGfxOff(void* self);
-    void                 holdGfxOff();
     static OSMetaClassBase* safeMetaCast(const OSMetaClassBase* object, const OSMetaClass* target);
 };

@@ -1,10 +1,10 @@
 # NootedRed compatibility matrix
 
-Status date: 2026-10-23. This table describes what the current tree actually enables, not what the
+Status date: 2026-10-25. This table describes what the current tree actually enables, not what the
 hardware could theoretically do. A feature is only `validated` when it has passed a real boot and the
 corresponding feature test on that exact build **and** APU.
 
-> **Satellite split (2026-10-23):** user-space GL/Metal/VDA patching lives in the separate
+> **Satellite split:** user-space GL/Metal/VDA patching lives in the separate
 > `NootedRedUserPatch.kext` satellite. Its exact-page data is **embedded at build time** from the
 > repo-root `PatchData/` sources via `tools/embed_patchdata.py`; the kext performs no runtime file I/O.
 > The main `NootedRed.kext` only performs kernel-side enablement and publishes the
@@ -12,19 +12,13 @@ corresponding feature test on that exact build **and** APU.
 > [Satellite UserPatch plan](Satellite-UserPatch-Plan.md),
 > [UserPatch data format](UserPatch-Data-Format.md) and [`PatchData/README.md`](../PatchData/README.md).
 >
-> Embedded data committed today:
-> - `24H32` — kinds 1 GL, 2 Metal, 3 VDA/VA, 4 VDA/AppleGVA;
-> - `25G241` — kinds 1, 2, 3, 4;
-> - `23J631` — kinds 3, 4 only (14.8.9 GL/Metal is a documented data gap).
+> **Only the complete 15.8.1 / `24H32` set is deployed.** Incomplete or unvalidated build sets
+> (`23J631`, `25G241`) and the family-prefix VCN fallbacks were removed. A build without an exact
+> committed data set is a fail-closed no-op; there is no nearest-build fallback.
 >
-> The old mainline `-NRedGLFix`/`-NRedGLFixOff` user-space toggles and the semantic GL fallback no
-> longer exist. The satellite auto-loads when NootedRed is present; the only new debug override is
-> `-NRedUserPatchOff`.
->
-> `-NRedVDA` / `-NRedAVC` still exist, but only as **kernel VCN-bridge** opt-ins in the main kext.
-> They must be present for the satellite's VDA/AppleGVA data to be usable: without the bridge,
-> `NRedVCNBridgeReady` is never published and the satellite leaves kinds 3/4 unapplied. GL/Metal
-> satellite data is independent of those flags.
+> `-NRedVDA` is the only VDA/VCN opt-in. It must be present for the satellite's VDA/AppleGVA data to
+> be usable: without the bridge, `NRedVCNBridgeReady` is never published and the satellite leaves
+> kinds 3/4 unapplied. GL/Metal satellite data is independent of that flag.
 
 ## Status vocabulary
 
@@ -41,12 +35,8 @@ corresponding feature test on that exact build **and** APU.
 | macOS build | Darwin | Kernel / graphics | GL/Metal (satellite data) | VDA/VCN kernel bridge | VDA user-space VA + AppleGVA (satellite data) | HEVC encode |
 | --- | --- | --- | --- | --- | --- | --- |
 | **15.8.1 (24H32)** | 24.6.0 | supported | **validated** (`0x1638`) | **validated** (`24H32` data) | **validated** (`0x1638`; kinds 3/4) | **validated** (`0x1638`) |
-| **14.8.9 (23J631)** | 23.6.0 | supported | **unsupported** (no 23J631 GL/Metal data) | experimental (imported `23J631` data, byte-gated) | experimental (kinds 3/4 data, offline) | experimental (imported data) |
-| **26.7.1 (25G241)** | 25.6.0 | supported | experimental (kinds 1/2 data, offline) | experimental (`25G241` data, hardware pending) | experimental (kinds 3/4 data, hardware pending) | experimental (25G241 data, hardware pending) |
-| other 15.x (`24H*`) | 24.x | supported | no-op (no exact 24H32 data) | experimental (`24H` family fallback, byte-gated) | **unsupported** (no exact `24H32` directory) | **unsupported** |
-| other 14.x (`23H*`/`23G*`/`23J*`) | 23.x | supported | **unsupported** (no exact 14.x GL/Metal data) | experimental (`23J`/`23H`/`23G` family fallback, byte-gated) | **unsupported** (only exact `23J631` data) | **unsupported** |
-| other 26.x | 25.x | supported | no-op (no exact 25G241 data) | experimental (`25G` family fallback, byte-gated) | **unsupported** (only exact `25G241` data) | **unsupported** |
-| Catalina 10.15 – Ventura 13 | 18–22 | supported | unsupported/no-op | **unsupported** | **unsupported** | **unsupported** |
+| other 15.x (`24H*`) | 24.x | supported | **unsupported** (no exact `24H32` data) | **unsupported** (no VCN data) | **unsupported** | **unsupported** |
+| other macOS builds | 18–25 | supported (kernel patches only) | **unsupported** | **unsupported** | **unsupported** | **unsupported** |
 
 Notes:
 
@@ -55,72 +45,53 @@ Notes:
 - GL/Metal and VDA user-space patches are applied by the satellite only when the exact 4 KiB driver
   page matches the committed `pages.bin`; any build/APU/page mismatch is a fail-closed no-op. There is
   no semantic scanner and no nearest-build fallback.
-- VDA/AppleGVA tables (kinds 3/4) are additionally gated on the main kext's `NRedVCNBridgeReady`
-  property. The property is 1 while `VCNBridge::loadReady()` is true and is republished as 0 on
-  accelerator stop, engine-allocation failure and `initHardware` failure, so the satellite cannot apply
-  VDA pages while no accelerator exists.
-- The satellite runtime has been boot-tested on 15.8.1 / `0x1638`: it loaded the embedded `24H32`
-  data, installed both hooks and applied a page. The `validated` entries still describe the
-  exact-page data validated previously in the mainline kext; GL/Metal/VDA feature-level tests and
-  other builds/APUs remain on the hardware checklist.
-- `PatchData/23J631` deliberately does not contain GL/Metal tables: master's Sonoma GL/Metal pages are
-  a Darwin 23.6-range table, not pinned to an exact `kern.osversion`. This is a listed data gap, not a
-  silent regression.
-- VCN family-prefix adapters reuse the nearest validated kernel table (`23J631`, `24H32`, `25G241`) for
-  nearby patch releases. Every guard/getter and original call-site byte is still checked; a changed
-  kernel is a no-op. These adapters are not a substitute for a build-specific VDA page table.
+- VDA/AppleGVA tables (kinds 3/4) are gated on the exact page/build/APU data. With `-NRedVDA` they are
+  early-eligible because AppleGVA/VADriver pages are validated before the bridge readiness property is
+  observable; on a non-`-NRedVDA` boot they remain gated on `NRedVCNBridgeReady`.
+- `NootedRed/VCNData/` contains only the exact `24H32` kernel call-site/guard table. Every guard and
+  original call-site byte is verified against the live X5000/X6000 drivers before any write.
 
 ## APU matrix
 
-| APU / device ID | VCN generation | GL/Metal (15.8.1) | VDA/VA + AppleGVA (15.8.1) | VDA/VA + AppleGVA (23J631) | VDA/VA + AppleGVA (25G241) |
-| --- | --- | --- | --- | --- | --- |
-| Renoir / Green Sardine `0x1638` | VCN 2.2 | **validated** | **validated** | experimental (data present, hardware pending) | experimental (data present, hardware pending) |
-| Renoir `0x1636` | VCN 2.2 | experimental (same 15.8.1 pages) | experimental (same 15.8.1 data) | experimental | experimental |
-| Cezanne `0x164C` | VCN 2.2 | experimental | experimental | experimental | experimental |
-| Barcelo `0x15E7` | VCN 2.2 | experimental | experimental | experimental | experimental |
-| Raven `0x15DD` | VCN 1.x | experimental | **unsupported** (no VCN 2.2 bridge readiness) | **unsupported** | **unsupported** |
-| Raven2 / Picasso `0x15D8` | VCN 1.x | experimental | **unsupported** (no VCN 2.2 bridge readiness) | **unsupported** | **unsupported** |
+| APU / device ID | VCN generation | GL/Metal (15.8.1) | VDA/VA + AppleGVA (15.8.1) |
+| --- | --- | --- | --- |
+| Renoir / Green Sardine `0x1638` | VCN 2.2 | **validated** | **validated** |
+| Renoir `0x1636` | VCN 2.2 | experimental (same pages) | experimental (same data) |
+| Cezanne `0x164C` | VCN 2.2 | experimental | experimental |
+| Barcelo `0x15E7` | VCN 2.2 | experimental | experimental |
+| Raven `0x15DD` | VCN 1.x | experimental | **unsupported** (no VCN 2.2 bridge readiness) |
+| Raven2 / Picasso `0x15D8` | VCN 1.x | experimental | **unsupported** (no VCN 2.2 bridge readiness) |
 
-The GL/Metal page data is shared across gfx9 APUs for the listed builds, but only `0x1638` on 15.8.1
-has a recorded hardware validation. VDA readiness is never published for VCN 1.x profiles, so VDA
-tables stay no-op there even though a 24H32/25G241 manifest's APU mask covers those families for
-GL/Metal.
+The GL/Metal page data is shared across gfx9 APUs, but only `0x1638` on 15.8.1 has a recorded hardware
+validation. VDA readiness is never published for VCN 1.x profiles, so VDA tables stay no-op there.
 
 ## Feature/control matrix
 
-| Feature | Control | 15.8.1 | 14.8.9 | 26.7.1 |
-| --- | --- | --- | --- | --- |
-| GL dual-source fix | satellite, `PatchData` kind 1 | validated | no data (no-op) | experimental (exact 25G241 pages) |
-| Metal dual-quad fix | satellite, `PatchData` kind 2 | validated | no data (no-op) | experimental (gate/allow, hardware pending) |
-| VDA/AppleGVA user-space | satellite, kinds 3/4 + `NRedVCNBridgeReady` | validated | experimental (offline data) | experimental (offline data) |
-| VCN2 hardware decode / encode | main kext VCN bridge + satellite VDA | validated | experimental (byte-gated) | experimental (25G241, hardware pending) |
-| Disable user-space patches | `-NRedUserPatchOff` debug boot arg | available | available | available |
-| Main kext without satellite | remove satellite kext | supported | supported | supported |
+| Feature | Control | 15.8.1 |
+| --- | --- | --- |
+| GL dual-source fix | satellite, `PatchData` kind 1 | validated |
+| Metal dual-quad fix | satellite, `PatchData` kind 2 | validated |
+| Metal HwInfo A1 (`numShaderEngines 4 -> 1`) | satellite, supplementary `PatchData` kind 2 page | validated (`0x1638`; sips/wallpaper compute) |
+| VDA/AppleGVA user-space | satellite, kinds 3/4; `-NRedVDA` makes pages early-eligible | validated |
+| VCN2 hardware decode / encode | main kext VCN bridge + satellite VDA | validated |
+| Disable user-space patches | `-NRedUserPatchOff` debug boot arg | available |
+| Main kext without satellite | remove satellite kext | supported |
 
-## What "macOS 26 support" means here
+## Adding another build
 
-- The kext range already includes macOS 26 (Darwin 25), with `25G241` VCN kernel data and committed
-  satellite GL/Metal/VDA data.
-- **VDA/VCN on macOS 26** is still experimental until a real 26.7.1 boot/decode/encode test passes.
-  Other 26.x builds remain unsupported for user-space VDA because the data is exact-build and
-  byte-gated.
-- For another 26.x build, collect its `SystemKernelExtensions.kc`/`AMDRadeonVADriver2`/AppleGVA pages
-  and platform metadata, derive a new `PatchData` directory from pinned source (see
-  [`tools/README-userpatch-data.md`](../tools/README-userpatch-data.md)), run
-  `tools/embed_patchdata.py --write`, rebuild/re-sign the satellite, then hardware-validate it.
-  15.8.1 or 26.7.1 data must not be relabelled for another build.
+There is no generic fallback. To add a build:
+
+1. collect its `SystemKernelExtensions.kc` and the matching VADriver/AppleGVA images;
+2. generate `NootedRed/VCNData/<build>.hpp` with `tools/gen_vcn_kernel_data.py` and register the
+   variant in `VCNData.cpp`;
+3. derive a complete `PatchData/<build>` set from pinned exact pages, regenerate
+   `PatchDataBlob.*`, and rebuild/re-sign the satellite;
+4. hardware-validate decode/encode and the GL/Metal paths before marking it supported.
 
 ## Evidence
 
 - [Architecture](ARCHITECTURE.md) — current kernel + satellite planes, data flow and rollback.
-- [Satellite UserPatch plan](Satellite-UserPatch-Plan.md) — main/satellite split, phase status and
-  `NRedVCNBridgeReady` readiness contract.
-- [UserPatch data format](UserPatch-Data-Format.md) — authoritative source-data contract and embedded
-  generation model.
-- [`PatchData/README.md`](../PatchData/README.md) — source data sets, regeneration/embed commands and
-  known gaps.
-- [Modules and support](MODULES-AND-SUPPORT.md) — current module architecture and full APU/build matrix.
-- [Platform data index](Platform-Data-Index.md) — collected datasets, including the 26.7.1 GL/MTL data.
-- [Archived 26.7.1 support note](archive/Tahoe-26.7.1-Support.md) — historical data derivation and the
-  open runtime-validation task.
-- `NootedRed/VCNData/24H32.hpp` / `23J631.hpp` / `25G241.hpp` — the three VCN kernel builds present.
+- [Satellite UserPatch plan](Satellite-UserPatch-Plan.md) — main/satellite split and readiness contract.
+- [UserPatch data format](UserPatch-Data-Format.md) — authoritative source-data contract.
+- [`PatchData/README.md`](../PatchData/README.md) — source data set, regeneration and embedding.
+- [Modules and support](MODULES-AND-SUPPORT.md) — module architecture and APU/build support.

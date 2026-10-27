@@ -59,7 +59,7 @@ MTL-image.bin fd46d5864a1b4c2e290b01b9c2676f6d91026ba58505b0a8393d35483afb74b4
 This confirms that for macOS 26.7.1 build 25G241, the same exact page images work for
 Renoir/Green Sardine `0x164c` and `0x1638`; APU-specific selection belongs to the main kext's
 DeviceProfile / the satellite's `apuMask` matching, not to per-driver page data. The committed
-`PatchData/25G241` set is derived from these tables.
+The collected 25G241 tables are research data only; no `PatchData/25G241` set is deployed.
 
 ## Adding a dataset
 

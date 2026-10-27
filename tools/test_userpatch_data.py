@@ -737,35 +737,15 @@ DEPLOYED_BUILDS: dict[str, dict[str, Any]] = {
         "kinds": [1, 2, 3, 4],
         "darwin": (24, 6, 0),
         "apu_mask": 0x3F,
-        "pages": 12,
-        "sites": 17,
-        "manifest_sha256": "0fa570203ee7de4287216e3a6356816b867cb133794133af2914a3d4a1bee860",
-        "pages_sha256": "39197623e8bac51ef71423a2b9c6ad6aa724a806d054219b7b49239117ffb86c",
-    },
-    "23J631": {
-        "kinds": [3, 4],
-        "darwin": (23, 6, 0),
-        "apu_mask": 0x38,
-        "pages": 9,
-        "sites": 13,
-        "manifest_sha256": "67d05b169c034a04af5955f29eb0ccaf3173a24c9c6905c6e79720de19d4a700",
-        "pages_sha256": "6d3867c68dda0b9fe10fd23e77b4e61a5da5746017ac820e5f5a8ee7f4ace940",
-    },
-    "25G241": {
-        "kinds": [1, 2, 3, 4],
-        "darwin": (25, 6, 0),
-        "apu_mask": 0x3F,
-        "pages": 11,
-        "sites": 17,
-        "manifest_sha256": "d7cfbdcbf2c15cbd9b2148bab993c7a92ad78f194fbef5f4f5a11d4b1a90c8a2",
-        "pages_sha256": "5f2469e184168e1b71141f32c51e463c49a7b0881f1ac688ef9e688efec46a4a",
+        "pages": 13,
+        "sites": 18,
+        "manifest_sha256": "08e1edb1eeef6d60c1866eefb84a00ac7f168b8f4c8bf4b929aea088fcb5988a",
+        "pages_sha256": "730176709352e3f70ccab19cfcbdc67c841031af255001af950c1b91df4217bb",
     },
 }
 
 VDA_SOURCES = {
     "24H32": {"vda": "NootedRed/VDAVAData.hpp", "gva": "NootedRed/VDAGVAData.hpp"},
-    "23J631": {"vda": "NootedRed/VDAVADataSonoma.hpp", "gva": "NootedRed/VDAGVADataSonoma.hpp"},
-    "25G241": {"vda": "NootedRed/VDAVADataTahoe.hpp", "gva": "NootedRed/VDAGVADataTahoe.hpp"},
 }
 
 
@@ -830,7 +810,7 @@ class DeployablePatchDataTest(unittest.TestCase):
                              range(kinds[3].page_index, kinds[3].page_index + kinds[3].page_count)]
                 gva_pages = [parsed.pages[index] for index in
                              range(kinds[4].page_index, kinds[4].page_index + kinds[4].page_count)]
-                self.assertEqual(len(vda_pages), 8 if build != "25G241" else 7)
+                self.assertEqual(len(vda_pages), 8)
                 self.assertEqual(len(gva_pages), 1)
                 for index, page_record in enumerate(vda_pages):
                     page_bytes = pages[page_record.data_offset:page_record.data_offset + PAGE_SIZE]
@@ -850,22 +830,13 @@ class DeployablePatchDataTest(unittest.TestCase):
             self.assertEqual(page_bytes, (FIXTURE_DIR / page_spec["source"]).read_bytes())
             self.assertEqual(hashlib.sha256(page_bytes).hexdigest(), page_spec["sha256"])
 
-        # 25G241 GL/Metal pages are master's Tahoe arrays.
-        tahoe = (master_source.PINNED_ROOT / "NootedRed/TahoePatchData.hpp").read_text(encoding="utf-8")
-        arrays = master_tables.parse_byte_arrays(tahoe, "TahoePatchData.hpp")
-        _, pages, _, parsed = load_generated(PATCHDATA_DIR / "25G241")
-        expected_names = ("kTahoeGLHwInfoPage", "kTahoeGLDualQuadPage", "kTahoeMTLControlPage")
-        for index, array_name in enumerate(expected_names):
-            page_bytes = pages[parsed.pages[index].data_offset:parsed.pages[index].data_offset + PAGE_SIZE]
-            self.assertEqual(page_bytes, arrays[array_name],
-                             f"25G241: page {index} is not master's {array_name}")
-
-    def test_14x_gl_metal_gap_is_documented_not_fabricated(self) -> None:
-        spec = json.loads((SPECS_DIR / "23J631" / "spec.json").read_text(encoding="utf-8"))
-        kinds = [table["kind"] for table in spec["tables"]]
-        self.assertEqual(kinds, [3, 4])
-        gaps = spec["provenance"]["gaps"]
-        self.assertTrue(any("GL/Metal" in gap for gap in gaps), gaps)
+        # 24H32 also carries the supplementary Metal HwInfo A1 page. It is not a master array; it is
+        # pinned under tools/sources/ and must match the checked-in source byte-for-byte.
+        supplementary = (ROOT / "tools/sources/24H32/metal-hwinfo-page.bin").read_bytes()
+        page_bytes = pages[parsed.pages[3].data_offset:parsed.pages[3].data_offset + PAGE_SIZE]
+        self.assertEqual(page_bytes, supplementary)
+        self.assertEqual(hashlib.sha256(page_bytes).hexdigest(),
+                         "37f265b415c6a56daf9bf6c80239b55c1aa670b9329e664ab1a562907f41d556")
 
     def test_converter_regeneration_is_deterministic_and_current(self) -> None:
         problems = converter.check(None, converter.DEFAULT_SPECS_DIR, converter.DEFAULT_PATCHDATA_DIR)

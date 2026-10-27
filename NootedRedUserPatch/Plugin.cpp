@@ -49,13 +49,11 @@ static const char* bootargBeta  = "-NRedUserPatchBeta";
 namespace
 {
 
-    // Bounded delayed retry (review D3).  Load retries cover a build string / IOKit / data-volume that is
-    // not ready at patcher-load or service-start time; readiness refreshes cover the VCN bridge becoming
-    // ready slightly later during boot.  Both are deliberately finite and never touch page pointers.
-    constexpr UInt32 kMaxLoadRetries         = 15;
-    constexpr UInt32 kLoadRetryDelayMs       = 2000;
-    constexpr UInt32 kMaxReadinessRefreshes  = 12;
-    constexpr UInt32 kReadinessRefreshDelayMs = 5000;
+    // Bounded delayed retry (review D3).  Covers a build string / IOKit state that is not ready at
+    // patcher-load or service-start time.  The retries are deliberately finite and never touch page
+    // pointers.
+    constexpr UInt32 kMaxLoadRetries   = 15;
+    constexpr UInt32 kLoadRetryDelayMs = 2000;
 
     // The Info.plist declares org.ChefKiss.NootedRed in OSBundleLibraries, so the kext loader itself only
     // loads this plugin when NootedRed is installed.  This lookup is a diagnostic only.
@@ -94,13 +92,13 @@ extern EXPORT PRODUCT_NAME* ADDPR(selfInstance);
 // Entry points:
 //   - plugin kmod start (`init`): allocate the lock, register `onPatcherLoadForce`; no IOKit/VFS work.
 //   - Lilu patcher load (`onPatcherLoad`): install both code-signing routes UNCONDITIONALLY (review D2),
-//     then attempt the data load and readiness refresh, then arm the bounded retry if work remains.
-//   - IOService start (`serviceStart`): retry data load + readiness refresh only.  It never routes
+//     then attempt the data load, then arm the bounded retry if work remains.
+//   - IOService start (`serviceStart`): retry data load only.  It never routes
 //     kernel text, and it cannot install a second time (installation happens only at patcher load).
-//   - delayed `thread_call` (retryCallback): bounded retries of load/readiness in a kernel thread.
+//   - delayed `thread_call` (retryCallback): bounded retries of data load in a kernel thread.
 //
 // All shared mutable state is guarded by `lock_` (an IOLock).  The validation hooks do not take this
-// lock: they only acquire-load the published data flag and the cached readiness flag, and their
+// lock: they only acquire-load the published data flag, and their
 // counters are atomics inside UserPatchBackend.
 class UserPatchRuntime
 {
@@ -134,16 +132,13 @@ private:
         UInt32                sites;
         bool                  pageHook;
         bool                  rangeHook;
-        bool                  vdaReady;
         UInt32                appliedPages;
         UInt32                loadAttempts;
-        UInt32                readinessRefreshes;
         bool                  retryPending;
     };
 
     // All *Locked helpers require `lock_` to be held.
     void ensureLocked();
-    void refreshReadinessLocked();
     void snapshotLocked(PublishSnapshot& snapshot) const;
     static void publish(const PublishSnapshot& snapshot);
     void logStateLocked(const char* prefix) const;
@@ -152,6 +147,9 @@ private:
 
     void clearRetryFlag();
     void startRetryCall();
+    void startStatusRefresh();
+    void statusRefresh();
+    static void statusRefreshCallback(thread_call_param_t param0, thread_call_param_t param1);
 
     static void retryCallback(thread_call_param_t param0, thread_call_param_t param1);
 
@@ -160,7 +158,6 @@ private:
     bool    finalNoOp_{false};
     bool    retryScheduled_{false};
     UInt32  loadAttempts_{0};
-    UInt32  readinessRefreshes_{0};
 };
 
 UserPatchRuntime& UserPatchRuntime::singleton()
@@ -208,7 +205,6 @@ void UserPatchRuntime::onPatcherLoad(KernelPatcher& patcher)
         UserPatchBackend::singleton().install(patcher);
 
         this->ensureLocked();
-        this->refreshReadinessLocked();
         this->snapshotLocked(snapshot);
         needRetry = this->retryNeededLocked();
         if (needRetry) {
@@ -235,10 +231,9 @@ void UserPatchRuntime::serviceStart()
     PublishSnapshot snapshot{};
     IOLockLock(this->lock_);
     if (!this->disabled_) {
-        // Load and readiness only: hooks are installed exclusively at patcher load, so this entry point
+        // Load only: hooks are installed exclusively at patcher load, so this entry point
         // can never route kernel text late or install a second time (D2).
         this->ensureLocked();
-        this->refreshReadinessLocked();
         this->snapshotLocked(snapshot);
         needRetry = this->retryNeededLocked();
         if (needRetry) {
@@ -255,6 +250,7 @@ void UserPatchRuntime::serviceStart()
 
     if (!this->disabled_) { publish(snapshot); }
     if (needRetry) { this->startRetryCall(); }
+    this->startStatusRefresh();
 }
 
 void UserPatchRuntime::ensureLocked()
@@ -274,39 +270,19 @@ void UserPatchRuntime::ensureLocked()
     }
 }
 
-void UserPatchRuntime::refreshReadinessLocked()
-{
-    auto& patchData = UserPatchData::singleton();
-    auto& backend   = UserPatchBackend::singleton();
-
-    if (!patchData.loaded()) {
-        backend.setVdaReady(false);
-        return;
-    }
-
-    const bool ready = UserPatchData::queryVcnReady(patchData.apuDeviceID());
-    backend.setVdaReady(ready);
-
-    if (this->readinessRefreshes_ < kMaxReadinessRefreshes) {
-        this->readinessRefreshes_ += 1;
-    }
-}
-
 bool UserPatchRuntime::retryNeededLocked() const
 {
     if (this->disabled_ || this->finalNoOp_) { return false; }
 
     auto& patchData = UserPatchData::singleton();
-    auto& backend   = UserPatchBackend::singleton();
 
     if (!patchData.loaded()) { return this->loadAttempts_ < kMaxLoadRetries; }
-
-    return !backend.vdaReady() && this->readinessRefreshes_ < kMaxReadinessRefreshes;
+    return false;
 }
 
 UInt32 UserPatchRuntime::retryDelayMs() const
 {
-    return UserPatchData::singleton().loaded() ? kReadinessRefreshDelayMs : kLoadRetryDelayMs;
+    return kLoadRetryDelayMs;
 }
 
 void UserPatchRuntime::clearRetryFlag()
@@ -361,7 +337,6 @@ void UserPatchRuntime::retryCallback(thread_call_param_t, thread_call_param_t pa
         if (!self.disabled_) {
             if (!self.finalNoOp_) {
                 self.ensureLocked();
-                self.refreshReadinessLocked();
             }
 
             self.snapshotLocked(snapshot);
@@ -384,6 +359,44 @@ void UserPatchRuntime::retryCallback(thread_call_param_t, thread_call_param_t pa
     if (thisCall != nullptr) { thread_call_free(thisCall); }
 }
 
+void UserPatchRuntime::startStatusRefresh()
+{
+    constexpr UInt32 kStatusRefreshMs = 5000;
+
+    if (this->disabled_) { return; }
+
+    thread_call_t call = thread_call_allocate(statusRefreshCallback, nullptr);
+    if (call == nullptr) {
+        SYSLOG("init", "failed to allocate status refresh call");
+        return;
+    }
+
+    UInt64 deadline = 0;
+    clock_interval_to_deadline(kStatusRefreshMs, static_cast<uint32_t>(NSEC_PER_MSEC), &deadline);
+    if (thread_call_enter1_delayed(call, call, deadline)) {
+        SYSLOG("init", "status refresh call was already pending");
+    }
+}
+
+void UserPatchRuntime::statusRefresh()
+{
+    if (this->lock_ == nullptr || this->disabled_) { return; }
+
+    PublishSnapshot snapshot{};
+    IOLockLock(this->lock_);
+    this->snapshotLocked(snapshot);
+    IOLockUnlock(this->lock_);
+
+    publish(snapshot);
+}
+
+void UserPatchRuntime::statusRefreshCallback(thread_call_param_t, thread_call_param_t param1)
+{
+    auto* const thisCall = static_cast<thread_call_t>(param1);
+    singleton().statusRefresh();
+    if (thisCall != nullptr) { thread_call_free(thisCall); }
+}
+
 void UserPatchRuntime::snapshotLocked(PublishSnapshot& snapshot) const
 {
     auto& patchData = UserPatchData::singleton();
@@ -400,10 +413,8 @@ void UserPatchRuntime::snapshotLocked(PublishSnapshot& snapshot) const
     snapshot.sites              = patchData.siteCount();
     snapshot.pageHook           = backend.pageHookInstalled();
     snapshot.rangeHook          = backend.rangeHookInstalled();
-    snapshot.vdaReady           = backend.vdaReady();
     snapshot.appliedPages       = backend.appliedPageCount();
     snapshot.loadAttempts       = this->loadAttempts_;
-    snapshot.readinessRefreshes = this->readinessRefreshes_;
     snapshot.retryPending       = this->retryScheduled_;
 }
 
@@ -424,12 +435,9 @@ void UserPatchRuntime::publish(const PublishSnapshot& snapshot)
     service->setProperty("NRedUserPatchSites", static_cast<unsigned long long>(snapshot.sites), 32);
     service->setProperty("NRedUserPatchHooks", snapshot.pageHook ? 1ULL : 0ULL, 32);
     service->setProperty("NRedUserPatchRangeHook", snapshot.rangeHook ? 1ULL : 0ULL, 32);
-    service->setProperty("NRedUserPatchVdaReady", snapshot.vdaReady ? 1ULL : 0ULL, 32);
     service->setProperty("NRedUserPatchAppliedPages",
                          static_cast<unsigned long long>(snapshot.appliedPages), 32);
     service->setProperty("NRedUserPatchLoadAttempts", static_cast<unsigned long long>(snapshot.loadAttempts), 32);
-    service->setProperty("NRedUserPatchReadinessRefreshes",
-                         static_cast<unsigned long long>(snapshot.readinessRefreshes), 32);
     service->setProperty("NRedUserPatchRetryPending", snapshot.retryPending ? 1ULL : 0ULL, 32);
 }
 
@@ -438,10 +446,10 @@ void UserPatchRuntime::logStateLocked(const char* const prefix) const
     auto& patchData = UserPatchData::singleton();
     auto& backend   = UserPatchBackend::singleton();
 
-    SYSLOG("init", "%s: data=%s reason=%s loadAttempts=%u readinessRefreshes=%u hooks=%s range=%s vdaReady=%s",
-           prefix, patchData.stateName(), patchData.reasonName(), static_cast<unsigned>(this->loadAttempts_),
-           static_cast<unsigned>(this->readinessRefreshes_), backend.pageHookInstalled() ? "installed" : "absent",
-           backend.rangeHookInstalled() ? "installed" : "absent", backend.vdaReady() ? "yes" : "no");
+    SYSLOG("init", "%s: data=%s reason=%s loadAttempts=%u hooks=%s range=%s", prefix,
+           patchData.stateName(), patchData.reasonName(), static_cast<unsigned>(this->loadAttempts_),
+           backend.pageHookInstalled() ? "installed" : "absent",
+           backend.rangeHookInstalled() ? "installed" : "absent");
 }
 
 OSDefineMetaClassAndStructors(PRODUCT_NAME, IOService)

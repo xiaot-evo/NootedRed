@@ -39,7 +39,7 @@ sys.path.insert(0, str(TOOLS_DIR))
 import embed_patchdata as embed  # noqa: E402
 import test_userpatch_data as format_tests  # noqa: E402
 
-EXPECTED_BUILDS = {"24H32", "25G241", "23J631"}
+EXPECTED_BUILDS = {"24H32"}
 PAGE_SIZE = format_tests.PAGE_SIZE
 
 ARRAY_RE = re.compile(r"const uint8_t (kManifest_\w+|kPages_\w+)\[\] = \{(.*?)\};", re.S)

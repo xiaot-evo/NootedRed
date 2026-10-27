@@ -19,10 +19,10 @@ build/branches/<branch>/<platform>/<arch>/userpatch/<mode>/       # NootedRedUse
 For example:
 
 ```text
-build/branches/feature-tahoe-26.7.1/macosx/x86_64/release/NootedRed.kext
-build/branches/feature-tahoe-26.7.1/macosx/x86_64/release/NootedRed-0.9.0-RELEASE-20261020-231422.zip
-build/branches/feature-tahoe-26.7.1/macosx/x86_64/userpatch/release/NootedRedUserPatch.kext
-build/branches/feature-tahoe-26.7.1/macosx/x86_64/userpatch/release/NootedRedUserPatch-0.9.0-RELEASE-20261020-231422.zip
+build/branches/research-satellite-userpatch/macosx/x86_64/release/NootedRed.kext
+build/branches/research-satellite-userpatch/macosx/x86_64/release/NootedRed-0.9.1-RELEASE-20261025-215000.zip
+build/branches/research-satellite-userpatch/macosx/x86_64/userpatch/release/NootedRedUserPatch.kext
+build/branches/research-satellite-userpatch/macosx/x86_64/userpatch/release/NootedRedUserPatch-0.9.1-RELEASE-20261025-215000.zip
 ```
 
 CI (`.github/workflows/main.yml`) and the wrapper both glob the two locations; a single
@@ -41,6 +41,6 @@ interface for per-branch, timestamped output.
 
 ## Why
 
-The kext and zip are versioned by branch (for example the stable 15.8.1 build and the experimental
-26.7.1/VDA builds). Keeping them under one branch-specific directory avoids accidentally installing or
-sharing a kext from another branch.
+The kext and zip are versioned by branch (for example the 15.8.1 build and experiment branches).
+Keeping them under one branch-specific directory avoids accidentally installing or sharing a kext
+from another branch.

@@ -51,9 +51,7 @@ validation data**, not a runtime deployment directory:
 
 | Build | Darwin | Kinds | Pages | Sites |
 | --- | --- | --- | --- | --- |
-| `24H32` | 24.6.0 | 1 GL, 2 Metal, 3 VDA/VA, 4 VDA/AppleGVA | 12 | 17 |
-| `25G241` | 25.6.0 | 1, 2, 3, 4 | 11 | 17 |
-| `23J631` | 23.6.0 | 3 VDA/VA, 4 VDA/AppleGVA | 9 | 13 |
+| `24H32` | 24.6.0 | 1 GL, 2 Metal, 3 VDA/VA, 4 VDA/AppleGVA | 13 | 18 |
 
 ```sh
 # Verify the pinned master snapshot (works at HEAD; master's user-space source is deleted here)
@@ -73,10 +71,10 @@ All pages are master's stock byte arrays and all sites are derived from its veri
 `find`/`replace`/`skip`/`count` fields; nothing is hand-edited or invented. `--source-root` and
 `--source-git` accept an alternative master tree for verification.
 
-Known gaps (listed, not fabricated): `23J631` has no GL/Metal data because master's Sonoma pages are a
-Darwin 23.6-range table without an exact `kern.osversion`; no data exists for other builds; VDA/AppleGVA
-is hardware-validated only on Renoir `0x1638` (15.8.1) and stays behind `NRedVCNBridgeReady` plus exact
-page equality; v1 has no driver-bundle hash field.
+Known gaps (listed, not fabricated): only `24H32` is deployed; other builds are intentionally
+unsupported and there is no family-prefix fallback. VDA/AppleGVA is hardware-validated only on Renoir
+`0x1638` (15.8.1) and stays behind `NRedVCNBridgeReady` plus exact page equality; v1 has no
+driver-bundle hash field.
 
 ## Embedded static PatchData (satellite)
 
@@ -137,7 +135,7 @@ python3 tools/embed_patchdata.py --report
 python3 tools/test_embedded_patchdata.py
 ```
 
-Embedded today: `23J631`, `24H32`, `25G241` (135,612 payload bytes; the generated `.cpp` is ~850 KB of
+Embedded today: `24H32` only (the generated `.cpp` is ~340 KB of
 hex before compilation). The generated files are deterministic (sorted builds, no timestamps or
 absolute paths, content SHA-256 values only) and are round-trip decoded by the generator itself before
 being written/accepted.

@@ -257,9 +257,7 @@ arrays. `tools/embed_patchdata.py` compiles this tree into the satellite's `Patc
 
 | Build | Darwin | `apuMask` | Table kinds | Pages | Sites | `manifest.bin` | `pages.bin` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `24H32` (15.8.1) | 24.6.0 | `0x3F` | 1 GL, 2 Metal, 3 VDA/VA, 4 VDA/AppleGVA | 12 | 17 | 1652 B | 49152 B |
-| `25G241` (26.7.1) | 25.6.0 | `0x3F` | 1 GL, 2 Metal, 3 VDA/VA, 4 VDA/AppleGVA | 11 | 17 | 1636 B | 45056 B |
-| `23J631` (14.8.9) | 23.6.0 | `0x38` | 3 VDA/VA, 4 VDA/AppleGVA | 9 | 13 | 1252 B | 36864 B |
+| `24H32` (15.8.1) | 24.6.0 | `0x3F` | 1 GL, 2 Metal, 3 VDA/VA, 4 VDA/AppleGVA | 13 | 18 | 1744 B | 53248 B |
 
 Kinds 1/2 are exact `AMDRadeonX5000GLDriver`/`AMDRadeonX5000MTLDriver` pages; kinds 3/4 are
 `AMDRadeonVADriver2`/`AppleGVA` pages from master's generated headers. GL/Metal are independent of the
@@ -285,11 +283,10 @@ python3 tools/test_embedded_patchdata.py           # embedded-array round-trip t
 
 Known gaps (data is not fabricated for them):
 
-- **`23J631` GL/Metal are not deployed.** Master has exact Sonoma GL/Metal pages for the Darwin 23.6
-  range (`kGLDriverPatches_Sonoma`), but the source does not pin them to an exact `kern.osversion`.
-  Only kinds 3/4 are shipped for that build.
-- No data exists for other builds (other 14.x/15.x/26.x versions). Add a pinned source and a
-  `BuildSpec` entry in `tools/convert_master_patchdata.py`; do not guess pages.
+- Only `24H32` is deployed. Other builds are intentionally unsupported until a complete exact page
+  set exists; the removed `23J631`/`25G241` sets and family-prefix fallbacks are not coming back
+  through guessing. Add a pinned source and a `BuildSpec` entry in
+  `tools/convert_master_patchdata.py`; do not guess pages.
 - VDA/AppleGVA data is hardware-validated only on Renoir `0x1638` (15.8.1). Format v1 has one
   `apuMask` per build, so other VCN 2.2 APUs rely on exact page equality plus the
   `NRedVCNBridgeReady` gate.

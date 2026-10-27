@@ -21,13 +21,10 @@ On-disk/generator data contract: [`docs/UserPatch-Data-Format.md`](../docs/UserP
 - Resolves the running build identity from the kernel only: `sysctl kern.osversion`, then XNU's
   `osversion` global. There is no file/plist fallback and no filesystem work (see
   [Build identity sources](#build-identity-sources)).
-- Selects the **embedded** PatchData set whose exact build string equals the running build, from the
-  generated `NRedUserPatchData::kBuilds[]` index (currently `24H32`, `25G241`, `23J631`).
-- Validates the whole embedded manifest before trusting a single byte: magic, format version, header
-  size, record layout, canonical table/page/site ranges, build string, Darwin version, APU mask and both
-  FNV-1a checksums, then validates the embedded `pages` size/checksum and every site. Any mismatch is a
-  logged **NoOp**: no page is ever written and the system is left untouched.
-- Retries transient boot-time identity/readiness failures with a bounded kernel `thread_call` timer
+- Loads the single embedded PatchData set directly; there is no build/Darwin/APU selection gate.
+- Validates the embedded manifest format and the pages checksum before trusting a byte, then validates
+  every site. The final match is the complete 4 KiB page image.
+- Retries transient boot-time identity/data-selection failures with a bounded kernel `thread_call` timer
   (review D3); see [Runtime states and bounded retry](#runtime-states-and-bounded-retry).
 - For every page the kernel validator presents, compares the **complete 4 KiB page** against the
   embedded page image. Only on exact equality are the site `find` bytes verified at their recorded
@@ -35,8 +32,8 @@ On-disk/generator data contract: [`docs/UserPatch-Data-Format.md`](../docs/UserP
   `MachInfo::setKernelWriting`.
 - Serialises page writes with its own spinlock and skips pages that already contain the replacement
   bytes (shared page caches re-validate the same page for several processes).
-- Applies VDA/AppleGVA pages only while a **cached** readiness flag, refreshed outside the hooks, says
-  the main kext's VCN bridge is ready (see below).
+- Applies VDA/AppleGVA pages only when the explicit `-NRedVDA` opt-in is present; exact page, build
+  and APU-mask gates still decide whether any byte is written.
 - Publishes its state and counters as IORegistry properties on its own service for diagnostics.
 
 ## What it does not do
@@ -52,8 +49,7 @@ On-disk/generator data contract: [`docs/UserPatch-Data-Format.md`](../docs/UserP
   validation callback while the mapping is valid. This is the specific failure mode that caused the
   research branch's kernel page-fault panic.
 - No IOKit registry matching inside the validation hooks (review D5). The hooks only acquire-load the
-  published data flag and the cached VDA readiness flag; all IOKit work happens in the plugin's own
-  early-boot/service/timer contexts.
+  published data flag; all IOKit work happens in the plugin's own early-boot/service/timer contexts.
 
 ## Auto-enable and boot arguments
 
@@ -157,10 +153,9 @@ NootedRedUserPatch/PatchDataBlob.hpp   # generated index: NRedUserPatchData::kBu
 NootedRedUserPatch/PatchDataBlob.cpp   # generated const manifest/pages byte arrays per build
 ```
 
-Embedded builds (sorted by build string): `23J631`, `24H32`, `25G241` — exact-page tables of kinds
-1 GL, 2 Metal, 3 VDA/VA and 4 VDA/AppleGVA as generated from the repo-root `PatchData/` tree.
-`PatchData/23J631` (14.8.9) deliberately contains only VDA/VA and VDA/AppleGVA tables; a GL/Metal set
-for that build is a documented data-pipeline gap, so GL/Metal stay unpatched there.
+Embedded build: `24H32` — exact-page tables of kinds 1 GL, 2 Metal, 3 VDA/VA and 4 VDA/AppleGVA as
+generated from the repo-root `PatchData/` tree. Other builds are intentionally absent; the satellite
+fails closed with `BuildUnsupported` rather than falling back to a nearest build.
 
 The generated files are owned by the data-pipeline task. Do not hand-edit them. Regenerate/verify after
 any `PatchData/` change:
@@ -213,56 +208,27 @@ single embedded-data key); an over-long or malformed value is rejected and never
 never derived from the Darwin version, and no source is a boot-argument path. `LoadAttempts` keeps
 counting and the bounded retry still applies to transient identity/IOKit failures.
 
-### Selection and APU matching
+### Lean selection
 
-1. The embedded build table is searched for an entry whose `build` exactly equals the running
-   `kern.osversion` string (for example `24H32`). There is no prefix, nearest-build or filesystem
-   fallback; no match is a terminal `BuildUnsupported` NoOp.
-2. The manifest `darwinMajor`/`darwinMinor` must match the running kernel; `darwinPatch` must match
-   `kern.osrelease` when the kernel exposes a non-zero patch level, otherwise it must be `0`.
-3. `apuMask` is an **intersection** test, not an equality test:
-   `accept = (manifest.apuMask & candidateFamilyMask) != 0`. The embedded index `apuMask` is also used
-   as a cheap early filter; the parsed manifest remains authoritative. Candidate bits are derived from
-   the AMD iGPU device ID (`vendor-id == 0x1002`, display class) without reading NootedRed symbols:
+The lean path does not select by macOS build, Darwin version or APU mask:
 
-   | Device ID | Candidate bits |
-   | --- | --- |
-   | `0x15DD` Raven | bit 0 |
-   | `0x15D8` Raven2/Picasso | bits 1 and 2 (the STRAP0 revision is not read, so both are accepted) |
-   | `0x1636`, `0x164C` Renoir/RenoirE | bits 3 and 4 |
-   | `0x15E7`, `0x1638` Barceló/Green Sardine | bits 3 and 5 |
-   | anything else | none: `NoOp` |
+1. The single embedded PatchData set is loaded as soon as the plugin's data load runs.
+2. APU device ID is still read for diagnostics, but an unknown APU is not a no-op.
+3. The complete 4 KiB page image remains the final write gate: if the running driver's page does not
+   match byte-for-byte, nothing is written.
 
-   A conservative candidate set cannot cause a mismatched write: the complete 4 KiB page equality
-   check is the final gate.
-4. Any validation failure leaves the plugin loaded but inert (`State = NoOp` in the log and IORegistry).
-   The routes remain installed and no-op.
+There is no nearest-build, APU-mask or family fallback. Adding another macOS build still means adding
+its exact pages; the lean path only removes the surrounding hardware/build whitelist.
+## VDA pages
 
-## VDA readiness contract with the main kext
-
-GL and Metal pages apply independently. VDA/VA and VDA/AppleGVA pages (table kinds 3 and 4) are only
-applied while the main kext reports the VCN bridge ready:
-
-- property name: `NRedVCNBridgeReady`
-- type: 32-bit property, value non-zero while ready
-- location: the AMD iGPU `IOPCIDevice` only (published by `NRed::setProp32`, task-3 merged). There is
-  no `NootedRed`-service fallback: the main kext does not write that property anywhere else.
-- semantics: written only after `VCNBridge::loadReady()` is true (requested + X5000 prepared + X6000
-  prepared + loadCompleted), and withdrawn on rollback/failure paths.
-
-The satellite resolves the property only from safe contexts (patcher load, `IOService::start`, and the
-bounded readiness refresh timer) and caches a boolean in `UserPatchBackend`. The validation hooks read
-that cached boolean with a single acquire load; they never walk the IORegistry (review D5).
-
-If the property is absent or zero, VDA pages are left unpatched (logged once) and decode falls back to
-the stock behaviour. An already-patched or skipped page is not revisited for a later mapping, so a VDA
-page validated before readiness is simply left stock.
-
+VDA/VA and VDA/AppleGVA pages are treated like every other page: if the complete 4 KiB image matches,
+the sites are applied. There is no `-NRedVDA`/readiness gate in the satellite; the main kext's
+`NRedVCNBridgeReady` property remains a status/diagnostic signal only.
 ## Runtime states and bounded retry
 
 State transitions are serialised by a single `IOLock` owned by `UserPatchRuntime` (review D4). The
-validation hooks do not take that lock; they acquire-load the immutable published data flag and the
-cached readiness flag, and update their counters with atomics.
+validation hooks do not take that lock; they acquire-load the immutable published data flag and update
+their counters with atomics.
 
 | State | Meaning |
 | --- | --- |
@@ -276,18 +242,16 @@ Entry points:
 | Entry point | What it does |
 | --- | --- |
 | plugin kmod start (`init`) | allocates the state lock and registers the Lilu patcher-load callback; no IOKit/VFS work. |
-| Lilu patcher load (`onPatcherLoad`) | installs both routes unconditionally, then attempts embedded-data selection + readiness refresh, then arms the retry timer if work remains. |
-| `IOService::start` (`serviceStart`) | retries selection + readiness refresh and publishes diagnostics. It never routes kernel text and cannot install a second time. |
-| delayed `thread_call` (`retryCallback`) | bounded retries of identity/selection/readiness in a kernel thread; never touches page pointers. |
+| Lilu patcher load (`onPatcherLoad`) | installs both routes unconditionally, then attempts embedded-data selection, then arms the retry timer if work remains. |
+| `IOService::start` (`serviceStart`) | retries data selection and publishes diagnostics. It never routes kernel text and cannot install a second time. |
+| delayed `thread_call` (`retryCallback`) | bounded retries of identity/data selection in a kernel thread; never touches page pointers. |
 
 Bounded retry policy:
 
 - load retries: up to 15 attempts, 2 s apart (covers `kern.osversion`/IOKit not being ready when the
   plugin starts). The delay is converted with `NSEC_PER_MSEC` because
   `clock_interval_to_deadline()` expects absolute-time units, not milliseconds;
-- readiness refreshes: up to 12 attempts, 5 s apart, after data is loaded (covers the VCN bridge
-  becoming ready slightly later during boot);
-- once either bound is reached, the plugin logs `delayed retries finished: ...` with the final state
+- once the bound is reached, the plugin logs `delayed retries finished: ...` with the final state
   and stops scheduling timers. The routes stay installed and inert.
 
 If the plugin is disabled (`-NRedUserPatchOff`), Lilu rejects it before `init()` and no lock, routes,
@@ -296,7 +260,7 @@ timers or properties exist.
 ## Diagnostics
 
 Log tags: `init` (plugin lifecycle/state machine), `UserPatchData` (embedded data selection/validation),
-`UserPatch` (hook installation, readiness, page application). Explicit `no-op: <Reason> (<detail>)`
+`UserPatch` (hook installation, page application). Explicit `no-op: <Reason> (<detail>)`
 lines are emitted for every fail-closed decision.
 
 IORegistry properties on the `NootedRedUserPatch` service (republished on every entry point/retry):
@@ -313,10 +277,8 @@ IORegistry properties on the `NootedRedUserPatch` service (republished on every 
 | `NRedUserPatchPages`, `NRedUserPatchSites` | validated table sizes |
 | `NRedUserPatchHooks` | `1` when the `_cs_validate_page` route is installed (installed even when data is NoOp) |
 | `NRedUserPatchRangeHook` | `1` when the `_cs_validate_range` route is installed (optional extra) |
-| `NRedUserPatchVdaReady` | cached `NRedVCNBridgeReady` state used by the VDA gate |
 | `NRedUserPatchAppliedPages` | distinct pages patched, as of the last state publish |
 | `NRedUserPatchLoadAttempts` | data-selection attempts so far |
-| `NRedUserPatchReadinessRefreshes` | readiness-refresh attempts so far |
 | `NRedUserPatchRetryPending` | `1` while a bounded retry timer is armed |
 
 ## Failure paths
@@ -352,29 +314,22 @@ headers. The equivalent host validation is the independent `tools/userpatch_data
 | File | Purpose |
 | --- | --- |
 | `Plugin.cpp` | `PluginConfiguration`, own `IOService`, locked runtime state machine, bounded `thread_call` retry, IORegistry diagnostics |
-| `PatchData.hpp/.cpp` | embedded build selection, kernel build/APU identity, manifest parser/validator, checksums, iGPU readiness query |
+| `PatchData.hpp/.cpp` | embedded build selection, kernel build/APU identity, manifest parser/validator, checksums |
 | `PatchDataBlob.hpp/.cpp` | **generated** embedded PatchData index and byte arrays (data-pipeline owned; do not hand-edit) |
-| `UserPatchBackend.hpp/.cpp` | `_cs_validate_page` / `_cs_validate_range` routes, exact-page compare, cached VDA readiness, atomic counters, serialised writes |
+| `UserPatchBackend.hpp/.cpp` | `_cs_validate_page` / `_cs_validate_range` routes, exact-page compare, early `-NRedVDA` eligibility, atomic counters, serialised writes |
 | `Info.plist` | bundle identifier, Lilu + NootedRed dependencies, IOKit personality |
 
 ## Known limitations (phase 2)
 
-- No hardware/boot validation yet. The embedded builds (`24H32`, `25G241`, `23J631`) have not been
-  exercised by a boot of this kext on real hardware.
+- Boot-tested on 15.8.1 / `0x1638` with the `24H32` set; other builds have no embedded data.
 - Only the embedded builds can run: any other macOS build is a terminal `BuildUnsupported` NoOp.
   Adding/updating a build requires regenerating `PatchDataBlob.*` and rebuilding/re-signing the kext.
 - The kext carries the embedded data payload (currently ~135 KiB of generated `const` arrays) plus its
   generated source; this increases the bundle size compared with an external-data design.
-- `PatchData/23J631` is VDA-only (no GL/Metal kinds), so GL/Metal stay stock on 14.8.9 until the data
-  pipeline pins a build-exact GL/Metal set.
 - Manifest v1 has no driver-binary hash: the exact 4 KiB page equality is the driver identity gate.
 - Data is keyed by exact build only; one build cannot carry per-APU-divergent page sets in v1.
 - APU family detection is conservative and does not read the STRAP0 revision register, so it accepts
   the family's candidate bit set (never a different family).
-- The VDA readiness cache is refreshed for a bounded window after boot. A readiness withdrawal later
-  than that window (for example an accelerator stop/restart after boot) is not observed, so VDA pages
-  could remain eligible on a stale cached `true`. Exact-page gating still applies; this is a
-  boot-timing/rollback limitation to validate on hardware.
 - If the bounded retries are exhausted, the satellite stays inert for the rest of the boot; it does not
   poll indefinitely.
 - No installer helper (`NootedRedUserPatchCtl`) in this scaffold.

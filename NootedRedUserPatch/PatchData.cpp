@@ -42,7 +42,6 @@ namespace
 {
 
     // Property published by the main NootedRed kext once VCNBridge::loadReady() is true.
-    const char* const kVcnReadyProperty = "NRedVCNBridgeReady";
 
     // Magic bytes of manifest.bin.
     const UInt8 kManifestMagic[4] = {'N', 'R', 'P', 'D'};
@@ -72,6 +71,16 @@ namespace
         return (character >= '0' && character <= '9') || (character >= 'A' && character <= 'Z')
                || (character >= 'a' && character <= 'z') || character == '.' || character == '_'
                || character == '-';
+    }
+
+    // Build families are the leading "24H", "24I", ... prefix.  Patch data remains
+    // exact-page data; a family match only allows the loader to try it, while the
+    // validation page/site match stays the final gate.
+    bool sameBuildFamily(const char* const runtime, const char* const data)
+    {
+        if (runtime == nullptr || data == nullptr) { return false; }
+        if (strlen(runtime) < 3 || strlen(data) < 3) { return false; }
+        return strncmp(runtime, data, 3) == 0;
     }
 
     // Reads a 32-bit little-endian PCI property (vendor-id, device-id, class-code, ...).
@@ -110,75 +119,43 @@ bool UserPatchData::loadLocked()
 {
     this->resetAttempt();
 
+    // Best-effort identity is diagnostic only; it is not a load gate.
     KernelIdentity identity{};
-    if (!readKernelIdentity(identity)) {
-        this->setNoOp(Reason::kBuildUnavailable, "build identity not available yet (kern.osversion sysctl/XNU global)",
-                      true);
-        return false;
-    }
+    readKernelIdentity(identity);
 
-    if (!identity.buildValid || !isValidBuildString(identity.build)) {
-        this->setNoOp(Reason::kBuildInvalid, "running build string is not a usable embedded-data key", false);
-        return false;
-    }
-    strlcpy(this->build_, identity.build, sizeof(this->build_));
-    this->buildSource_ = identity.buildSource;
-
-    // Select the embedded PatchData set by exact build string.  There is no nearest/prefix match and no
-    // filesystem access; adding a build requires regenerating PatchDataBlob.* and rebuilding the kext.
-    const NRedUserPatchData::EmbeddedBuild* embedded = nullptr;
-    for (size_t index = 0; index < NRedUserPatchData::kBuildCount; index++) {
-        const auto& candidate = NRedUserPatchData::kBuilds[index];
-        if (candidate.build != nullptr && strcmp(candidate.build, this->build_) == 0) {
-            embedded = &candidate;
-            break;
-        }
-    }
+    // Lean path: only one embedded set exists.  The page image remains the final match key.  The
+    // build family (24H**) only permits an attempt; a security-update build can still use the same
+    // exact pages, and a changed page is rejected by the validator's full-page/site check.
+    const auto* const embedded = NRedUserPatchData::kBuildCount > 0 ? &NRedUserPatchData::kBuilds[0] : nullptr;
     if (embedded == nullptr) {
-        char available[128]{};
-        for (size_t index = 0; index < NRedUserPatchData::kBuildCount; index++) {
-            const auto& candidate = NRedUserPatchData::kBuilds[index];
-            if (candidate.build == nullptr) { continue; }
-            if (available[0] != '\0') { strlcat(available, ",", sizeof(available)); }
-            strlcat(available, candidate.build, sizeof(available));
-        }
-
-        char detail[192]{};
-        snprintf(detail, sizeof(detail), "no embedded PatchData for build '%s'; available: %s", this->build_, available);
-        SYSLOG("UserPatchData", "%s", detail);
-        this->setNoOp(Reason::kBuildUnsupported, detail, false);
+        this->setNoOp(Reason::kBuildUnsupported, "no embedded PatchData set is compiled in", false);
         return false;
     }
 
-    // APU detection still reads the live IORegistry; the loader performs no filesystem work at all.
-    const UInt32 runningApuMask = detectApuMask(this->deviceID_);
-    if (runningApuMask == 0) {
-        this->setNoOp(Reason::kApuUnknown, "no supported AMD iGPU device-id found (or IOKit not ready)", true);
+    const char* const embeddedBuild = embedded->build != nullptr ? embedded->build : "unknown";
+    if (identity.buildValid && identity.build[0] != '\0' && !sameBuildFamily(identity.build, embeddedBuild)) {
+        this->setNoOp(Reason::kBuildUnsupported, "running build is not in the embedded 24H build family", false);
         return false;
     }
-    this->apuMask_ = runningApuMask;
+
+    strlcpy(this->build_, identity.buildValid && identity.build[0] != '\0' ? identity.build : embeddedBuild,
+            sizeof(this->build_));
+    this->buildSource_ = identity.buildSource != nullptr ? identity.buildSource : "embedded";
+    this->apuMask_ = detectApuMask(this->deviceID_);    // diagnostic only; not a gate
 
     // The generated index metadata is a non-authoritative early filter/diagnostic mirror; the embedded
     // bytes below are still parsed and validated exactly as v1.
     DBGLOG("UserPatchData",
            "embedded index %s: darwin %u.%u.%u apuMask=0x%X tables=%u pages=%u sites=%u pagesChecksum=0x%X",
-           this->build_, static_cast<unsigned>(embedded->darwinMajor), static_cast<unsigned>(embedded->darwinMinor),
+           embeddedBuild, static_cast<unsigned>(embedded->darwinMajor), static_cast<unsigned>(embedded->darwinMinor),
            static_cast<unsigned>(embedded->darwinPatch), static_cast<unsigned>(embedded->apuMask),
            static_cast<unsigned>(embedded->tableCount), static_cast<unsigned>(embedded->pageCount),
            static_cast<unsigned>(embedded->siteCount), static_cast<unsigned>(embedded->pagesChecksum));
-    if (embedded->apuMask != 0 && (embedded->apuMask & runningApuMask) == 0) {
-        char detail[48]{};
-        snprintf(detail, sizeof(detail), "embedded index 0x%X apu 0x%X", static_cast<unsigned>(embedded->apuMask),
-                 static_cast<unsigned>(runningApuMask));
-        this->setNoOp(Reason::kApuMismatch, detail, false);
-        return false;
-    }
-
     this->manifestBuf_  = embedded->manifest;
     this->manifestSize_ = embedded->manifestSize;
     this->pagesBuf_     = embedded->pages;
     this->pagesSize_    = embedded->pagesSize;
-    snprintf(this->dataSource_, sizeof(this->dataSource_), "embedded:%s", this->build_);
+    snprintf(this->dataSource_, sizeof(this->dataSource_), "embedded-family:%s", embeddedBuild);
 
     if (this->manifestBuf_ == nullptr || this->manifestSize_ < sizeof(ManifestHeader)) {
         this->setNoOp(Reason::kManifestInvalid, "embedded manifest is empty or shorter than its header", false);
@@ -259,38 +236,6 @@ bool UserPatchData::loadLocked()
         }
         strlcpy(manifestBuild, header->build, sizeof(manifestBuild));
     }
-    if (strcmp(manifestBuild, this->build_) != 0) {
-        SYSLOG("UserPatchData", "manifest build '%s' does not match running build '%s'", manifestBuild, this->build_);
-        this->setNoOp(Reason::kBuildMismatch, manifestBuild, false);
-        return false;
-    }
-
-    // Darwin selection: major/minor from the kernel; patch only when the kernel exposes it.
-    if (header->darwinMajor != identity.darwinMajor || header->darwinMinor != identity.darwinMinor
-        || (!identity.patchValid && header->darwinPatch != 0)
-        || (identity.patchValid && header->darwinPatch != identity.darwinPatch))
-    {
-        char detail[48]{};
-        snprintf(detail, sizeof(detail), "manifest %u.%u.%u", static_cast<unsigned>(header->darwinMajor),
-                 static_cast<unsigned>(header->darwinMinor), static_cast<unsigned>(header->darwinPatch));
-        this->setNoOp(Reason::kDarwinMismatch, detail, false);
-        return false;
-    }
-
-    // APU selection: the manifest must cover at least one bit of the detected candidate mask.
-    if (header->apuMask == 0 || (header->apuMask & ~0x3FU) != 0) {
-        this->setNoOp(Reason::kManifestInvalid, "manifest apuMask is zero or has unknown v1 bits", false);
-        return false;
-    }
-    this->matchedApuMask_ = header->apuMask & this->apuMask_;
-    if (this->matchedApuMask_ == 0) {
-        char detail[48]{};
-        snprintf(detail, sizeof(detail), "manifest 0x%X apu 0x%X", static_cast<unsigned>(header->apuMask),
-                 static_cast<unsigned>(this->apuMask_));
-        this->setNoOp(Reason::kApuMismatch, detail, false);
-        return false;
-    }
-
     // The embedded pages blob must be the declared size and match its checksum before any byte is trusted.
     if (this->pagesBuf_ == nullptr || this->pagesSize_ == 0) {
         this->setNoOp(Reason::kPagesSizeMismatch, "embedded pages blob is missing or empty", false);
@@ -732,54 +677,6 @@ UInt32 UserPatchData::detectApuMask(UInt16& deviceID)
 
     iterator->release();
     return mask;
-}
-
-bool UserPatchData::readFlagProperty(IORegistryEntry* const entry, const char* const key)
-{
-    if (entry == nullptr) { return false; }
-
-    auto* const property = entry->getProperty(key);
-    if (property == nullptr) { return false; }
-
-    if (auto* const number = OSDynamicCast(OSNumber, property); number != nullptr) {
-        return number->unsigned32BitValue() != 0;
-    }
-    if (auto* const data = OSDynamicCast(OSData, property); data != nullptr) {
-        if (data->getLength() >= sizeof(UInt32)) {
-            UInt32 value = 0;
-            memcpy(&value, data->getBytesNoCopy(), sizeof(value));
-            return value != 0;
-        }
-    }
-
-    return false;
-}
-
-bool UserPatchData::queryVcnReady(const UInt16 deviceID)
-{
-    // The main kext publishes `NRedVCNBridgeReady` on the AMD iGPU IOPCIDevice only (32-bit, non-zero
-    // while VCNBridge::loadReady() is true).  This performs an IOKit lookup, so the runtime only calls it
-    // from a safe context; the validation hooks read the cached flag in UserPatchBackend (review D5).
-    auto* const matching = IOService::serviceMatching("IOPCIDevice");
-    if (matching == nullptr) { return false; }
-
-    auto* const iterator = IOService::getMatchingServices(matching);
-    if (iterator == nullptr) { return false; }
-
-    bool ready = false;
-    while (auto* const object = iterator->getNextObject()) {
-        auto* const service = OSDynamicCast(IOService, object);
-        if (service == nullptr) { continue; }
-        if (readPciProperty(service, "vendor-id") != 0x1002) { continue; }
-        if (deviceID != 0 && readPciProperty(service, "device-id") != deviceID) { continue; }
-        if (readFlagProperty(service, kVcnReadyProperty)) {
-            ready = true;
-            break;
-        }
-    }
-
-    iterator->release();
-    return ready;
 }
 
 UInt32 UserPatchData::fnv1a32(const UInt8* const data, const size_t size)

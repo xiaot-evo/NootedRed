@@ -50,12 +50,6 @@ static const UInt8 kChannelTypesPattern[] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
 
 static const UInt8 kHwlConvertChipFamilyPattern[] = {0x81, 0xFE, 0x8D, 0x00, 0x00, 0x00, 0x0F};
 
-static const char* const kBootArgNoComputeSubmit = "-NRedNoComputeSubmit";
-
-// Written from every compute submission path; only the first call and every 256th call publish a
-// property (a property write per submit would be too expensive in this hot path).
-static UInt32 computeSubmitHookCalls{0};
-
 // Make for loop stop after one SDMA engine.
 static const UInt8 kStartHWEnginesOriginal[] = {0x40, 0x83, 0xF0, 0x02};
 static const UInt8 kStartHWEnginesMask[]     = {0xF0, 0xFF, 0xF0, 0xFF};
@@ -222,38 +216,25 @@ void X5000::processKext(KernelPatcher& patcher, const size_t id, const mach_vm_a
     // `__ZTV` is the vtable start ([offset-to-top, typeinfo, fn0, ...]); an object's vptr points at the
     // address point (start + 2 pointers).  The ObjectField offsets below are relative to that address
     // point, so applying them to the `__ZTV` symbol itself would patch a different virtual function.
-    if (currentKernelVersion() >= MACOS_11 && checkKernelArgument(kBootArgNoComputeSubmit)) {
-        NRed::singleton().setProp32("NRedComputeSubmitHook", 0);
-        NRed::singleton().setProp32("NRedComputeSubmitHookSkip", 4);
-        SYSLOG("X5000", "Compute submit hook disabled by -NRedNoComputeSubmit");
-    }
-    else if (currentKernelVersion() >= MACOS_11) {
+    if (currentKernelVersion() >= MACOS_11) {
         PenguinWizardry::PatternSolveRequest notifyRequest{
             "__ZN30AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv", this->notifyGfxAccess};
         if (!notifyRequest.solve(patcher, id, slide, size)) {
             patcher.clearError();
-            NRed::singleton().setProp32("NRedComputeSubmitHook", 0);
-            NRed::singleton().setProp32("NRedComputeSubmitHookSkip", 1);
             SYSLOG("X5000", "Compute submit hook skipped: notifyGfxAccess unavailable");
         }
         else {
             auto* const pm4ComputeChannelVTable = static_cast<UInt8*>(pm4ComputeChannelVT) + 2 * sizeof(void*);
             if (this->hwChannelSubmitCommandBuffer(pm4ComputeChannelVTable) != this->orgPM4SubmitCommandBuffer) {
-                NRed::singleton().setProp32("NRedComputeSubmitHook", 0);
-                NRed::singleton().setProp32("NRedComputeSubmitHookSkip", 2);
                 SYSLOG("X5000", "Compute submit hook skipped: vtable slot does not match submitCommandBuffer");
             }
             else if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
-                NRed::singleton().setProp32("NRedComputeSubmitHook", 0);
-                NRed::singleton().setProp32("NRedComputeSubmitHookSkip", 3);
                 SYSLOG("X5000", "Compute submit hook skipped: cannot enable kernel writing");
             }
             else {
                 this->hwChannelSubmitCommandBuffer(pm4ComputeChannelVTable) =
                     reinterpret_cast<mach_vm_address_t>(computeSubmitCommandBuffer);
                 MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-                NRed::singleton().setProp32("NRedComputeSubmitHook", 1);
-                NRed::singleton().setProp32("NRedComputeSubmitHookSkip", 0);
                 SYSLOG("X5000", "Compute submit hook installed");
             }
         }
@@ -489,14 +470,6 @@ UInt32 X5000::wrapHwlConvertChipFamily(void* const self, const UInt32 family, co
 
 UInt32 X5000::computeSubmitCommandBuffer(void* const self, void* const info)
 {
-    const auto call = __atomic_fetch_add(&computeSubmitHookCalls, 1, __ATOMIC_RELAXED);
-    if (call == 0) {
-        NRed::singleton().setProp32("NRedComputeSubmitHookCalled", 1);
-        SYSLOG("X5000", "Compute submit hook first call");
-    }
-    if ((call & 0xFF) == 0) {
-        NRed::singleton().setProp32("NRedComputeSubmitHookCalls", call + 1);
-    }
     singleton().notifyGfxAccess(singleton().hwChannelHWInterfaceField(self));
     return FunctionCast(computeSubmitCommandBuffer, singleton().orgPM4SubmitCommandBuffer)(self, info);
 }

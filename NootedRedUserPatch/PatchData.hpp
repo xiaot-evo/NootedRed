@@ -165,11 +165,6 @@ public:
     const Page* pages() const;
     const Site* sites() const;
 
-    // Reads the main kext's `NRedVCNBridgeReady` flag for the given AMD iGPU device ID.  This performs an
-    // IOKit lookup and must only be called from a safe context (patcher load / IOService start / delayed
-    // retry), never from the code-signing hooks; UserPatchBackend caches the result for the hooks.
-    static bool queryVcnReady(UInt16 deviceID);
-
     // True when the last load failure was transient (retryable) rather than terminal.  Call while
     // holding the runtime state lock.
     bool retryable() const;
@@ -262,7 +257,6 @@ private:
     static UInt32 detectApuMask(UInt16& deviceID);
     static UInt32 fnv1a32(const UInt8* data, size_t size);
     static UInt64 fnv1a64Zeroed(const UInt8* data, size_t size, size_t zeroOffset, size_t zeroSize);
-    static bool readFlagProperty(IORegistryEntry* entry, const char* key);
 
     // Published with release semantics after the runtime tables are complete; the validation hooks use an
     // acquire load.  Buffers are never freed or replaced after this becomes 1.

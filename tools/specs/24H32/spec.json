@@ -75,11 +75,29 @@
     },
     "apuMaskNote": "union of master's gfx9 family masks; exact page equality is the final gate",
     "gaps": [
-      "No PatchData exists for other builds. Add a pinned source + BuildSpec entry; do not guess pages.",
+      "Only 24H32 is deployed. Other builds are intentionally unsupported until a complete, validated page/guard set exists; do not guess or reuse nearest-build data.",
       "VDA/AppleGVA data is hardware-validated only on Renoir 0x1638 (15.8.1). Format v1 has one apuMask per build, so other VCN 2.2 APUs rely on exact page equality and NRedVCNBridgeReady.",
       "Driver identity in format v1 is exact 4 KiB page equality; there is no driver-bundle hash field."
     ],
-    "note": "Pages are master's stock byte arrays; site offsets/occurrences are derived from the PagePatch find/replace/skip/count fields. No driver bytes are invented. Regenerate with tools/convert_master_patchdata.py."
+    "extraPages": [
+      {
+        "kind": 2,
+        "source": "tools/sources/24H32/metal-hwinfo-page.bin",
+        "sha256": "37f265b415c6a56daf9bf6c80239b55c1aa670b9329e664ab1a562907f41d556",
+        "note": "exact 4 KiB AMDRadeonX5000MTLDriver gfx9_HwInfoInitData page; supplementary user-space fix imported from research/apucaps-planb MTLHwInfoData.hpp",
+        "sites": [
+          {
+            "offset": 1309,
+            "find": "c7477804000000",
+            "replace": "c7477801000000",
+            "findOccurrence": 0,
+            "name": "MTLHwInfo A1 numShaderEngines 4 -> 1",
+            "note": "15.8.1 AMDRadeonX5000MTLDriver HwInfo page; fixes Metal compute/scratch topology on Renoir-family APUs"
+          }
+        ]
+      }
+    ],
+    "note": "Pages are master's stock byte arrays plus the pinned supplementary extraPages sources; site offsets/occurrences are derived from the PagePatch find/replace/skip/count fields. No driver bytes are invented. Regenerate with tools/convert_master_patchdata.py."
   },
   "tables": [
     {
@@ -122,7 +140,7 @@
     },
     {
       "kind": 2,
-      "note": "metal: 1 exact page(s) from master NootedRed/UserPatches.cpp:kGLDriverPatches",
+      "note": "metal: 1 exact page(s) from master NootedRed/UserPatches.cpp:kGLDriverPatches + supplementary source",
       "pages": [
         {
           "source": "pages/metal-00-mtlcontrol-page.bin",
@@ -144,6 +162,21 @@
               "findOccurrence": 0,
               "name": "kMTLAllowFind -> kMTLAllowReplace",
               "note": "NootedRed/UserPatches.cpp: kMTLAllowFind occurrence 0 of 2"
+            }
+          ]
+        },
+        {
+          "source": "pages/metal-01-mtl-hwinfo-page.bin",
+          "sha256": "37f265b415c6a56daf9bf6c80239b55c1aa670b9329e664ab1a562907f41d556",
+          "note": "exact 4 KiB AMDRadeonX5000MTLDriver gfx9_HwInfoInitData page; supplementary user-space fix imported from research/apucaps-planb MTLHwInfoData.hpp",
+          "sites": [
+            {
+              "offset": 1309,
+              "find": "c7477804000000",
+              "replace": "c7477801000000",
+              "findOccurrence": 0,
+              "name": "MTLHwInfo A1 numShaderEngines 4 -> 1",
+              "note": "15.8.1 AMDRadeonX5000MTLDriver HwInfo page; fixes Metal compute/scratch topology on Renoir-family APUs"
             }
           ]
         }

@@ -29,8 +29,6 @@ Current supported boot arguments are listed in the script and below:
 | Argument | Effect |
 | --- | --- |
 | `-NRedVDA` | main kext: enable the VCN/VDA kernel bridge; required for satellite VDA pages |
-| `-NRedAVC` | main kext: alternate VDA/VCN opt-in |
-| `-NRedVCNNoGfxOff` | main kext: diagnostic GFXOFF hold for VCN |
 | `-NRedUserPatchOff` | satellite: disable all user-space page patching |
 | `-NRedUserPatchDebug` | satellite: verbose Lilu logging |
 | `-NRedUserPatchBeta` | satellite: allow non-release kernels |

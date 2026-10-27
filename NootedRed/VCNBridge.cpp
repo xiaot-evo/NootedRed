@@ -47,12 +47,9 @@ namespace
 {
 
     const char* const kBootArgVDA = "-NRedVDA";
-    const char* const kBootArgAVC = "-NRedAVC";
-    // Diagnostic: keep the X5000 GFXOFF state disabled while the bridged VCN0 engine is active.
-    const char* const kBootArgNoGfxOff = "-NRedVCNNoGfxOff";
 
-    // VCNData selects either an exact build table or a family-prefix adapter for nearby patch releases;
-    // every guard and original call-site byte is still verified against the live driver before patching.
+    // VCNData carries the exact 24H32 kernel bridge table. Every guard and original call-site byte is
+    // verified against the live driver before patching.
     bool isSupportedOS()
     {
         const auto& version = currentKernelVersion();
@@ -205,21 +202,16 @@ VCNBridge& VCNBridge::singleton() { return moduleInstance; }
 
 void VCNBridge::init()
 {
-    this->requested = checkKernelArgument(kBootArgVDA) || checkKernelArgument(kBootArgAVC);
-    this->noGfxOff = this->requested && checkKernelArgument(kBootArgNoGfxOff);
-    if (this->noGfxOff) {
-        NRed::singleton().setProp32("NRedVCNNoGfxOff", 1);
-        SYSLOG("VCN", "VCN GFXOFF hold requested; X5000 enableGfxOff will be ignored");
-    }
+    this->requested = checkKernelArgument(kBootArgVDA);
     if (!this->requested) {
-        DBGLOG("VCN", "VCN bridge is disabled; add -NRedVDA or -NRedAVC to opt in");
+        DBGLOG("VCN", "VCN bridge is disabled; add -NRedVDA to opt in");
         return;
     }
 
     if (!isSupportedOS()) {
         SYSLOG("VCN",
-               "VCN data is for macOS 15.8.1 (Darwin 24.6) or 14.8.9 (Darwin 23.6); the hardware decode boot "
-               "argument is ignored on this build");
+               "VCN data is for macOS 15.8.1 (Darwin 24.6); the hardware decode boot argument is ignored on "
+               "this build");
         this->requested = false;
         return;
     }
@@ -272,12 +264,24 @@ void* VCNBridge::allocateEngine(void* const hardware)
     return engine;
 }
 
+bool VCNBridge::loadX6000Now()
+{
+    publishStage(6);
+    const auto status   = OSKextLoadKextWithIdentifier("com.apple.kext.AMDRadeonX6000");
+    this->loadCompleted = status == kOSReturnSuccess && this->x5000Prepared && this->x6000Prepared;
+    NRed::singleton().setProp32("NRedVCNNativeLoadStatus", static_cast<UInt32>(status));
+    NRed::singleton().setProp32("NRedVCNNativeLoadReady", static_cast<UInt32>(this->loadCompleted));
+    if (!this->loadCompleted) { publishReject(6); }
+    SYSLOG("VCN", "X6000 native load status=0x%X prepared5=%u prepared6=%u", static_cast<unsigned>(status),
+           this->x5000Prepared, this->x6000Prepared);
+    return this->loadCompleted;
+}
+
 bool VCNBridge::acceleratorStart(void* const self, IOService* const provider)
 {
     auto& bridge = singleton();
     if (bridge.requested) {
         NRed::singleton().setProp32("NRedVCNAccelStartSeen", 1);
-        if (bridge.noGfxOff) { NRed::singleton().setProp32("NRedVCNNoGfxOff", 1); }
         publishStage(5);
     }
 
@@ -302,17 +306,7 @@ bool VCNBridge::acceleratorStart(void* const self, IOService* const provider)
 
     if (!bridge.loadAttempted) {
         bridge.loadAttempted = true;
-        publishStage(6);
-        const auto status   = OSKextLoadKextWithIdentifier("com.apple.kext.AMDRadeonX6000");
-        bridge.loadCompleted = status == kOSReturnSuccess && bridge.x5000Prepared && bridge.x6000Prepared;
-        NRed::singleton().setProp32("NRedVCNNativeLoadStatus", static_cast<UInt32>(status));
-        NRed::singleton().setProp32("NRedVCNNativeLoadReady", static_cast<UInt32>(bridge.loadCompleted));
-        if (!bridge.loadCompleted) { publishReject(6); }
-        SYSLOG("VCN", "X6000 native load status=0x%X prepared5=%u prepared6=%u", status, bridge.x5000Prepared,
-               bridge.x6000Prepared);
-
-        // The actual readiness transition: loadCompleted just became true, so make it visible to the
-        // satellite immediately (before the original accelerator start runs).
+        bridge.loadX6000Now();
         publishBridgeReady();
     }
     else if (readinessWithdrawnByStop && bridge.x5000Prepared && bridge.x6000Prepared) {
@@ -428,35 +422,9 @@ UInt64 VCNBridge::surfaceCopy(void* const self, void* const input, const UInt64 
     return reinterpret_cast<UInt64 (*)(void*, void*, UInt64, void*)>(address)(self, input, size, event);
 }
 
-void VCNBridge::noopEnableGfxOff(void* const self)
-{
-    auto& bridge = singleton();
-    if (!bridge.gfxOffHeld) {
-        bridge.gfxOffHeld = true;
-        NRed::singleton().setProp32("NRedVCNGfxOffHeld", 1);
-        SYSLOG("VCN", "ignoring X5000 enableGfxOff while the VCN bridge is active");
-    }
-    (void)self;
-}
-
-void VCNBridge::holdGfxOff()
-{
-    auto& bridge = singleton();
-    if (!bridge.noGfxOff || bridge.gfxOffHeld || bridge.hardwareHandle == nullptr
-        || bridge.notifyGfxAccess == 0) {
-        return;
-    }
-
-    reinterpret_cast<void (*)(void*)>(bridge.notifyGfxAccess)(bridge.hardwareHandle);
-    bridge.gfxOffHeld = true;
-    NRed::singleton().setProp32("NRedVCNGfxOffHeld", 1);
-    SYSLOG("VCN", "GFXOFF held off for the bridged VCN engine");
-}
-
 void VCNBridge::signalWork(void* const hardware)
 {
     auto& bridge = singleton();
-    bridge.holdGfxOff();
     if (bridge.engineEnabled() && bridge.notifyGfxAccess != 0) {
         reinterpret_cast<void (*)(void*)>(bridge.notifyGfxAccess)(hardware);
         return;
@@ -468,7 +436,6 @@ void VCNBridge::signalWork(void* const hardware)
 bool VCNBridge::initHardware(void* const self, const UInt32 channel)
 {
     auto& bridge = singleton();
-    bridge.holdGfxOff();
     const auto result = FunctionCast(initHardware, bridge.orgInitHardware)(self, channel);
     NRed::singleton().setProp32("NRedVCNLastHardwareInit", static_cast<UInt32>(result));
 
@@ -569,12 +536,6 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
                       this->surfaceCopy5000, slide, size);
         ok &= resolve(patcher, id, "__ZN30AMDRadeonX5000_AMDGFX9Hardware15notifyGfxAccessEv", this->notifyGfxAccess,
                       slide, size);
-        if (this->noGfxOff) {
-            ok &= resolve(patcher, id, "__ZN28AMDRadeonX5000_AMDRTHardware13disableGfxOffEv",
-                          this->disableGfxOff5000, slide, size);
-            ok &= resolve(patcher, id, "__ZN28AMDRadeonX5000_AMDRTHardware12enableGfxOffEv",
-                          this->enableGfxOff5000, slide, size);
-        }
         if (!ok) {
             publishReject(9);
             SYSLOG("VCN", "failed to resolve X5000 bridge symbols");
@@ -619,18 +580,6 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
             return;
         }
 
-        if (this->noGfxOff) {
-            KernelPatcher::RouteRequest gfxRoute{"__ZN28AMDRadeonX5000_AMDRTHardware12enableGfxOffEv",
-                                                  noopEnableGfxOff, this->enableGfxOff5000};
-            if (!patcher.routeMultiple(id, &gfxRoute, 1, slide, size)) {
-                patcher.clearError();
-                publishReject(12);
-                SYSLOG("VCN", "Failed to route X5000 enableGfxOff for the GFXOFF hold");
-                this->x5000Prepared = false;
-                return;
-            }
-        }
-
         KernelPatcher::RouteRequest castRoute{"__ZN15OSMetaClassBase12safeMetaCastEPKS_PK11OSMetaClass", safeMetaCast,
                                               this->orgSafeMetaCast};
         if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &castRoute, 1)) {
@@ -645,6 +594,7 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
         NRed::singleton().setProp32("NRedVCNX5000ABIValidated", 1);
         publishStage(4);
         SYSLOG("VCN", "X5000 VCN entry points prepared");
+
     }
     else if (id == kextRadeonX6000.loadIndex) {
         NRed::singleton().setProp32("NRedVCNX6000Seen", 1);

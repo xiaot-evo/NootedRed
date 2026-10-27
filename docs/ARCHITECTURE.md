@@ -52,12 +52,13 @@ The main kext must build and run with the satellite absent; that is the primary 
   `manifestSize`, FNV-1a checksums, canonical table layout, limits, page/site bounds and site `find`
   bytes at their recorded offsets;
 - applies tables of kind 1 GL and 2 Metal independently of the main kext; kinds 3 VDA/VA and
-  4 VDA/AppleGVA only while the cached `NRedVCNBridgeReady` value is true;
+  4 VDA/AppleGVA only when the user passed `-NRedVDA` (AppleGVA/VADriver pages are validated too early
+  to wait for the main kext's readiness property);
 - requires an exact full-page match and the site's `find` bytes at the declared offset; there is no
   semantic scan, no page search and no nearest-build fallback;
 - fails closed (`NoOp`) on a missing/mismatched embedded build, build/Darwin/APU mismatch or page
   mismatch, while the plugin stays loaded and the routes stay inert;
-- retries transient identity/readiness failures from the Lilu patcher-load callback,
+- retries transient identity/data-selection failures from the Lilu patcher-load callback,
   `IOService::start` and a bounded `thread_call` timer; it performs no file I/O in any of them.
 
 The parser/loader contract is defined in [UserPatch-Data-Format.md](UserPatch-Data-Format.md).
@@ -73,9 +74,7 @@ inputs live under `tools/specs/`. `tools/embed_patchdata.py` then emits
 
 | Build | Darwin | Kinds | Notes |
 | --- | --- | --- | --- |
-| `24H32` | 24.6.0 | 1 GL, 2 Metal, 3 VDA/VA, 4 VDA/AppleGVA | full 15.8.1 set |
-| `25G241` | 25.6.0 | 1, 2, 3, 4 | full 26.7.1 set, hardware pending |
-| `23J631` | 23.6.0 | 3, 4 | VDA-only; 14.8.9 GL/Metal is a documented gap |
+| `24H32` | 24.6.0 | 1 GL, 2 Metal, 3 VDA/VA, 4 VDA/AppleGVA | complete 15.8.1 set |
 
 The running kext has no data directory and performs no VFS/read of these files; `PatchData/` is
 build-time input only. See [`PatchData/README.md`](../PatchData/README.md) for regeneration/embedding

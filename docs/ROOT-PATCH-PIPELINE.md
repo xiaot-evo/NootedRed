@@ -33,7 +33,7 @@ compat/
   manifests/
     15.8.1-24H32/glfix.json
     15.8.1-24H32/vda.json
-    14.8.9-23J631/...            # only after validation
+    unsupported-builds/         # do not add without complete validated data
   payloads/
     15.8.1-24H32/glfix/…         # patched files or patch recipes + hashes
     15.8.1-24H32/vda/…

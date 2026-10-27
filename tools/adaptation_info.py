@@ -49,8 +49,6 @@ APU_MASKS = {
 VCN_CAPABLE = {"0x1636", "0x1638", "0x164C", "0x15E7"}
 BOOT_ARGS = [
     ("-NRedVDA", "main kext: enable the VCN/VDA kernel bridge; required for satellite VDA pages"),
-    ("-NRedAVC", "main kext: alternate VDA/VCN opt-in"),
-    ("-NRedVCNNoGfxOff", "main kext: diagnostic GFXOFF hold for VCN"),
     ("-NRedUserPatchOff", "satellite: disable all user-space page patching"),
     ("-NRedUserPatchDebug", "satellite: verbose Lilu logging"),
     ("-NRedUserPatchBeta", "satellite: allow non-release kernels"),
@@ -230,7 +228,7 @@ def print_human(report: dict) -> None:
     if satellite["loaded"]:
         for key in ("NRedUserPatchState", "NRedUserPatchReason", "NRedUserPatchBuild",
                     "NRedUserPatchDataSource", "NRedUserPatchApuMask",
-                    "NRedUserPatchPages", "NRedUserPatchSites", "NRedUserPatchVdaReady"):
+                    "NRedUserPatchPages", "NRedUserPatchSites"):
             if key in satellite["properties"]:
                 print(f"    {key}: {satellite['properties'][key]}")
     print("  boot arguments:")

@@ -231,7 +231,7 @@ namespace VCNData::Build24H32
     inline constexpr char DriverSHA256_6000[] = "c3a053dcce9f2bfd2fb8474f7abb3b0e30784459e613a0863ea8190175891265";
 
     inline constexpr Variant kData = {
-        2,
+        1,
         Build,
         DarwinMajor,
         DarwinMinor,
@@ -245,7 +245,6 @@ namespace VCNData::Build24H32
         Table5000,
         Table6000,
         SignalSymbol,
-        false,
         true,
         KernelCollectionUUID,
         DriverUUID5000,

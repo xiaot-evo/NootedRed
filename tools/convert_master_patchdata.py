@@ -6,13 +6,9 @@ pinned snapshot (``tools/pinned/master``), writes readable specs with exact 4 Ki
 ``tools/specs/<build>/`` and generates the deployable ``PatchData/<build>/`` directory with
 ``tools/userpatch_data.py``.
 
-Coverage is deliberately conservative; gaps are reported instead of invented:
+Coverage is limited to the one complete, validated build:
 
 * ``24H32`` (15.8.1, Darwin 24.6.0): kinds 1 GL, 2 Metal, 3 VDA/VA, 4 VDA/AppleGVA.
-* ``25G241`` (26.7.1, Darwin 25.6.0): kinds 1, 2, 3, 4.
-* ``23J631`` (14.8.9, Darwin 23.6.0): kinds 3 and 4 only. Master's Sonoma GL/Metal pages are a
-  14.x-range table and are not pinned to an exact ``kern.osversion``, so they are listed as a gap
-  rather than deployed under a guessed build.
 
 Every page is master's stock byte array and every site is resolved from the table's verified
 ``find``/``replace``/``skip``/``count`` fields; the output is deterministic. Adding a build means
@@ -58,13 +54,6 @@ GL_PAGE_NOTES: dict[str, tuple[str, int | None]] = {
                               "(master array kGLDriverDualQuadPage)", 0x8000),
     "kMTLControlPage": ("exact 4 KiB AMDRadeonX5000MTLDriver shared-cache page containing the "
                         "pipeline CB_COLOR_CONTROL computation (master array kMTLControlPage)", None),
-    "kTahoeGLHwInfoPage": ("exact 4 KiB AMDRadeonX5000GLDriver page at file offset 0xE000 "
-                           "(master array kTahoeGLHwInfoPage)", 0xE000),
-    "kTahoeGLDualQuadPage": ("exact 4 KiB AMDRadeonX5000GLDriver page at file offset 0x8000 "
-                             "(master array kTahoeGLDualQuadPage)", 0x8000),
-    "kTahoeMTLControlPage": ("exact 4 KiB AMDRadeonX5000MTLDriver shared-cache page containing the "
-                             "pipeline CB_COLOR_CONTROL computation (master array "
-                             "kTahoeMTLControlPage)", None),
 }
 
 
@@ -86,6 +75,18 @@ class HeaderSource:
 
 
 @dataclass(frozen=True)
+class ExtraPage:
+    """Supplementary exact-page source pinned outside the master snapshot."""
+
+    kind: int
+    name: str
+    source: str
+    sha256: str
+    note: str
+    sites: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
 class BuildSpec:
     build: str
     darwin: tuple[int, int, int]
@@ -95,6 +96,7 @@ class BuildSpec:
     vda: HeaderSource
     gva: HeaderSource
     gaps: tuple[str, ...] = field(default_factory=tuple)
+    extra_pages: tuple[ExtraPage, ...] = field(default_factory=tuple)
 
 
 BUILDS: tuple[BuildSpec, ...] = (
@@ -108,37 +110,33 @@ BUILDS: tuple[BuildSpec, ...] = (
                     "AMDRadeonX5000GLDriver 7.0.25 / macOS 15.8.1 (24H32)"),
         vda=HeaderSource("NootedRed/VDAVAData.hpp"),
         gva=HeaderSource("NootedRed/VDAGVAData.hpp"),
-    ),
-    BuildSpec(
-        build="23J631",
-        darwin=(23, 6, 0),
-        apu_mask=0x38,  # Renoir / RenoirE / GreenSardine: the VCN 2.2 families these VDA tables target
-        note=("VDA-only macOS 14.8.9 set: master's VDA/VA and VDA/AppleGVA headers are pinned to "
-              "23J631. GL/Metal are not deployed: master's Sonoma pages are a 14.x-range table, not an "
-              "exact 23J631 build."),
-        gl=None,
-        vda=HeaderSource("NootedRed/VDAVADataSonoma.hpp"),
-        gva=HeaderSource("NootedRed/VDAGVADataSonoma.hpp"),
-        gaps=("GL/Metal: master has exact Sonoma pages for the Darwin 23.6 range (kGLDriverPatches_Sonoma) "
-              "but does not pin them to an exact kern.osversion, so no 14.x PatchData directory is "
-              "generated for kinds 1/2.",),
-    ),
-    BuildSpec(
-        build="25G241",
-        darwin=(25, 6, 0),
-        apu_mask=0x3F,
-        note=("Deployable macOS 26.7.1 set: GL/Metal exact pages plus VDA/VA and VDA/AppleGVA tables. "
-              "VDA kinds still require NRedVCNBridgeReady at runtime; Metal is copied from master's "
-              "known-good gate/allow form."),
-        gl=GlSource("kTahoeGLDriverPatches", ("NootedRed/UserPatches.cpp", "NootedRed/TahoePatchData.hpp"),
-                    "AMDRadeonX5000GLDriver 7.x / macOS 26.7.1 (25G241)"),
-        vda=HeaderSource("NootedRed/VDAVADataTahoe.hpp"),
-        gva=HeaderSource("NootedRed/VDAGVADataTahoe.hpp"),
+        extra_pages=(
+            ExtraPage(
+                kind=2,
+                name="mtl-hwinfo-page",
+                source="tools/sources/24H32/metal-hwinfo-page.bin",
+                sha256="37f265b415c6a56daf9bf6c80239b55c1aa670b9329e664ab1a562907f41d556",
+                note=("exact 4 KiB AMDRadeonX5000MTLDriver gfx9_HwInfoInitData page; supplementary "
+                      "user-space fix imported from research/apucaps-planb MTLHwInfoData.hpp"),
+                sites=(
+                    {
+                        "offset": 0x51D,
+                        "find": "c7477804000000",
+                        "replace": "c7477801000000",
+                        "findOccurrence": 0,
+                        "name": "MTLHwInfo A1 numShaderEngines 4 -> 1",
+                        "note": ("15.8.1 AMDRadeonX5000MTLDriver HwInfo page; fixes Metal compute/"
+                                 "scratch topology on Renoir-family APUs"),
+                    },
+                ),
+            ),
+        ),
     ),
 )
 
 GLOBAL_GAPS = (
-    "No PatchData exists for other builds. Add a pinned source + BuildSpec entry; do not guess pages.",
+    "Only 24H32 is deployed. Other builds are intentionally unsupported until a complete, validated "
+    "page/guard set exists; do not guess or reuse nearest-build data.",
     "VDA/AppleGVA data is hardware-validated only on Renoir 0x1638 (15.8.1). Format v1 has one "
     "apuMask per build, so other VCN 2.2 APUs rely on exact page equality and NRedVCNBridgeReady.",
     "Driver identity in format v1 is exact 4 KiB page equality; there is no driver-bundle hash field.",
@@ -158,11 +156,7 @@ def _require(condition: bool, message: str) -> None:
 # converter verifies that mapping from the pinned NRed.cpp instead of assuming it.
 VDA_NAMESPACES = {
     "NootedRed/VDAVAData.hpp": "VDAVAData",
-    "NootedRed/VDAVADataSonoma.hpp": "VDAVADataSonoma",
-    "NootedRed/VDAVADataTahoe.hpp": "VDAVADataTahoe",
     "NootedRed/VDAGVAData.hpp": "VDAGVAData",
-    "NootedRed/VDAGVADataSonoma.hpp": "VDAGVADataSonoma",
-    "NootedRed/VDAGVADataTahoe.hpp": "VDAGVADataTahoe",
 }
 
 
@@ -336,6 +330,32 @@ def derive_spec(source: SourceTree, definition: BuildSpec,
     page_files.update(gva_pages)
     source_files_used.update((definition.vda.file, definition.gva.file, "NootedRed/NRed.cpp"))
 
+    for extra in definition.extra_pages:
+        page = (ROOT / extra.source).read_bytes()
+        _require(len(page) == tables.PAGE_SIZE,
+                 f"{extra.source}: {len(page)} bytes, expected {tables.PAGE_SIZE}")
+        _require(tables.sha256_hex(page) == extra.sha256,
+                 f"{extra.source}: sha256 does not match the pinned supplementary source")
+        target = next((table for table in table_specs if table["kind"] == extra.kind), None)
+        _require(target is not None, f"{definition.build}: no table kind {extra.kind} for {extra.source}")
+        for site in extra.sites:
+            find = bytes.fromhex(site["find"])
+            offset = int(site["offset"])
+            _require(0 <= offset <= len(page) - len(find),
+                     f"{extra.source}: site offset 0x{offset:x} outside the page")
+            _require(page[offset:offset + len(find)] == find,
+                     f"{extra.source}: site find bytes do not match at 0x{offset:x}")
+        index = len(target["pages"])
+        file_name = f"{KIND_NAMES[extra.kind]}-{index:02d}-{tables.slugify(extra.name)}.bin"
+        target["pages"].append({
+            "source": f"pages/{file_name}",
+            "sha256": extra.sha256,
+            "note": extra.note,
+            "sites": [dict(site) for site in extra.sites],
+        })
+        target["note"] += " + supplementary source"
+        page_files[file_name] = page
+
     table_specs.sort(key=lambda table: table["kind"])
     expected_kinds = [1, 2, 3, 4] if definition.gl is not None else [3, 4]
     _require([table["kind"] for table in table_specs] == expected_kinds,
@@ -372,9 +392,26 @@ def derive_spec(source: SourceTree, definition: BuildSpec,
                 0x38: "Renoir | RenoirE | GreenSardine, the VCN 2.2 families these VDA tables target",
             }.get(definition.apu_mask, f"0x{definition.apu_mask:02X}"),
             "gaps": list(definition.gaps) + list(GLOBAL_GAPS),
-            "note": ("Pages are master's stock byte arrays; site offsets/occurrences are derived from "
-                     "the PagePatch find/replace/skip/count fields. No driver bytes are invented. "
-                     "Regenerate with tools/convert_master_patchdata.py."),
+            **({"extraPages": [
+                {
+                    "kind": extra.kind,
+                    "source": extra.source,
+                    "sha256": extra.sha256,
+                    "note": extra.note,
+                    "sites": [dict(site) for site in extra.sites],
+                }
+                for extra in definition.extra_pages
+            ]} if definition.extra_pages else {}),
+            "note": (
+                "Pages are master's stock byte arrays; site offsets/occurrences are derived from "
+                "the PagePatch find/replace/skip/count fields. No driver bytes are invented. "
+                "Regenerate with tools/convert_master_patchdata.py."
+                if not definition.extra_pages else
+                "Pages are master's stock byte arrays plus the pinned supplementary extraPages "
+                "sources; site offsets/occurrences are derived from the PagePatch find/replace/"
+                "skip/count fields. No driver bytes are invented. Regenerate with "
+                "tools/convert_master_patchdata.py."
+            ),
         },
         "tables": [
             {"kind": table["kind"], "note": table["note"], "pages": table["pages"]}
