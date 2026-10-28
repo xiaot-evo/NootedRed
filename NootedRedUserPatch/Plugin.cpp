@@ -39,6 +39,7 @@
 #include <mach/clock_types.h>
 #include <kern/thread_call.h>
 #include <libkern/c++/OSIterator.h>
+#include <libkern/c++/OSData.h>
 #include <PatchData.hpp>
 #include <UserPatchBackend.hpp>
 
@@ -133,6 +134,8 @@ private:
         bool                  pageHook;
         bool                  rangeHook;
         UInt32                appliedPages;
+        bool                  profileLoaded;
+        UInt32                profileStage;
         UInt32                loadAttempts;
         bool                  retryPending;
     };
@@ -219,7 +222,6 @@ void UserPatchRuntime::onPatcherLoad(KernelPatcher& patcher)
     }
     IOLockUnlock(this->lock_);
 
-    if (!this->disabled_) { UserPatchBackend::singleton().loadExternalProfile(); }
     if (!this->disabled_) { publish(snapshot); }
     if (needRetry) { this->startRetryCall(); }
 }
@@ -249,7 +251,6 @@ void UserPatchRuntime::serviceStart()
     }
     IOLockUnlock(this->lock_);
 
-    if (!this->disabled_) { UserPatchBackend::singleton().loadExternalProfile(); }
     if (!this->disabled_) { publish(snapshot); }
     if (needRetry) { this->startRetryCall(); }
     this->startStatusRefresh();
@@ -356,10 +357,7 @@ void UserPatchRuntime::retryCallback(thread_call_param_t, thread_call_param_t pa
         IOLockUnlock(self.lock_);
     }
 
-    if (publishState) {
-        UserPatchBackend::singleton().loadExternalProfile();
-        publish(snapshot);
-    }
+    if (publishState) { publish(snapshot); }
     if (needNext) { self.startRetryCall(); }
     if (thisCall != nullptr) { thread_call_free(thisCall); }
 }
@@ -419,6 +417,8 @@ void UserPatchRuntime::snapshotLocked(PublishSnapshot& snapshot) const
     snapshot.pageHook           = backend.pageHookInstalled();
     snapshot.rangeHook          = backend.rangeHookInstalled();
     snapshot.appliedPages       = backend.appliedPageCount();
+    snapshot.profileLoaded      = backend.profileLoaded();
+    snapshot.profileStage       = backend.profileFailureStage();
     snapshot.loadAttempts       = this->loadAttempts_;
     snapshot.retryPending       = this->retryScheduled_;
 }
@@ -442,6 +442,8 @@ void UserPatchRuntime::publish(const PublishSnapshot& snapshot)
     service->setProperty("NRedUserPatchRangeHook", snapshot.rangeHook ? 1ULL : 0ULL, 32);
     service->setProperty("NRedUserPatchAppliedPages",
                          static_cast<unsigned long long>(snapshot.appliedPages), 32);
+    service->setProperty("NRedUserPatchProfileLoaded", snapshot.profileLoaded ? 1ULL : 0ULL, 32);
+    service->setProperty("NRedUserPatchProfileStage", static_cast<unsigned long long>(snapshot.profileStage), 32);
     service->setProperty("NRedUserPatchLoadAttempts", static_cast<unsigned long long>(snapshot.loadAttempts), 32);
     service->setProperty("NRedUserPatchRetryPending", snapshot.retryPending ? 1ULL : 0ULL, 32);
 }
@@ -480,6 +482,10 @@ bool PRODUCT_NAME::start(IOService* provider)
 
     if (ADDPR(startSuccess)) {
         UserPatchRuntime::singleton().serviceStart();
+    }
+
+    if (auto* const profile = OSDynamicCast(OSData, this->getProperty("NRedOffsetProfile"))) {
+        UserPatchBackend::singleton().loadProfileFromData(profile->getBytesNoCopy(), profile->getLength());
     }
 
     return ADDPR(startSuccess);

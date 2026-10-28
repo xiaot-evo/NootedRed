@@ -116,14 +116,14 @@ final class AppModel: ObservableObject {
     func installProfile() {
         guard let profile = parsedProfile else { return }
         isParsing = true
-        parserLog += "\n正在安装到 /var/db/nootedred…"
+        parserLog += "\n正在写入 EFI NootedRedUserPatch Info.plist…"
 
         Task {
             do {
                 let url = try await OffsetProfileGenerator.installToSystem(profile)
                 self.profileInstalledPath = url.path
-                self.parserLog += "\n已安装：\(url.path)\n重启后 NootedRedUserPatch 将优先加载该 profile。"
-                self.statusMessage = "OffsetProfile 已安装"
+                self.parserLog += "\n已写入：\(url.path)\n已清理旧的 /var/db/nootedred 安装。"
+                self.statusMessage = "OffsetProfile 已写入 EFI"
             } catch {
                 self.parserLog += "\n安装失败：\(error.localizedDescription)"
                 self.statusMessage = "OffsetProfile 安装失败"

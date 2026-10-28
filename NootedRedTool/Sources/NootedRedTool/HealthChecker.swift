@@ -20,8 +20,8 @@ enum HealthChecker {
             patchLevel = .fail
             patchDetail = "未检测到 NootedRedUserPatch 已加载。"
         } else if pages == 0 {
-            patchLevel = .warning
-            patchDetail = "UserPatch 已加载，但尚未报告应用页；打开应用后再检查。"
+            patchLevel = .info
+            patchDetail = "UserPatch 已加载；页面计数是启动快照，可能晚于实际 patch。以硬件解码/Metal/GL 实测为准。"
         } else if pages >= 13 {
             patchLevel = .pass
             patchDetail = "13 个用户态补丁页已应用。"

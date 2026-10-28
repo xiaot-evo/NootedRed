@@ -26,43 +26,22 @@
 #include <string.h>
 
 using tCsValidatePage = void (*)(void*, void*, UInt64, const void*, int*, int*, int*);
-using tVnodeLookup = int (*)(const char*, int, void**, void*);
-using tVnodePut = int (*)(void*);
-using tVnRdwr = int (*)(int, void*, char*, int, int64_t, int, int, void*, int*, void*);
-using tVfsContextCurrent = void* (*)(void);
-using tKauthCredGet = void* (*)(void);
-using tCurrentProc = void* (*)(void);
+
+extern "C" char osversion[];
 
 namespace
 {
 
-    constexpr char kProfileMagic[4] = {'N', 'R', 'P', 'F'};
-    constexpr UInt32 kProfileVersion = 1;
+    // Page offsets are supplied exclusively by the injected NRedOffsetProfile
+    // personality property.  There is deliberately no embedded fallback: a
+    // missing or mismatched profile leaves the page patch disabled.
+    UInt64 gPageFileOffsets[UserPatchData::kMaxPages]{};
+
+    constexpr UInt8 kProfileMagic[4] = {'N', 'R', 'P', 'F'};
+    constexpr UInt16 kProfileVersion = 1;
     constexpr size_t kProfileHeaderSize = 32;
-    constexpr const char* kProfilePath = "/var/db/nootedred/offset-profile.bin";
 
-    // Embedded 24H32 fallback.  The user-space profile generator can replace
-    // these page offsets with a build-specific set via /var/db/nootedred.
-    UInt64 gPageFileOffsets[] = {
-        0x0000E000,    // GL HwInfo
-        0x00008000,    // GL DualQuad
-        0x087B3000,    // MTLControl
-        0x087EF000,    // MTL HwInfo
-        0x08606000,    // VDA page 0
-        0x08608000,    // VDA page 1
-        0x0860F000,    // VDA page 2
-        0x0864D000,    // VDA page 3
-        0x0864F000,    // VDA page 4
-        0x08650000,    // VDA page 5
-        0x08667000,    // VDA page 6
-        0x0867D000,    // VDA page 7
-        0x06692000,    // AppleGVA
-    };
-
-    static_assert(sizeof(gPageFileOffsets) / sizeof(gPageFileOffsets[0]) <= UserPatchData::kMaxPages,
-                  "page offset table must fit the embedded page limit");
-
-    UInt32 fnv1a32(const UInt8* data, size_t size)
+    UInt32 fnv1a32(const UInt8* const data, const size_t size)
     {
         UInt32 hash = 2166136261U;
         for (size_t i = 0; i < size; i++) {
@@ -108,55 +87,20 @@ bool UserPatchBackend::install(KernelPatcher& patcher)
     }
     this->pageHookInstalled_ = true;
 
-    auto solve = [&patcher](const char* name) -> mach_vm_address_t {
-        auto address = patcher.solveSymbol(KernelPatcher::KernelID, name);
-        if (patcher.getError() != KernelPatcher::Error::NoError) {
-            patcher.clearError();
-            return 0;
-        }
-        return address;
-    };
-
-    this->orgVnodeLookup_ = solve("_vnode_lookup");
-    this->orgVnodePut_ = solve("_vnode_put");
-    this->orgVnRdwr_ = solve("_vn_rdwr");
-    this->orgVfsContextCurrent_ = solve("_vfs_context_current");
-    this->orgKauthCredGet_ = solve("_kauth_cred_get");
-    this->orgCurrentProc_ = solve("_current_proc");
-
-    SYSLOG("UserPatch", "installed _cs_validate_page backend (profile=%s)",
-           this->orgVnodeLookup_ != 0 ? "vfs" : "embedded");
+    SYSLOG("UserPatch", "installed _cs_validate_page backend (embedded offsets)");
     return true;
 }
 
-bool UserPatchBackend::loadExternalProfile()
+bool UserPatchBackend::loadProfileFromData(const void* const data, const size_t size)
 {
     if (this->profileLoaded_) { return true; }
-    if (this->orgVnodeLookup_ == 0 || this->orgVnodePut_ == 0 || this->orgVnRdwr_ == 0
-        || this->orgVfsContextCurrent_ == 0 || this->orgKauthCredGet_ == 0 || this->orgCurrentProc_ == 0)
-    {
+    if (data == nullptr || size < kProfileHeaderSize) { return false; }
+
+    const auto* const buffer = static_cast<const UInt8*>(data);
+    if (memcmp(buffer, kProfileMagic, sizeof(kProfileMagic)) != 0) {
+        this->profileFailureStage_ = 4;
         return false;
     }
-
-    auto lookup = reinterpret_cast<tVnodeLookup>(this->orgVnodeLookup_);
-    auto put = reinterpret_cast<tVnodePut>(this->orgVnodePut_);
-    auto rdwr = reinterpret_cast<tVnRdwr>(this->orgVnRdwr_);
-    auto context = reinterpret_cast<tVfsContextCurrent>(this->orgVfsContextCurrent_)();
-    auto cred = reinterpret_cast<tKauthCredGet>(this->orgKauthCredGet_)();
-    auto proc = reinterpret_cast<tCurrentProc>(this->orgCurrentProc_)();
-
-    void* vnode = nullptr;
-    if (lookup(kProfilePath, 0, &vnode, context) != 0 || vnode == nullptr) { return false; }
-
-    UInt8 buffer[512]{};
-    int residual = 0;
-    const auto readResult = rdwr(0, vnode, reinterpret_cast<char*>(buffer), sizeof(buffer), 0, 1, 0, cred, &residual,
-                                 proc);
-    put(vnode);
-    if (readResult != 0 || residual < 0) { return false; }
-
-    const size_t available = sizeof(buffer) - static_cast<size_t>(residual);
-    if (available < kProfileHeaderSize || memcmp(buffer, kProfileMagic, sizeof(kProfileMagic)) != 0) { return false; }
 
     const auto version = static_cast<UInt16>(buffer[4] | (buffer[5] << 8));
     const auto headerSize = static_cast<UInt16>(buffer[6] | (buffer[7] << 8));
@@ -165,33 +109,46 @@ bool UserPatchBackend::loadExternalProfile()
         || pageCount != UserPatchData::singleton().pageCount()
         || pageCount > sizeof(gPageFileOffsets) / sizeof(gPageFileOffsets[0]))
     {
+        this->profileFailureStage_ = 5;
         return false;
     }
 
     const size_t offsetsSize = static_cast<size_t>(pageCount) * sizeof(UInt64);
-    if (available < kProfileHeaderSize + offsetsSize) { return false; }
+    if (size < kProfileHeaderSize + offsetsSize) {
+        this->profileFailureStage_ = 6;
+        return false;
+    }
 
     char profileBuild[17]{};
     memcpy(profileBuild, buffer + 12, 16);
-    const char* const runtimeBuild = UserPatchData::singleton().buildString();
-    if (runtimeBuild == nullptr || strncmp(profileBuild, runtimeBuild, 3) != 0) { return false; }
+    const char* const runtimeBuild = osversion;
+    if (runtimeBuild == nullptr || runtimeBuild[0] == '\0' || strncmp(profileBuild, runtimeBuild, 16) != 0) {
+        this->profileFailureStage_ = 7;
+        return false;
+    }
 
     const auto expectedChecksum = static_cast<UInt32>(buffer[28])
                                   | (static_cast<UInt32>(buffer[29]) << 8)
                                   | (static_cast<UInt32>(buffer[30]) << 16)
                                   | (static_cast<UInt32>(buffer[31]) << 24);
-    if (fnv1a32(buffer + kProfileHeaderSize, offsetsSize) != expectedChecksum) { return false; }
+    if (fnv1a32(buffer + kProfileHeaderSize, offsetsSize) != expectedChecksum) {
+        this->profileFailureStage_ = 8;
+        return false;
+    }
 
     for (UInt16 i = 0; i < pageCount; i++) {
         UInt64 offset = 0;
         memcpy(&offset, buffer + kProfileHeaderSize + static_cast<size_t>(i) * sizeof(UInt64), sizeof(offset));
-        if (offset == 0) { return false; }
+        if (offset == 0) {
+            this->profileFailureStage_ = 9;
+            return false;
+        }
         gPageFileOffsets[i] = offset;
     }
 
     this->profileLoaded_ = true;
-    this->profileAttempted_ = true;
-    SYSLOG("UserPatch", "loaded external offset profile for build %s (%u pages)", profileBuild,
+    this->profileFailureStage_ = 0;
+    SYSLOG("UserPatch", "loaded offset profile property for build %s (%u pages)", profileBuild,
            static_cast<unsigned>(pageCount));
     return true;
 }
@@ -199,6 +156,7 @@ bool UserPatchBackend::loadExternalProfile()
 void UserPatchBackend::performPagePatch(const UInt8* data, size_t dataSize, UInt64 pageOffset)
 {
     // Runs inside the code-signing validator; no IOKit, no VFS, no allocation.
+    if (!this->profileLoaded_) { return; }
     const auto& patchData = UserPatchData::singleton();
     if (data == nullptr || !patchData.loaded()) { return; }
 
@@ -266,7 +224,12 @@ void UserPatchBackend::wrapCsValidatePage(void* blobs, void* pager, UInt64 pageO
     }
 }
 
+
 bool UserPatchBackend::pageHookInstalled() const { return this->pageHookInstalled_; }
+
+bool UserPatchBackend::profileLoaded() const { return this->profileLoaded_; }
+
+UInt32 UserPatchBackend::profileFailureStage() const { return this->profileFailureStage_; }
 
 bool UserPatchBackend::rangeHookInstalled() const { return false; }
 

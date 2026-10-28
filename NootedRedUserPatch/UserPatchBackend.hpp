@@ -42,13 +42,15 @@ public:
     // Installs the page-only validation route.
     bool install(KernelPatcher& patcher);
 
-    // Loads the user-space generated page-offset profile from the system cache.
-    // Safe to call repeatedly; falls back to the embedded offsets on failure.
-    bool loadExternalProfile();
+    // Parses the profile supplied by the injected Info.plist personality
+    // property.  Only memory is inspected; no VFS or thread is used.
+    bool loadProfileFromData(const void* data, size_t size);
 
     bool   pageHookInstalled() const;
     bool   rangeHookInstalled() const;
     UInt32 appliedPageCount() const;
+    bool   profileLoaded() const;
+    UInt32 profileFailureStage() const;
 
 private:
     UserPatchBackend() = default;
@@ -66,15 +68,9 @@ private:
                                    int* tainted, int* nx);
 
     mach_vm_address_t orgCsValidatePage_{0};
-    mach_vm_address_t orgVnodeLookup_{0};
-    mach_vm_address_t orgVnodePut_{0};
-    mach_vm_address_t orgVnRdwr_{0};
-    mach_vm_address_t orgVfsContextCurrent_{0};
-    mach_vm_address_t orgKauthCredGet_{0};
-    mach_vm_address_t orgCurrentProc_{0};
 
     bool profileLoaded_{false};
-    bool profileAttempted_{false};
+    volatile UInt32 profileFailureStage_{0};
 
     bool installAttempted_{false};
     bool pageHookInstalled_{false};

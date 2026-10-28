@@ -22,11 +22,13 @@
 
 #include <VCNData.hpp>
 #include <VCNData/24H32.hpp>
+#include <VCNData/24H232.hpp>
 
 namespace
 {
 
     const VCNData::Variant* const kVariants[] = {
+        &VCNData::Build24H232::kData,
         &VCNData::Build24H32::kData,
     };
 

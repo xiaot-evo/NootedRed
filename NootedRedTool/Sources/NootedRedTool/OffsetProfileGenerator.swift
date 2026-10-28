@@ -177,16 +177,48 @@ enum OffsetProfileGenerator {
 
     static func installToSystem(_ profile: OffsetProfile) async throws -> URL {
         let binary = binaryData(profile)
-        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("nootedred-offset-profile.bin")
-        try binary.write(to: temporary, options: .atomic)
-        let destination = "/var/db/nootedred/offset-profile.bin"
-        let command = "mkdir -p /var/db/nootedred && cp '\(temporary.path)' '\(destination)' && chmod 644 '\(destination)'"
+        let infoPlist = try findInjectedInfoPlist()
+        let original = try Data(contentsOf: infoPlist)
+        var format = PropertyListSerialization.PropertyListFormat.xml
+        guard var root = try PropertyListSerialization.propertyList(from: original, options: [], format: &format)
+                as? [String: Any],
+              var personalities = root["IOKitPersonalities"] as? [String: Any],
+              var personality = personalities["org.ChefKiss.NootedRedUserPatch"] as? [String: Any]
+        else {
+            throw NSError(domain: "NootedRedTool", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Info.plist 缺少 NootedRedUserPatch personality"])
+        }
+
+        personality["NRedOffsetProfile"] = binary
+        personalities["org.ChefKiss.NootedRedUserPatch"] = personality
+        root["IOKitPersonalities"] = personalities
+        let updated = try PropertyListSerialization.data(fromPropertyList: root, format: .xml, options: 0)
+
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("nootedred-info.plist")
+        try updated.write(to: temporary, options: .atomic)
+        let command = """
+        cp '\(temporary.path)' '\(infoPlist.path)' && chmod 644 '\(infoPlist.path)' && \
+        rm -f /var/db/nootedred/offset-profile.bin /var/db/nootedred/offset-profile.bin.disabled && \
+        rmdir /var/db/nootedred 2>/dev/null || true
+        """
         let result = await CommandRunner.runAsAdmin(command)
         guard result.status == 0 else {
             throw NSError(domain: "NootedRedTool", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: result.output.isEmpty ? "授权被取消" : result.output])
         }
-        return URL(fileURLWithPath: destination)
+        return infoPlist
+    }
+
+    static func findInjectedInfoPlist() throws -> URL {
+        let mounted = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: nil,
+                                                            options: []) ?? []
+        for volume in mounted {
+            let candidate = volume.appendingPathComponent(
+                "EFI/OC/Kexts/NootedRedUserPatch.kext/Contents/Info.plist")
+            if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        }
+        throw NSError(domain: "NootedRedTool", code: 3,
+                      userInfo: [NSLocalizedDescriptionKey: "未找到 EFI/OC/Kexts/NootedRedUserPatch.kext，请先挂载 EFI"])
     }
 
     static func fnv1a32(_ data: Data) -> UInt32 {
