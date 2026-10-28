@@ -27,8 +27,6 @@
 
 using tCsValidatePage = void (*)(void*, void*, UInt64, const void*, int*, int*, int*);
 
-extern "C" char osversion[];
-
 namespace
 {
 
@@ -91,14 +89,14 @@ bool UserPatchBackend::install(KernelPatcher& patcher)
     return true;
 }
 
-bool UserPatchBackend::loadProfileFromData(const void* const data, const size_t size)
+bool UserPatchBackend::loadProfileFromData(const void* const data, const size_t size,
+                                           const char* const expectedBuild)
 {
     if (this->profileLoaded_) { return true; }
     if (data == nullptr || size < kProfileHeaderSize) { return false; }
 
     const auto* const buffer = static_cast<const UInt8*>(data);
     if (memcmp(buffer, kProfileMagic, sizeof(kProfileMagic)) != 0) {
-        this->profileFailureStage_ = 4;
         return false;
     }
 
@@ -106,24 +104,23 @@ bool UserPatchBackend::loadProfileFromData(const void* const data, const size_t 
     const auto headerSize = static_cast<UInt16>(buffer[6] | (buffer[7] << 8));
     const auto pageCount = static_cast<UInt16>(buffer[8] | (buffer[9] << 8));
     if (version != kProfileVersion || headerSize != kProfileHeaderSize
-        || pageCount != UserPatchData::singleton().pageCount()
+        || pageCount == 0
         || pageCount > sizeof(gPageFileOffsets) / sizeof(gPageFileOffsets[0]))
     {
-        this->profileFailureStage_ = 5;
         return false;
     }
 
     const size_t offsetsSize = static_cast<size_t>(pageCount) * sizeof(UInt64);
     if (size < kProfileHeaderSize + offsetsSize) {
-        this->profileFailureStage_ = 6;
         return false;
     }
 
     char profileBuild[17]{};
     memcpy(profileBuild, buffer + 12, 16);
-    const char* const runtimeBuild = osversion;
-    if (runtimeBuild == nullptr || runtimeBuild[0] == '\0' || strncmp(profileBuild, runtimeBuild, 16) != 0) {
-        this->profileFailureStage_ = 7;
+
+    if (expectedBuild == nullptr || expectedBuild[0] == '\0'
+        || strncmp(profileBuild, expectedBuild, 16) != 0)
+    {
         return false;
     }
 
@@ -132,7 +129,6 @@ bool UserPatchBackend::loadProfileFromData(const void* const data, const size_t 
                                   | (static_cast<UInt32>(buffer[30]) << 16)
                                   | (static_cast<UInt32>(buffer[31]) << 24);
     if (fnv1a32(buffer + kProfileHeaderSize, offsetsSize) != expectedChecksum) {
-        this->profileFailureStage_ = 8;
         return false;
     }
 
@@ -140,14 +136,14 @@ bool UserPatchBackend::loadProfileFromData(const void* const data, const size_t 
         UInt64 offset = 0;
         memcpy(&offset, buffer + kProfileHeaderSize + static_cast<size_t>(i) * sizeof(UInt64), sizeof(offset));
         if (offset == 0) {
-            this->profileFailureStage_ = 9;
             return false;
         }
         gPageFileOffsets[i] = offset;
     }
 
-    this->profileLoaded_ = true;
-    this->profileFailureStage_ = 0;
+    this->profilePageCount_ = pageCount;
+    strlcpy(this->profileBuild_, profileBuild, sizeof(this->profileBuild_));
+    this->profileLoaded_     = true;
     SYSLOG("UserPatch", "loaded offset profile property for build %s (%u pages)", profileBuild,
            static_cast<unsigned>(pageCount));
     return true;
@@ -165,7 +161,11 @@ void UserPatchBackend::performPagePatch(const UInt8* data, size_t dataSize, UInt
     if (pages == nullptr || sites == nullptr) { return; }
 
     const UInt32 pageCount = patchData.pageCount();
-    if (pageCount > sizeof(gPageFileOffsets) / sizeof(gPageFileOffsets[0])) { return; }
+    if (pageCount != this->profilePageCount_
+        || pageCount > sizeof(gPageFileOffsets) / sizeof(gPageFileOffsets[0]))
+    {
+        return;
+    }
 
     for (size_t dataOffset = 0; dataOffset + UserPatchData::kPageSize <= dataSize;
          dataOffset += UserPatchData::kPageSize)
@@ -229,7 +229,8 @@ bool UserPatchBackend::pageHookInstalled() const { return this->pageHookInstalle
 
 bool UserPatchBackend::profileLoaded() const { return this->profileLoaded_; }
 
-UInt32 UserPatchBackend::profileFailureStage() const { return this->profileFailureStage_; }
+const char* UserPatchBackend::profileBuild() const { return this->profileBuild_; }
+
 
 bool UserPatchBackend::rangeHookInstalled() const { return false; }
 

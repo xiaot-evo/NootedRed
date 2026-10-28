@@ -44,13 +44,13 @@ public:
 
     // Parses the profile supplied by the injected Info.plist personality
     // property.  Only memory is inspected; no VFS or thread is used.
-    bool loadProfileFromData(const void* data, size_t size);
+    bool loadProfileFromData(const void* data, size_t size, const char* expectedBuild);
 
     bool   pageHookInstalled() const;
     bool   rangeHookInstalled() const;
     UInt32 appliedPageCount() const;
     bool   profileLoaded() const;
-    UInt32 profileFailureStage() const;
+    const char* profileBuild() const;
 
 private:
     UserPatchBackend() = default;
@@ -69,8 +69,9 @@ private:
 
     mach_vm_address_t orgCsValidatePage_{0};
 
-    bool profileLoaded_{false};
-    volatile UInt32 profileFailureStage_{0};
+    bool    profileLoaded_{false};
+    UInt16  profilePageCount_{0};
+    char    profileBuild_[17]{};
 
     bool installAttempted_{false};
     bool pageHookInstalled_{false};

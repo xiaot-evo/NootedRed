@@ -269,17 +269,12 @@ IORegistry properties on the `NootedRedUserPatch` service (republished on every 
 | --- | --- |
 | `NRedUserPatchState` | `Idle` / `Loaded` / `NoOp` |
 | `NRedUserPatchReason` | last reason (`None`, `BuildUnsupported`, `BuildMismatch`, `ApuMismatch`, ...) |
-| `NRedUserPatchBuild` | running build string used for selection |
-| `NRedUserPatchBuildSource` | identity source (`sysctl:kern.osversion` or `xnu:osversion`) |
-| `NRedUserPatchDataSource` | `embedded:<build>` after selection; empty before it (not a filesystem path) |
+| `NRedUserPatchBuild` | profile build after a successful personality load |
+| `NRedUserPatchDataSource` | `personality:NRedOffsetProfile` after a successful load |
 | `NRedUserPatchApuMask` | candidate APU bits derived from the iGPU |
-| `NRedUserPatchAppliedApuMask` | intersection with the manifest `apuMask` |
 | `NRedUserPatchPages`, `NRedUserPatchSites` | validated table sizes |
-| `NRedUserPatchHooks` | `1` when the `_cs_validate_page` route is installed (installed even when data is NoOp) |
+| `NRedUserPatchHooks` | `1` when the `_cs_validate_page` route is installed |
 | `NRedUserPatchRangeHook` | `1` when the `_cs_validate_range` route is installed (optional extra) |
-| `NRedUserPatchAppliedPages` | distinct pages patched, as of the last state publish |
-| `NRedUserPatchLoadAttempts` | data-selection attempts so far |
-| `NRedUserPatchRetryPending` | `1` while a bounded retry timer is armed |
 
 ## Failure paths
 

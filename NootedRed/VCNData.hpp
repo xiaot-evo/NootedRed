@@ -84,13 +84,4 @@ namespace VCNData
         const char* driverSHA256_6000;
     };
 
-    // Exact build lookup.  osversion must be populated and match the variant's build string exactly.
-    const Variant* findVariant(const char* osversion, UInt32 darwinMajor, UInt32 darwinMinor);
-
-    // Darwin-only lookup for the early X5000 verification path, before osversion may be populated.
-    // Callers must still use findVariant() before writing any X6000 patch.
-    const Variant* variantForDarwin(UInt32 darwinMajor, UInt32 darwinMinor);
-
-    // True when at least one data variant exists for the Darwin version.
-    bool hasVariantForDarwin(UInt32 darwinMajor, UInt32 darwinMinor);
 }    // namespace VCNData

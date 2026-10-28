@@ -28,6 +28,21 @@ struct OffsetProfile: Codable {
     var pageCount: Int { pages.count }
 }
 
+/// 写入 EFI 的结果：目标 Info.plist 与本次自动备份（备份失败时为 nil）。
+struct OffsetProfileInstallResult {
+    let infoPlistURL: URL
+    let backupURL: URL?
+}
+
+/// EFI 中 NootedRedUserPatch personality 里已经写入的 profile 摘要。
+struct InstalledProfileSummary {
+    let build: String
+    let pageCount: Int
+    let byteCount: Int
+    let infoPlistPath: String
+    let modifiedAt: Date?
+}
+
 private struct SiteSpec {
     let offset: UInt32
     let find: String
@@ -175,10 +190,10 @@ enum OffsetProfileGenerator {
         return data
     }
 
-    static func installToSystem(_ profile: OffsetProfile) async throws -> URL {
+    /// 纯函数：把 OffsetProfile 写入 Info.plist 的 NootedRedUserPatch personality，返回新的 plist 数据。
+    /// 用于安装与自测（不触碰磁盘）。
+    static func updatedInfoPlistData(_ original: Data, profile: OffsetProfile) throws -> Data {
         let binary = binaryData(profile)
-        let infoPlist = try findInjectedInfoPlist()
-        let original = try Data(contentsOf: infoPlist)
         var format = PropertyListSerialization.PropertyListFormat.xml
         guard var root = try PropertyListSerialization.propertyList(from: original, options: [], format: &format)
                 as? [String: Any],
@@ -190,35 +205,110 @@ enum OffsetProfileGenerator {
         }
 
         personality["NRedOffsetProfile"] = binary
+        personality["NRedSystemBuild"] = profile.build
         personalities["org.ChefKiss.NootedRedUserPatch"] = personality
         root["IOKitPersonalities"] = personalities
-        let updated = try PropertyListSerialization.data(fromPropertyList: root, format: .xml, options: 0)
+        return try PropertyListSerialization.data(fromPropertyList: root, format: .xml, options: 0)
+    }
+
+    /// 把 OffsetProfile 写入已挂载 EFI 中的 NootedRedUserPatch.kext personality。
+    ///
+    /// 前置条件：调用方已经确认 EFI 已挂载，并把 EFI 分区的根路径传进来。
+    static func installToEFI(_ profile: OffsetProfile, efiRoot: URL) async throws -> OffsetProfileInstallResult {
+        guard !profile.pages.isEmpty else {
+            throw NSError(domain: "NootedRedTool", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "OffsetProfile 为空，没有可写入的页面"])
+        }
+        let infoPlist = efiRoot.appendingPathComponent(
+            "EFI/OC/Kexts/NootedRedUserPatch.kext/Contents/Info.plist")
+        guard FileManager.default.fileExists(atPath: infoPlist.path) else {
+            throw NSError(domain: "NootedRedTool", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey:
+                                        "EFI 中未找到 NootedRedUserPatch.kext（\(infoPlist.deletingLastPathComponent().path)）"])
+        }
+
+        let original = try Data(contentsOf: infoPlist)
+        let backupURL = backupOriginalInfoPlist(original)
+        let updated = try updatedInfoPlistData(original, profile: profile)
 
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("nootedred-info.plist")
         try updated.write(to: temporary, options: .atomic)
-        let command = """
-        cp '\(temporary.path)' '\(infoPlist.path)' && chmod 644 '\(infoPlist.path)' && \
+        let command = installCommand(temporaryInfoPlist: temporary.path, targetInfoPlist: infoPlist.path)
+        let result = await CommandRunner.runAsAdmin(command)
+        guard result.status == 0 else {
+            let message: String
+            if CommandRunner.isUserCancellation(result) {
+                message = "授权被取消，未写入 EFI"
+            } else {
+                message = result.output.isEmpty ? "写入 EFI 失败" : result.output
+            }
+            throw NSError(domain: "NootedRedTool", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: message])
+        }
+
+        // 写入后复查：确认 personality 里能读回同样的构建号与页数。
+        guard let summary = installedProfileSummary(efiRoot: efiRoot),
+              summary.build == profile.build,
+              summary.pageCount == profile.pages.count else {
+            throw NSError(domain: "NootedRedTool", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey: "写入后校验失败，EFI 中的 OffsetProfile 与生成结果不一致"])
+        }
+        return OffsetProfileInstallResult(infoPlistURL: infoPlist, backupURL: backupURL)
+    }
+
+    /// 纯函数：构造把临时 Info.plist 覆盖到 EFI 的提权命令。
+    /// 两个路径都经过 `shellSingleQuoted`，卷名中的引号/分号不会逃逸出参数。
+    static func installCommand(temporaryInfoPlist: String, targetInfoPlist: String) -> String {
+        let source = CommandRunner.shellSingleQuoted(temporaryInfoPlist)
+        let target = CommandRunner.shellSingleQuoted(targetInfoPlist)
+        return """
+        cp \(source) \(target) && chmod 644 \(target) && \
         rm -f /var/db/nootedred/offset-profile.bin /var/db/nootedred/offset-profile.bin.disabled && \
         rmdir /var/db/nootedred 2>/dev/null || true
         """
-        let result = await CommandRunner.runAsAdmin(command)
-        guard result.status == 0 else {
-            throw NSError(domain: "NootedRedTool", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: result.output.isEmpty ? "授权被取消" : result.output])
-        }
-        return infoPlist
     }
 
-    static func findInjectedInfoPlist() throws -> URL {
-        let mounted = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: nil,
-                                                            options: []) ?? []
-        for volume in mounted {
-            let candidate = volume.appendingPathComponent(
-                "EFI/OC/Kexts/NootedRedUserPatch.kext/Contents/Info.plist")
-            if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+    /// 写入前把原 Info.plist 备份到本机 Application Support，便于回滚。
+    @discardableResult
+    static func backupOriginalInfoPlist(_ data: Data) -> URL? {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                  in: .userDomainMask).first else { return nil }
+        let directory = base.appendingPathComponent("NootedRedTool/backups", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let url = directory.appendingPathComponent("NootedRedUserPatch-Info-\(formatter.string(from: Date())).plist")
+        do {
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
         }
-        throw NSError(domain: "NootedRedTool", code: 3,
-                      userInfo: [NSLocalizedDescriptionKey: "未找到 EFI/OC/Kexts/NootedRedUserPatch.kext，请先挂载 EFI"])
+    }
+
+    /// 读取 EFI 中已经写入的 OffsetProfile，用于健康检查与页面状态。
+    static func installedProfileSummary(efiRoot: URL) -> InstalledProfileSummary? {
+        let infoPlist = efiRoot.appendingPathComponent(
+            "EFI/OC/Kexts/NootedRedUserPatch.kext/Contents/Info.plist")
+        guard FileManager.default.fileExists(atPath: infoPlist.path),
+              let root = NSDictionary(contentsOf: infoPlist) as? [String: Any],
+              let personalities = root["IOKitPersonalities"] as? [String: Any],
+              let personality = personalities["org.ChefKiss.NootedRedUserPatch"] as? [String: Any],
+              let data = personality["NRedOffsetProfile"] as? Data,
+              data.count >= 32,
+              data.prefix(4) == Data("NRPF".utf8)
+        else { return nil }
+
+        let bytes = [UInt8](data)
+        let pageCount = Int(bytes[8]) | (Int(bytes[9]) << 8)
+        let buildBytes = bytes[12..<28]
+        let build = String(decoding: buildBytes.prefix { $0 != 0 }, as: UTF8.self)
+        let modified = (try? FileManager.default.attributesOfItem(atPath: infoPlist.path))?[.modificationDate] as? Date
+        return InstalledProfileSummary(build: build,
+                                       pageCount: pageCount,
+                                       byteCount: data.count,
+                                       infoPlistPath: infoPlist.path,
+                                       modifiedAt: modified)
     }
 
     static func fnv1a32(_ data: Data) -> UInt32 {

@@ -30,6 +30,7 @@
 #include <NRed.hpp>
 #include <VCNBridge.hpp>
 #include <VCNData.hpp>
+#include <VCNRuntimeResolver.hpp>
 #include <VDA.hpp>
 #include <X5000.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
@@ -48,27 +49,16 @@ namespace
 
     const char* const kBootArgVDA = "-NRedVDA";
 
-    // VCNData carries the exact 24H32 kernel bridge table. Every guard and original call-site byte is
-    // verified against the live driver before patching.
+    // The runtime resolver is the only table source. Nothing is selected by
+    // build string and there is no embedded Variant to fall back to.
     bool isSupportedOS()
     {
-        const auto& version = currentKernelVersion();
-        return VCNData::hasVariantForDarwin(version.major(), version.minor());
-    }
-
-    // The build string is checked once the accelerator starts, not in NRed::init: the early kext-load
-    // phase can run before `osversion` is populated, which would otherwise disable a valid bridge.
-    // This exact-build lookup is the only gate before X6000 data is applied; an empty or unknown build
-    // string returns nullptr and the bridge stays inert.
-    const VCNData::Variant* currentVariant()
-    {
-        const auto& version = currentKernelVersion();
-        return VCNData::findVariant(osversion, version.major(), version.minor());
+        return currentKernelVersion() >= KernelVersion::BigSur;
     }
 
     bool isSupportedBuild()
     {
-        return currentVariant() != nullptr;
+        return VCNRuntime::have5000();
     }
 
     bool isSupportedDevice()
@@ -212,14 +202,6 @@ void VCNBridge::init()
         SYSLOG("VCN",
                "VCN data is for macOS 15.8.1 (Darwin 24.6); the hardware decode boot argument is ignored on "
                "this build");
-        this->requested = false;
-        return;
-    }
-
-    // Once the build string is visible, require an exact data variant.  The early kext-load path may run
-    // before `osversion` is populated; in that case the exact check is repeated before X6000 patching.
-    if (osversion[0] != '\0' && currentVariant() == nullptr) {
-        SYSLOG("VCN", "no VCN data variant for %s; the hardware decode boot argument is ignored", osversion);
         this->requested = false;
         return;
     }
@@ -496,16 +478,13 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
 
     if (id == kextRadeonX5000.loadIndex) {
         NRed::singleton().setProp32("NRedVCNX5000Seen", 1);
-        const auto& version = currentKernelVersion();
-        const auto* const variant = VCNData::variantForDarwin(version.major(), version.minor());
-        if (variant == nullptr) {
+        if (!VCNRuntime::prepare5000(patcher, id, slide, size)) {
             publishReject(4);
-            SYSLOG("VCN", "no VCN data variant for this Darwin version");
+            SYSLOG("VCN", "runtime resolver failed to derive X5000 guards");
             this->x5000Prepared = false;
             return;
         }
-        NRed::singleton().setProp32("NRedVCNDataVariant", variant->id);
-        NRed::singleton().setProp32("NRedVCNDataIdentityAvailable", variant->hasKernelIdentity ? 1 : 0);
+        const auto* const variant = VCNRuntime::variant();
         publishStage(2);
 
         if (!verifyKernelABI(patcher, id, slide, size, *variant, true)) {
@@ -608,25 +587,22 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
             return;
         }
 
-        const auto* const variant = currentVariant();
-        if (variant == nullptr) {
+        if (!VCNRuntime::prepare6000(patcher, id, slide, size)) {
             publishReject(5);
-            SYSLOG("VCN", "no VCN data variant for build '%s'; VCN bridge disabled", osversion);
+            SYSLOG("VCN", "runtime resolver failed to derive X6000 tables (stage=%u calls=%u seen=%u)",
+                   VCNRuntime::failure(), VCNRuntime::callCount(), VCNRuntime::seenCalls());
+            DBGLOG("VCNRuntime", "filters slot=%u vtable=%u class=%u receiver=%u", VCNRuntime::diag(0),
+                   VCNRuntime::diag(1), VCNRuntime::diag(2), VCNRuntime::diag(3));
             this->x6000Prepared = false;
             return;
         }
+        const auto* const variant = VCNRuntime::variant();
 
         if (!isSupportedDevice()) {
             publishReject(3);
             SYSLOG("VCN", "X6000 load is not usable for this device/profile; VCN bridge disabled");
             this->x6000Prepared = false;
             return;
-        }
-        NRed::singleton().setProp32("NRedVCNDataVariant", variant->id);
-        NRed::singleton().setProp32("NRedVCNDataIdentityAvailable", variant->hasKernelIdentity ? 1 : 0);
-        if (!variant->hasKernelIdentity) {
-            SYSLOG("VCN", "VCN data for %s is imported, not locally verified; exact build and byte checks apply",
-                   variant->build);
         }
 
         if (!verifyKernelABI(patcher, id, slide, size, *variant, false)) {

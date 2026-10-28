@@ -40,6 +40,7 @@
 #include <kern/thread_call.h>
 #include <libkern/c++/OSIterator.h>
 #include <libkern/c++/OSData.h>
+#include <libkern/c++/OSString.h>
 #include <PatchData.hpp>
 #include <UserPatchBackend.hpp>
 
@@ -135,7 +136,7 @@ private:
         bool                  rangeHook;
         UInt32                appliedPages;
         bool                  profileLoaded;
-        UInt32                profileStage;
+        char                  profileBuild[17];
         UInt32                loadAttempts;
         bool                  retryPending;
     };
@@ -418,7 +419,7 @@ void UserPatchRuntime::snapshotLocked(PublishSnapshot& snapshot) const
     snapshot.rangeHook          = backend.rangeHookInstalled();
     snapshot.appliedPages       = backend.appliedPageCount();
     snapshot.profileLoaded      = backend.profileLoaded();
-    snapshot.profileStage       = backend.profileFailureStage();
+    strlcpy(snapshot.profileBuild, backend.profileBuild(), sizeof(snapshot.profileBuild));
     snapshot.loadAttempts       = this->loadAttempts_;
     snapshot.retryPending       = this->retryScheduled_;
 }
@@ -430,22 +431,15 @@ void UserPatchRuntime::publish(const PublishSnapshot& snapshot)
 
     service->setProperty("NRedUserPatchState", UserPatchData::stateName(snapshot.state));
     service->setProperty("NRedUserPatchReason", UserPatchData::reasonName(snapshot.reason));
-    service->setProperty("NRedUserPatchBuild", snapshot.build);
-    service->setProperty("NRedUserPatchBuildSource", snapshot.buildSource);
-    service->setProperty("NRedUserPatchDataSource", snapshot.dataSource);
+    service->setProperty("NRedUserPatchBuild",
+                         snapshot.profileLoaded ? snapshot.profileBuild : snapshot.build);
+    service->setProperty("NRedUserPatchDataSource",
+                         snapshot.profileLoaded ? "personality:NRedOffsetProfile" : snapshot.dataSource);
     service->setProperty("NRedUserPatchApuMask", static_cast<unsigned long long>(snapshot.apuMask), 32);
-    service->setProperty("NRedUserPatchAppliedApuMask",
-                         static_cast<unsigned long long>(snapshot.appliedApuMask), 32);
     service->setProperty("NRedUserPatchPages", static_cast<unsigned long long>(snapshot.pages), 32);
     service->setProperty("NRedUserPatchSites", static_cast<unsigned long long>(snapshot.sites), 32);
     service->setProperty("NRedUserPatchHooks", snapshot.pageHook ? 1ULL : 0ULL, 32);
     service->setProperty("NRedUserPatchRangeHook", snapshot.rangeHook ? 1ULL : 0ULL, 32);
-    service->setProperty("NRedUserPatchAppliedPages",
-                         static_cast<unsigned long long>(snapshot.appliedPages), 32);
-    service->setProperty("NRedUserPatchProfileLoaded", snapshot.profileLoaded ? 1ULL : 0ULL, 32);
-    service->setProperty("NRedUserPatchProfileStage", static_cast<unsigned long long>(snapshot.profileStage), 32);
-    service->setProperty("NRedUserPatchLoadAttempts", static_cast<unsigned long long>(snapshot.loadAttempts), 32);
-    service->setProperty("NRedUserPatchRetryPending", snapshot.retryPending ? 1ULL : 0ULL, 32);
 }
 
 void UserPatchRuntime::logStateLocked(const char* const prefix) const
@@ -485,7 +479,14 @@ bool PRODUCT_NAME::start(IOService* provider)
     }
 
     if (auto* const profile = OSDynamicCast(OSData, this->getProperty("NRedOffsetProfile"))) {
-        UserPatchBackend::singleton().loadProfileFromData(profile->getBytesNoCopy(), profile->getLength());
+        const char* expectedBuild = nullptr;
+        if (auto* const build = OSDynamicCast(OSString, this->getProperty("NRedSystemBuild"))) {
+            expectedBuild = build->getCStringNoCopy();
+        }
+        UserPatchBackend::singleton().loadProfileFromData(profile->getBytesNoCopy(), profile->getLength(),
+                                                          expectedBuild);
+        this->removeProperty("NRedOffsetProfile");
+        this->removeProperty("NRedSystemBuild");
     }
 
     return ADDPR(startSuccess);
