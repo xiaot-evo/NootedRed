@@ -15,8 +15,9 @@ patch addresses, page offsets, `find` or `replace` bytes in the generator.
 | `BinaryImage.swift` | Bounds-checked little-endian reader; full 64-bit Mach-O parser (LC_SEGMENT_64 with sections, LC_SYMTAB, LC_DYSYMTAB, LC_FUNCTION_STARTS); split dyld-shared-cache store that unions every subcache mapping table, discovers the image-text array from the cache header (structural validation, `.map` fallback) and translates VM addresses to `(subcache file, file offset)`. |
 | `Decoding.swift` | Real x86_64 disassembler: Capstone 5 loaded dynamically (`dlopen`), `cs_insn` layout verified by a self-test before use; strict Intel-syntax operand parser (registers, immediates, memory base/index/scale/displacement). Fails closed when Capstone is unavailable — no byte-scan fallback. |
 | `FunctionAnalysis.swift` | Function extents from `LC_FUNCTION_STARTS` (symbol/next-symbol fallback), whole-body decode with 100% byte-coverage validation, basic blocks, branch-target-on-boundary checks, reachability, and an Objective-C metadata parser (`__objc_classlist` → `class_ro_t` → method lists, relative and classic layouts). |
-| `SemanticRules.swift` | The rule engine and the 12 semantic rules that resolve the 18 sites on macOS 15.8.2/24H232 (GL/Metal gfx9 HwInfo, GL dual-quad, Metal RB+ gate/allow, VDA accelerator/addrlib/factory/feedback-stride/chip-family, AppleGVA AVDGetGPUAccelerators). Each rule resolves a function through symbols or parsed ObjC metadata, matches instructions by decoded semantics, requires exactly one unambiguous match, derives `find` from the image and synthesises a same-length `replace` whose decoded effect is re-validated. |
-| `ProfilePipeline.swift` | Fixture environment (build, APU mask, device ID, user-patch-loaded guard), image set, NRPT v2 profile construction through `ProfileCodec.encode` (image table with kind/canonical path/unslid VM address/`__TEXT` extent/segment+section names, per-page `imageIndex`+`pageVmOffset`), page hashes/flags, identity-collision scan over every target `__TEXT` page, offline validator built on `ProfileCodec.applyPage` plus v2 metadata re-resolution, JSON evidence and the CLI. |
+| `SemanticRules.swift` | The rule engine and the 13 semantic rules that resolve the 20 sites on macOS 15.8.2/24H232 (GL/Metal gfx9 HwInfo, GL dual-quad, Metal RB+ gate/allow, VDA accelerator/addrlib/factory/feedback-stride/chip-family, VDA encoder source pitch, AppleGVA AVDGetGPUAccelerators). Each rule resolves a function through symbols or parsed ObjC metadata, matches instructions by decoded semantics, requires exactly one unambiguous match, derives `find` from the image and synthesises a same-length `replace` whose decoded effect is re-validated. |
+| `ProfilePipeline.swift` | Fixture environment (build, APU mask, device ID, user-patch-loaded guard), image set, NRPT v3 profile construction through `ProfileCodec.encode` (image table with kind/canonical path/unslid VM address/`__TEXT` extent, per-page `mode`+`imageIndex`+`pageVmOffset`), page hashes, identity-collision scan over every target `__TEXT` page, offline validator built on `ProfileCodec.applyPage` with mode routing plus image-metadata re-resolution and selector simulation, JSON evidence and the CLI (single profile and bundle). |
+| `ProfileBundle.swift` | `--bundle-profiles` manifest parsing (fixture-root and/or prebuilt-profile entries, identity overrides that must match the header) and the bundle evidence JSON. Plist serialization is delegated to `ProfileCodec.encodeBundlePlist` / `nredProfilesArray`; the tool does not reimplement the `NRedProfiles` wire format. |
 
 ## CLI
 
@@ -41,48 +42,90 @@ zero or multiple semantic matches in the expected function(s), non-decodable fun
 whose 4 KiB read is short, an unintended page matching a profile page identity, any model rule
 violation from `ProfileCodec.encode`, or a failure of the built-in offline validation.
 
-## NRPT v2 target-image metadata
+## NRPT v3 patch modes and target-image metadata
 
-The profile is NRPT **v2** (docs/PatchProfile-Spec.md §0). Each page record additionally carries
-`imageIndex` (index into the image table) and `pageVmOffset` (4 KiB-aligned `pageStart - image
-mach-header unslid VM address`). Image entries carry `kind` (0 = standalone file-backed dylib,
-1 = dyld shared cache image), a canonical absolute path derived from the parsed image (the
-generator strips the fixture-root prefix, so extracted fixtures and the live system produce the
-same bytes), the unslid mach-header VM address, the `__TEXT` vmsize bound and the parsed
-segment/section names (metadata/evidence; the runtime does not depend on them). The consumer
-computes the live page address as `dyld imageLoadAddress + pageVmOffset`, which works for both the
-standalone GL bundle and cache images. The evidence JSON records, per page, the image path/kind,
-segment, section, in-segment page index, `pageVmOffset`, page VA, page-file offset and page hash,
-and the built-in validator re-resolves every `(imageIndex, pageVmOffset)` to the exact fixture page
-for all records.
+The profile is NRPT **v3** (docs/PatchProfile-Spec.md). Every page record states the validation
+route it belongs to: `mode` is `PAGE` (1) for a page of a standalone file-backed image (the GL
+driver bundle, applied from `_cs_validate_page`) and `DYLD` (2) for a page of a dyld shared-cache
+image (Metal/VADriver2/AppleGVA, applied from `_cs_validate_range`). The mode is derived from the
+parsed image kind and is never guessed from addresses; v3 also rejects a mode/image-kind mismatch.
+There is no offset identity and no matchFlags: page identity is the full-page FNV-1a-64 hash plus
+every site `find`, scoped by mode. `pageFileOffset` (best pager/file evidence) and `pageVmOffset`
+(`pageStart - image mach-header unslid VM address`) remain 4 KiB-aligned diagnostic evidence only.
+Image entries are the simplified v3 form: kind, canonical absolute path derived from the parsed
+image (fixture-root prefix stripped, so fixtures and the live system produce the same bytes),
+unslid mach-header VM address and `__TEXT` vmsize. Segment/section names and the parsed function
+evidence stay in the JSON report, not in the wire profile. The built-in validator re-resolves every
+`(imageIndex, pageVmOffset)` to the exact fixture page, simulates the mode-routed matcher over every
+target `__TEXT` page, checks the already-patched pass and the one-entry bundle selector, and fails
+if any unintended fixture page satisfies a record identity.
+
+## Multi-profile bundle
+
+`NootedRedTool --bundle-profiles <manifest.json> --out <dir>` generates one NRPT v3 profile per
+manifest entry (or re-validates a prebuilt `.nrpt` entry), wraps them in the codec's
+`NRedProfilesBundle` and writes `nred-profiles.plist` via `ProfileCodec.encodeBundlePlist` plus
+`nred-profiles-evidence.json`. The plist has the `NRedProfiles` root array; each dictionary carries
+exactly `Build` (String), `APUMask` (Integer), `DeviceID` (Integer, 0 = no gate) and `Profile`
+(Data). Entries preserve the manifest order (selection is by exact build/APU/device, so order has no
+runtime semantics) and identical inputs produce byte-identical plists. Duplicate builds, bundle
+metadata differing from the embedded profile header, or invalid profiles are rejected by the codec
+(E050-E053).
+
+Manifest example (fixture entries generate from a clean fixture; `profile` entries reuse a
+prebuilt `.nrpt`; optional `build`/`apuMask`/`deviceID` overrides must equal the profile header):
+
+```json
+{
+  "schema": 1,
+  "profiles": [
+    { "fixtureRoot": "/path/to/version-fixtures/15.8.2" },
+    { "profile": "/path/to/nred-24H232.nrpt", "fixtureRoot": "/path/to/version-fixtures/15.8.2" }
+  ]
+}
+```
 
 Generation must use a **clean fixture**. The live root is refused when `NootedRedUserPatch` is
 loaded; even without the hook the running system's patched driver pages can leak through the
 unified buffer cache, so `version-fixtures/<build>` is extracted with `F_NOCACHE` source reads and
 passed as the `--generate-profile` root. Identical inputs produce byte-identical profiles.
 
-## Page identity flags
+## Page identity and mode
 
 `ProfileCodec.encode` derives counts, table sizes and the payload checksum; the generator only
-supplies the page/site model. **Every** page record sets
-`REQUIRE_OFFSET | REQUIRE_HASH | REQUIRE_SITES` (`0x0007`): standalone bundles are paged with their
-file offset, and for split dyld shared caches the pager offset equals the subcache file offset
-(spec §4.3); the offset gate was validated against the fixture for all 13 pages. The offset is also
-the disambiguator for identical 4 KiB content reached through a different image offset, e.g. the
-VADriver2 `.03` page at `0x867D000` versus the legacy VADriver page at `0x85C4000`: both have the
-same FNV-1a-64 hash, but only the `.03` chunk base matches, so the legacy page is rejected before
-any hash comparison. There are no hash-only page records.
+supplies the image/page/site model. NRPT v3 has **no offset identity and no matchFlags**: every page
+record is identified by its validated `mode` (`PAGE` for the standalone GL bundle, `DYLD` for dyld
+shared-cache images) plus the full-page FNV-1a-64 hash and all site `find` bytes. `pageFileOffset`
+and `pageVmOffset` are 4 KiB-aligned diagnostic evidence only and are re-resolved against the
+fixture by the built-in validator; v3 also has no offset gate that could reject an already-patched
+or differently-paged delivery. Identical 4 KiB content reached through another image is not a
+problem by construction: the mode-scoped content identity is the same record, and the producer-side
+collision scan fails generation only if an unintended page of a target image satisfies a record.
+There are no hash-only page records.
 
 ## 15.8.2 (24H232) result
 
 Generated on the clean host system (no UserPatch loaded) with `--generate-profile / --out <dir>`:
 
-- offline validation PASS, 1858 `__TEXT` pages scanned, 13 page records matched, 0 find mismatches
-- 13 pages / 18 sites / 4 target images / 2776 bytes, all 13 page records with `matchFlags = 0x0007`
-- sha256 `56afabe0b7f77346057108ba1b458bbdecc5f436a720f5915484f579257bc3f4`
-- generated from the clean `F_NOCACHE` fixture `version-fixtures/15.8.2` (build 24H232, device
-  0x1638); byte-identical across repeated runs; artifacts published under
-  `build/profile-24H232-v2/`
+- offline validation PASS, 1858 `__TEXT` pages scanned, 14 page records matched, 0 find mismatches
+- 14 pages / 20 sites / 4 target images / 1736 bytes, mode PAGE=2 (standalone GL pages) and
+  DYLD=12 (Metal/VADriver2/AppleGVA cache pages)
+- profile sha256 `8cf524b479f1f8d779bf2048b0ddab3f5b5b62c0abce9ba10c53118269d341d6`
+- bundle `nred-profiles.plist` sha256 `615cbd893a3e4eeffba0cdae9ffd9ea1c1c43639e8dfe2bff5d3c4deaa4b8329`
+  (1 entry: Build 24H232 / APUMask 0x28 / DeviceID 0x1638)
+- generated from the clean `F_NOCACHE` fixture `version-fixtures/15.8.2`; profile and plist are
+  byte-identical across repeated runs; artifacts published under `build/profile-24H232-v3/`
+  (the pre-pitch-rule artifact is archived under `build/profile-24H232-v3/archive-pre-vcn-pitch/`)
+
+The `vda.encoder.source_pitch` rule adds the upstream `Vcn2Encoder::setEncodeParams` fix on the new
+VADriver2 `.03` page at image offset `0x46000` (FNV-1a-64 `d773bc6223a083ac`): `[rdx+0x80]` (source
+pitch) and `[rdx+0x84]` (element size) are read directly instead of reconstructing the pitch from
+the encoded width (`imul; add 0xff; and ~0xff`), and the untouched `xor edx,edx; div ecx` conversion
+and stores are kept. The upstream 15.8.x table expresses this as one 32-byte byte patch that starts
+two bytes inside the preceding `vxorps` (`57 C0 C5 F8 …`), which would leave the VEX prefix `C5 F8`
+in front of `mov eax,[rdx+0x80]` — not decodable. The generator therefore works on parsed
+instruction boundaries and splits the 25-byte reconstruction block into two length-preserving v3
+sites (12 + 13 bytes; the wire limit is 16 bytes per site), which is why the page has two sites.
 
 The 4-image set is GL (`kind 0`, unslid 0), Metal, VADriver2 and AppleGVA (`kind 1`, cache unslid
 addresses `0x7FFB08757000` / `0x7FFB08606000` / `0x7FFA06672000`). The AppleGVA record is the

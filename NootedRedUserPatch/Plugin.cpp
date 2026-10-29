@@ -77,8 +77,12 @@ namespace
     constexpr UInt32 kIdentityRetryDelayMs = 1000;
     constexpr UInt32 kIdentityRetryLimit   = 40;
 
-    const char* const kProfileProperty   = "NRedOffsetProfile";
-    const char* const kBuildHintProperty = "NRedSystemBuild";
+    const char* const kProfilesProperty  = "NRedProfiles";
+    const char* const kBundleBuildKey    = "Build";
+    const char* const kBundleApuKey      = "APUMask";
+    const char* const kBundleDeviceKey   = "DeviceID";
+    const char* const kBundleProfileKey  = "Profile";
+    constexpr UInt32  kMaxBundleEntries  = 16;
 
     // Last observed values of every running-build source, filled by readActualBuild().  Diagnostics
     // only; an unreadable or malformed source is reported as "none".
@@ -208,28 +212,6 @@ namespace
         return true;
     }
 
-    // The injected NRedSystemBuild hint is an early sanity input only.  It never replaces the
-    // authoritative running build comparison.
-    bool readInjectedBuild(IOService* const service, char* const out, const size_t outSize)
-    {
-        if (service == nullptr) { return false; }
-
-        auto* const property = service->getProperty(kBuildHintProperty);
-        if (auto* const value = OSDynamicCast(OSString, property)) {
-            return copyBuildText(value->getCStringNoCopy(), out, outSize);
-        }
-        if (auto* const value = OSDynamicCast(OSData, property)) {
-            const size_t length = value->getLength();
-            const auto* const bytes = static_cast<const UInt8*>(value->getBytesNoCopy());
-            if (bytes != nullptr && length >= 1 && length < outSize) {
-                memcpy(out, bytes, length);
-                out[length] = '\0';
-                return true;
-            }
-        }
-        return false;
-    }
-
     // Bounded comma-separated index list builder for the applied-page diagnostics.  Never runs in a
     // validation hook: it only formats a handful of bytes for the IORegistry publication.
     void appendPageIndex(char* const buffer, const size_t size, size_t& position, const UInt32 index, bool& truncated)
@@ -331,145 +313,6 @@ namespace
 
     // First pager offset at which each profile page's full-page content was observed, e.g.
     // "0:0x8000,1:none,2:0x1000".  Bounded and truncated for pathological profiles.
-    void buildObservedOffsetList(const PatchProfile& profile, char* const out, const size_t outSize)
-    {
-        size_t pos       = 0;
-        bool   truncated = false;
-        for (UInt32 pageIndex = 0; pageIndex < profile.pageCount(); pageIndex++) {
-            if (truncated) { break; }
-
-            UInt64    offset  = 0;
-            const bool present = profile.firstObservedOffset(pageIndex, offset);
-            int        written = 0;
-            if (present) {
-                written = snprintf(out + pos, outSize - pos, pos == 0 ? "%u:0x%llX" : ",%u:0x%llX",
-                                   static_cast<unsigned>(pageIndex), static_cast<unsigned long long>(offset));
-            }
-            else {
-                written = snprintf(out + pos, outSize - pos, pos == 0 ? "%u:none" : ",%u:none",
-                                   static_cast<unsigned>(pageIndex));
-            }
-            if (written < 0 || static_cast<size_t>(written) >= outSize - pos) {
-                truncated = true;
-                break;
-            }
-            pos += static_cast<size_t>(written);
-        }
-        if (pos == 0) { strlcpy(out, "none", outSize); }
-    }
-
-    // Decisive classification for every profile page that was never applied:
-    //   offsetMismatch       - the full-page hash matched at a chunk whose pager offset differs from
-    //                          the record's required offset (offset namespace mismatch);
-    //   siteOrWriteMismatch  - hash and offset matched, but a site find or the write failed;
-    //   contentMismatch      - the expected pager offset was delivered but the page hash differs;
-    //   neverPresented       - no chunk with the expected pager offset was ever delivered;
-    //   unobserved           - offset-free record whose content was never observed.
-    const char* classifyUnappliedPage(const PatchProfile& profile, const UInt32 pageIndex)
-    {
-        if (profile.offsetMismatch(pageIndex)) { return "offsetMismatch"; }
-        if (profile.hashObserved(pageIndex)) { return "siteOrWriteMismatch"; }
-        if (profile.offsetSeen(pageIndex)) { return "contentMismatch"; }
-        if (profile.pageRequiresOffset(pageIndex)) { return "neverPresented"; }
-        return "unobserved";
-    }
-
-    void buildUnappliedDiagnostics(const PatchProfile& profile, char* const out, const size_t outSize)
-    {
-        size_t pos = 0;
-        for (UInt32 pageIndex = 0; pageIndex < profile.pageCount(); pageIndex++) {
-            if (profile.pageApplied(pageIndex)) { continue; }
-
-            const int written = snprintf(out + pos, outSize - pos, pos == 0 ? "%u:%s" : ",%u:%s",
-                                         static_cast<unsigned>(pageIndex),
-                                         classifyUnappliedPage(profile, pageIndex));
-            if (written < 0 || static_cast<size_t>(written) >= outSize - pos) { break; }
-            pos += static_cast<size_t>(written);
-        }
-        if (pos == 0) { strlcpy(out, "none", outSize); }
-    }
-
-    // "index:0xHASH" for every recorded expected-offset delivery (bounded per-page slot list).
-    void buildExpectedOffsetHashes(const PatchProfile& profile, char* const out, const size_t outSize)
-    {
-        size_t pos    = 0;
-        bool   filled = false;
-        for (UInt32 pageIndex = 0; pageIndex < profile.pageCount() && !filled; pageIndex++) {
-            const UInt32 count = profile.expectedOffsetHashCount(pageIndex);
-            for (UInt32 slot = 0; slot < count; slot++) {
-                UInt64 hash = 0;
-                UInt32 found = 0;
-                UInt32 total = 0;
-                if (!profile.expectedOffsetHashEntry(pageIndex, slot, hash, found, total)) { continue; }
-
-                const int written = snprintf(out + pos, outSize - pos, pos == 0 ? "%u:0x%016llX" : ",%u:0x%016llX",
-                                             static_cast<unsigned>(pageIndex),
-                                             static_cast<unsigned long long>(hash));
-                if (written < 0 || static_cast<size_t>(written) >= outSize - pos) {
-                    filled = true;
-                    break;
-                }
-                pos += static_cast<size_t>(written);
-            }
-        }
-        if (pos == 0) { strlcpy(out, "none", outSize); }
-    }
-
-    // "index:<matched>/<total>" site-find counts for every recorded expected-offset delivery.
-    void buildExpectedOffsetSiteCounts(const PatchProfile& profile, char* const out, const size_t outSize)
-    {
-        size_t pos    = 0;
-        bool   filled = false;
-        for (UInt32 pageIndex = 0; pageIndex < profile.pageCount() && !filled; pageIndex++) {
-            const UInt32 count = profile.expectedOffsetHashCount(pageIndex);
-            for (UInt32 slot = 0; slot < count; slot++) {
-                UInt64 hash = 0;
-                UInt32 found = 0;
-                UInt32 total = 0;
-                if (!profile.expectedOffsetHashEntry(pageIndex, slot, hash, found, total)) { continue; }
-
-                const int written = snprintf(out + pos, outSize - pos, pos == 0 ? "%u:%u/%u" : ",%u:%u/%u",
-                                             static_cast<unsigned>(pageIndex), static_cast<unsigned>(found),
-                                             static_cast<unsigned>(total));
-                if (written < 0 || static_cast<size_t>(written) >= outSize - pos) {
-                    filled = true;
-                    break;
-                }
-                pos += static_cast<size_t>(written);
-            }
-        }
-        if (pos == 0) { strlcpy(out, "none", outSize); }
-    }
-
-    // Pages where at least one expected-offset delivery still matched every generated site find.
-    // Returns the number of such pages.
-    UInt32 buildSiteFindAllMatchedPages(const PatchProfile& profile, char* const out, const size_t outSize)
-    {
-        size_t pos       = 0;
-        bool   truncated = false;
-        UInt32 matchedPages = 0;
-        for (UInt32 pageIndex = 0; pageIndex < profile.pageCount(); pageIndex++) {
-            const UInt32 count = profile.expectedOffsetHashCount(pageIndex);
-            bool allMatched = false;
-            for (UInt32 slot = 0; slot < count; slot++) {
-                UInt64 hash = 0;
-                UInt32 found = 0;
-                UInt32 total = 0;
-                if (!profile.expectedOffsetHashEntry(pageIndex, slot, hash, found, total)) { continue; }
-                if (total != 0 && found == total) {
-                    allMatched = true;
-                    break;
-                }
-            }
-            if (allMatched) {
-                matchedPages += 1;
-                appendPageIndex(out, outSize, pos, pageIndex, truncated);
-            }
-        }
-        if (pos == 0) { strlcpy(out, "none", outSize); }
-        return matchedPages;
-    }
-
 }    // namespace
 
 // EXPORT keeps the metaclass symbols externally visible.  Without it the target-wide
@@ -495,7 +338,7 @@ extern EXPORT PRODUCT_NAME* ADDPR(selfInstance);
 //   3. the authoritative running build is resolved from the kernel/bootloader sources; because
 //      kern.osversion is only populated later by launchd, this step retries on a bounded 1 s cadence
 //      instead of failing at the early entry points;
-//   4. while the actual build is not readable yet, the injected NRedSystemBuild hint may unblock
+//   4. while the actual build is not readable yet, the provisional NRedProfiles candidate may unblock
 //      matching provisionally, but only when it is a valid build string and exactly equals the parsed
 //      profile build (IdentityProvisional=1).  Once the actual build is readable it is authoritative:
 //      exact equality confirms the provisional state, any disagreement is a hard error that revokes
@@ -524,16 +367,8 @@ private:
 
     // Where the injected profile was copied/validated.  Published as a diagnostic: a page faulted before
     // the profile is active is cached by the kernel and never revalidated, so this stage matters.
-    enum class ProfileLoadStage : UInt8
-    {
-        kNone = 0,
-        kPatcherLoad,
-        kServiceStart,
-        kAbsent,
-    };
 
-    void loadProfileLocked(IOService* service, ProfileLoadStage stage);
-    const char* profileLoadStageName() const;
+    void loadProfileLocked(IOService* service, bool finalAttempt);
     void resolveIdentityLocked(IOService* service);
     void afterTransition();
     void startIdentityRetriesIfNeeded();
@@ -551,25 +386,14 @@ private:
     {
         char appliedMask[24]{"0x0000000000000000"};
         char appliedPageList[256]{"none"};
-        char unappliedPageList[256]{"none"};
-        char observedHashMask[24]{"0x0000000000000000"};
-        char observedHashPageList[256]{"none"};
-        char offsetMismatchMask[24]{"0x0000000000000000"};
-        char offsetMismatchPageList[256]{"none"};
-        char offsetSeenMask[24]{"0x0000000000000000"};
-        char offsetSeenPageList[256]{"none"};
-        char observedOffsetList[512]{"none"};
-        char unappliedDiagnostics[384]{"none"};
-        char expectedOffsetSeenMask[24]{"0x0000000000000000"};
-        char expectedOffsetHashes[1024]{"none"};
-        char expectedOffsetSiteCounts[768]{"none"};
-        char siteFindAllMatchedList[256]{"none"};
-        char vnodeRejectedMask[24]{"0x0000000000000000"};
-        char vnodeRejectedPageList[256]{"none"};
+        char deferredPageList[256]{"none"};
         char alreadyPatchedMask[24]{"0x0000000000000000"};
         char alreadyPatchedPageList[256]{"none"};
-        char hashOnlyAppliedMask[24]{"0x0000000000000000"};
-        char hashOnlyAppliedPageList[256]{"none"};
+        char snapDeviceTree[16]{"none"};
+        char snapSysctl[16]{"none"};
+        char snapXnu[16]{"none"};
+        char snapBuildSource[16]{"none"};
+        char snapActualBuild[16]{"none"};
     };
 
     IOLock* lock_{nullptr};
@@ -581,12 +405,12 @@ private:
     bool identityResolved_{false};
     bool identityRetryActive_{false};
     bool provisionalLogged_{false};
+    UInt32 profileBundleCount_{0};
+    SInt32 profileBundleIndex_{-1};
+    char   selectedProfileBuild_[kBuildTextSize]{};
     UInt32 identityAttempts_{0};
-    ProfileLoadStage profileLoadStage_{ProfileLoadStage::kNone};
 
     char actualBuild_[kBuildTextSize]{};
-    char injectedBuild_[kBuildTextSize]{};
-    bool injectedBuildValid_{false};
 
     // Last observed running-build sources, published as diagnostics.
     char deviceTreeBuild_[kBuildTextSize]{"none"};
@@ -623,7 +447,7 @@ void UserPatchRuntime::init()
     }
 
     SYSLOG("init", "NootedRedUserPatch %s starting (generic NRPT profile engine)", kextVersion);
-    SYSLOG("init", "patch data comes only from the injected %s personality property", kProfileProperty);
+    SYSLOG("init", "patch data comes only from the injected %s personality property", kProfilesProperty);
 
     lilu.onPatcherLoadForce([](void* const, KernelPatcher& patcher) {
         UserPatchRuntime::singleton().onPatcherLoad(patcher);
@@ -636,18 +460,18 @@ void UserPatchRuntime::onPatcherLoad(KernelPatcher& patcher)
 
     IOLockLock(this->lock_);
     if (!this->disabled_) {
-        // Load/validate the injected profile before the code-signing routes are installed: a page that
-        // faults before the profile is active has its validation result cached by the kernel and is
-        // never presented to the hooks again.  Lilu's cached DeviceInfo is already available here
-        // (createCached() runs before the patcher-load callbacks), so hardware identity and the
-        // provisional build gate can also complete before routing.  If the IOKit service instance is
-        // not visible yet this defers to IOService::start.
-        this->loadProfileLocked(ADDPR(selfInstance), ProfileLoadStage::kPatcherLoad);
-
-        // Sleepable, IOKit-safe context: this is the only place hardware identity is detected.
+        // Sleepable, IOKit-safe context: this is the only place hardware identity is detected.  It must
+        // run before bundle selection because APU mask / device ID are part of the exact selector.
         UserPatchBackend::singleton().detectHardwareIdentity();
 
+        // Load/validate the injected NRedProfiles bundle before the code-signing routes are installed:
+        // a page that faults before the profile is active has its validation result cached by the
+        // kernel and is never presented to the hooks again.  If kern.osversion is not published yet
+        // (launchd sets it later) a unique APU/device candidate may be selected provisionally and the
+        // bounded identity retry confirms it.  Service instance may still be null here.
         this->resolveIdentityLocked(ADDPR(selfInstance));
+
+        this->loadProfileLocked(ADDPR(selfInstance), false);
 
         // Unconditional install: a missing or rejected profile must never delay kernel-text routing.
         UserPatchBackend::singleton().install(patcher);
@@ -664,8 +488,9 @@ void UserPatchRuntime::onServiceStart(IOService* const service)
 
     IOLockLock(this->lock_);
     if (!this->disabled_) {
-        this->loadProfileLocked(service, ProfileLoadStage::kServiceStart);
+        UserPatchBackend::singleton().detectHardwareIdentity();
         this->resolveIdentityLocked(service);
+        this->loadProfileLocked(service, true);
     }
     IOLockUnlock(this->lock_);
 
@@ -673,73 +498,174 @@ void UserPatchRuntime::onServiceStart(IOService* const service)
     this->startIdentityRetriesIfNeeded();
 }
 
-void UserPatchRuntime::loadProfileLocked(IOService* const service, const ProfileLoadStage stage)
+void UserPatchRuntime::loadProfileLocked(IOService* const service, const bool finalAttempt)
 {
     if (this->profileHandled_) { return; }
-
-    // The IOKit service instance (and thus the injected personality properties) may not be visible
-    // during the early patcher-load callback: leave the profile unhandled so IOService::start retries.
     if (service == nullptr) { return; }
 
-    auto* const property = service->getProperty(kProfileProperty);
-    auto* const data     = OSDynamicCast(OSData, property);
-    if (data == nullptr) {
-        if (stage == ProfileLoadStage::kServiceStart) {
-            this->profileHandled_    = true;
-            this->profileLoadStage_  = ProfileLoadStage::kAbsent;
-            PatchProfile::singleton().noteAbsentProfile();
+    auto& profile = PatchProfile::singleton();
+
+    const auto finishFailClosed = [&](const char* const code, const char* const context) {
+        profile.failBundleSelection(PatchProfile::Reason::kProfileInvalid, code, context);
+        this->profileHandled_ = true;
+        service->removeProperty(kProfilesProperty);
+        SYSLOG("init", "NRedProfiles rejected: %s (%s)", code, context);
+    };
+
+    auto* const bundle = OSDynamicCast(OSArray, service->getProperty(kProfilesProperty));
+    if (bundle == nullptr) {
+        if (finalAttempt) {
+            this->profileHandled_ = true;
+            profile.noteAbsentProfile();
         }
         return;
     }
 
-    this->profileHandled_   = true;
-    this->profileLoadStage_ = stage;
-
-    // Read the injected build hint before the properties are removed.  It is a sanity check only.
-    char injected[kBuildTextSize]{};
-    if (readInjectedBuild(service, injected, sizeof(injected))) {
-        strlcpy(this->injectedBuild_, injected, sizeof(this->injectedBuild_));
-        this->injectedBuildValid_ = true;
+    const UInt32 count = bundle->getCount();
+    this->profileBundleCount_ = count;
+    if (count < 1 || count > kMaxBundleEntries) {
+        finishFailClosed("E050", "bundle entry count out of range");
+        return;
     }
 
-    // Validate and copy the whole profile while the OSData property is still alive.  The engine keeps
-    // only its own bounded static tables, so the property bytes may be freed afterwards.
-    PatchProfile::singleton().loadFromData(data->getBytesNoCopy(), data->getLength());
+    char    builds[kMaxBundleEntries][kBuildTextSize]{};
+    UInt32  apuMasks[kMaxBundleEntries]{};
+    UInt32  deviceIDs[kMaxBundleEntries]{};
+    OSData* profiles[kMaxBundleEntries]{};
+    bool    candidates[kMaxBundleEntries]{};
 
-    service->removeProperty(kProfileProperty);
-    service->removeProperty(kBuildHintProperty);
+    // Whole-bundle structural validation (NRedProfiles rules §8): count, exact four keys, types,
+    // build uniqueness/format, APU mask and device ID ranges, profile size.  The selected profile is
+    // parsed fully afterwards; any structural violation rejects the whole bundle.
+    for (UInt32 index = 0; index < count; index++) {
+        auto* const entry = OSDynamicCast(OSDictionary, bundle->getObject(index));
+        if (entry == nullptr || entry->getCount() != 4) {
+            finishFailClosed("E053", "malformed bundle entry");
+            return;
+        }
+        auto* const buildValue = OSDynamicCast(OSString, entry->getObject(kBundleBuildKey));
+        auto* const apuValue   = OSDynamicCast(OSNumber, entry->getObject(kBundleApuKey));
+        auto* const devValue   = OSDynamicCast(OSNumber, entry->getObject(kBundleDeviceKey));
+        auto* const dataValue  = OSDynamicCast(OSData, entry->getObject(kBundleProfileKey));
+        if (buildValue == nullptr || apuValue == nullptr || devValue == nullptr || dataValue == nullptr) {
+            finishFailClosed("E053", "bundle entry key missing or wrong type");
+            return;
+        }
 
-    SYSLOG("init", "profile loaded at stage %s", this->profileLoadStageName());
-}
+        const char* const buildText = buildValue->getCStringNoCopy();
+        if (buildText == nullptr || !PatchProfile::isValidBuildString(buildText)) {
+            finishFailClosed("E053", "invalid bundle Build");
+            return;
+        }
+        for (UInt32 other = 0; other < index; other++) {
+            if (strcmp(builds[other], buildText) == 0) {
+                finishFailClosed("E051", "duplicate bundle Build");
+                return;
+            }
+        }
 
-const char* UserPatchRuntime::profileLoadStageName() const
-{
-    switch (this->profileLoadStage_) {
-        case ProfileLoadStage::kPatcherLoad: return "patcherLoad";
-        case ProfileLoadStage::kServiceStart: return "serviceStart";
-        case ProfileLoadStage::kAbsent: return "absent";
-        default: return "none";
+        const UInt32 apuMask = apuValue->unsigned32BitValue();
+        if (apuMask == 0 || (apuMask & ~PatchProfile::kApuMaskKnown) != 0) {
+            finishFailClosed("E053", "invalid bundle APUMask");
+            return;
+        }
+        const UInt32 deviceID = devValue->unsigned32BitValue();
+        if (deviceID > 0xFFFFU) {
+            finishFailClosed("E053", "invalid bundle DeviceID");
+            return;
+        }
+        if (dataValue->getBytesNoCopy() == nullptr || dataValue->getLength() < PatchProfile::kHeaderSize
+            || dataValue->getLength() > PatchProfile::kMaxProfileSize)
+        {
+            finishFailClosed("E053", "invalid bundle Profile data");
+            return;
+        }
+
+        strlcpy(builds[index], buildText, kBuildTextSize);
+        apuMasks[index]  = apuMask;
+        deviceIDs[index] = deviceID;
+        profiles[index]  = dataValue;
+
+        const UInt32 runningMask = profile.runningApuMask();
+        const bool   apuOk       = runningMask != 0 && (apuMask & runningMask) != 0;
+        const bool   deviceOk    = deviceID == 0
+                                || (profile.runningDeviceID() != 0 && deviceID == profile.runningDeviceID());
+        candidates[index] = apuOk && deviceOk;
     }
+
+    SInt32 selected = -1;
+    if (this->identityResolved_) {
+        for (UInt32 index = 0; index < count; index++) {
+            if (strcmp(builds[index], this->actualBuild_) == 0) {
+                if (candidates[index]) { selected = static_cast<SInt32>(index); }
+                else {
+                    // Build matched but the APU/device gate failed: no cross-build/device fallback.
+                    const UInt32 runningMask = profile.runningApuMask();
+                    const bool   apuOk = runningMask != 0 && (apuMasks[index] & runningMask) != 0;
+                    finishFailClosed("E052", apuOk ? "bundle DeviceID gate failed" : "bundle APUMask gate failed");
+                    return;
+                }
+                break;
+            }
+        }
+        if (selected < 0) {
+            finishFailClosed("E052", "no bundle entry for the running build");
+            return;
+        }
+    }
+    else {
+        // B8 provisional mode: before kern.osversion is readable matching may start only when exactly
+        // one bundle entry passes the APU/device gates ignoring Build.  Zero or several candidates wait.
+        UInt32 provisionalCandidates = 0;
+        for (UInt32 index = 0; index < count; index++) {
+            if (candidates[index]) { provisionalCandidates += 1; selected = static_cast<SInt32>(index); }
+        }
+        if (provisionalCandidates != 1) { return; }    // wait for the authoritative build; no guess
+    }
+
+    auto* const data = profiles[selected];
+    if (!profile.parsed()) {
+        if (!profile.loadFromData(data->getBytesNoCopy(), data->getLength())) { return; }    // failed closed
+    }
+
+    // §8: bundle metadata must equal the embedded profile header identity (E052).
+    if (strcmp(profile.build(), builds[selected]) != 0 || profile.apuMask() != apuMasks[selected]
+        || profile.deviceID() != deviceIDs[selected])
+    {
+        finishFailClosed("E052", "bundle entry metadata differs from profile header");
+        return;
+    }
+
+    if (this->identityResolved_) {
+        if (!profile.confirmRunningBuild(this->actualBuild_, builds[selected])) { return; }    // failed closed
+    }
+    else {
+        if (!profile.setProvisionalBuild(builds[selected])) { return; }
+        if (!this->provisionalLogged_) {
+            this->provisionalLogged_ = true;
+            SYSLOG("init", "NRedProfiles entry %s selected provisionally before kern.osversion is readable",
+                   builds[selected]);
+        }
+    }
+
+    this->profileHandled_     = true;
+    this->profileBundleIndex_ = selected;
+    strlcpy(this->selectedProfileBuild_, builds[selected], sizeof(this->selectedProfileBuild_));
+    service->removeProperty(kProfilesProperty);
+
+    SYSLOG("init", "NRedProfiles: %u entry(ies), selected %s", static_cast<unsigned>(count), builds[selected]);
 }
 
 void UserPatchRuntime::resolveIdentityLocked(IOService* const service)
 {
+    (void)service;    // bundle selection uses ADDPR(selfInstance); kept for symmetric signatures
     if (this->identityResolved_) { return; }
-
-    if (!this->injectedBuildValid_) {
-        char injected[kBuildTextSize]{};
-        if (readInjectedBuild(service, injected, sizeof(injected))) {
-            strlcpy(this->injectedBuild_, injected, sizeof(this->injectedBuild_));
-            this->injectedBuildValid_ = true;
-        }
-    }
 
     BuildReadings readings{};
     char          actual[kBuildTextSize]{};
     const bool    resolved = readActualBuild(actual, sizeof(actual), readings);
 
-    // Publish the last observed source values even when the build is not readable yet: this is what
-    // makes a "build unavailable" report conclusive without another debug build.
+    // Publish the last observed source values even when the build is not readable yet.
     strlcpy(this->deviceTreeBuild_, readings.deviceTree, sizeof(this->deviceTreeBuild_));
     strlcpy(this->sysctlBuild_, readings.sysctl, sizeof(this->sysctlBuild_));
     strlcpy(this->xnuBuild_, readings.xnu, sizeof(this->xnuBuild_));
@@ -749,27 +675,25 @@ void UserPatchRuntime::resolveIdentityLocked(IOService* const service)
         strlcpy(this->actualBuild_, actual, sizeof(this->actualBuild_));
         this->identityResolved_ = true;
 
-        const bool accepted =
-            PatchProfile::singleton().confirmRunningBuild(this->actualBuild_,
-                                                          this->injectedBuildValid_ ? this->injectedBuild_ : nullptr);
-        SYSLOG("init", "running build resolved as %s (source %s): %s", this->actualBuild_, this->resolvedBuildSource_,
-               accepted ? "confirmed" : "rejected");
+        // Select/confirm the bundle now that the authoritative build is known.
+        if (!this->profileHandled_) { this->loadProfileLocked(ADDPR(selfInstance), false); }
+
+        auto& profile = PatchProfile::singleton();
+        if (profile.parsed()) {
+            const bool accepted = profile.confirmRunningBuild(this->actualBuild_,
+                                                              this->selectedProfileBuild_[0] != '\0'
+                                                                  ? this->selectedProfileBuild_
+                                                                  : nullptr);
+            SYSLOG("init", "running build resolved as %s (source %s): %s", this->actualBuild_,
+                   this->resolvedBuildSource_, accepted ? "confirmed" : "rejected");
+        }
         return;
     }
 
-    // The actual build is not published yet (launchd writes kern.osversion later).  The injected hint
-    // may unblock early matching provisionally, but only when it is valid and exactly equals the
-    // parsed profile build; the profile engine enforces that and never stores an invalid/mismatched
-    // hint.  The identity retry chain keeps running until the actual build confirms or contradicts it.
-    if (!this->identityResolved_
-        && PatchProfile::singleton().setProvisionalBuild(this->injectedBuildValid_ ? this->injectedBuild_ : nullptr))
-    {
-        if (!this->provisionalLogged_) {
-            this->provisionalLogged_ = true;
-            SYSLOG("init", "running build not published yet; matching provisionally on NRedSystemBuild %s",
-                   this->injectedBuild_);
-        }
-    }
+    // The actual build is not published yet (launchd writes kern.osversion later).  Bundle selection
+    // may start provisionally only when a single APU/device candidate exists (v3 spec §8.2); zero or
+    // several candidates wait for the bounded identity retry.
+    if (!this->profileHandled_) { this->loadProfileLocked(ADDPR(selfInstance), false); }
 }
 
 void UserPatchRuntime::afterTransition()
@@ -794,7 +718,7 @@ void UserPatchRuntime::startIdentityRetriesIfNeeded()
 {
     bool start = false;
     IOLockLock(this->lock_);
-    if (!this->disabled_ && this->profileHandled_ && !this->identityResolved_ && !this->identityRetryActive_
+    if (!this->disabled_ && !this->identityResolved_ && !this->identityRetryActive_
         && PatchProfile::singleton().state() != PatchProfile::State::kNoOp)
     {
         this->identityRetryActive_ = true;
@@ -827,7 +751,7 @@ void UserPatchRuntime::identityRetryStep()
         }
         else if (this->identityAttempts_ >= kIdentityRetryLimit) {
             // Bounded discovery is exhausted and the authoritative running build was never readable:
-            // fail closed.  The injected NRedSystemBuild hint is never used as an acceptance fallback.
+            // fail closed.  The NRedProfiles entry build is authoritative; there is no hint fallback.
             this->identityRetryActive_ = false;
             exhausted                  = true;
             profile.failUnconfirmedBuild();
@@ -882,25 +806,20 @@ void UserPatchRuntime::publishDiagnostics()
     auto* const service = ADDPR(selfInstance);
     if (service == nullptr || this->publishLock_ == nullptr) { return; }
 
-    // Serialise formatting and publication so concurrent entry points / retry / refresh contexts cannot
-    // interleave the shared static diagnostic buffers.  The lock order is publishLock_ -> lock_.
+    // Serialise formatting and publication; the snapshots live in the static diagnostics block so the
+    // kernel stack frame stays bounded.
     IOLockLock(this->publishLock_);
+    auto& diag = this->diag_;
 
-    // Snapshot the runtime-owned strings under the state lock.
-    char   deviceTreeBuild[kBuildTextSize]{"none"};
-    char   sysctlBuild[kBuildTextSize]{"none"};
-    char   xnuBuild[kBuildTextSize]{"none"};
-    char   buildSource[16]{"none"};
-    char   actualBuild[kBuildTextSize]{};
     UInt32 identityAttempts = 0;
     bool   identityResolved = false;
     if (this->lock_ != nullptr) {
         IOLockLock(this->lock_);
-        strlcpy(deviceTreeBuild, this->deviceTreeBuild_, sizeof(deviceTreeBuild));
-        strlcpy(sysctlBuild, this->sysctlBuild_, sizeof(sysctlBuild));
-        strlcpy(xnuBuild, this->xnuBuild_, sizeof(xnuBuild));
-        strlcpy(buildSource, this->resolvedBuildSource_, sizeof(buildSource));
-        strlcpy(actualBuild, this->actualBuild_, sizeof(actualBuild));
+        strlcpy(diag.snapDeviceTree, this->deviceTreeBuild_, sizeof(diag.snapDeviceTree));
+        strlcpy(diag.snapSysctl, this->sysctlBuild_, sizeof(diag.snapSysctl));
+        strlcpy(diag.snapXnu, this->xnuBuild_, sizeof(diag.snapXnu));
+        strlcpy(diag.snapBuildSource, this->resolvedBuildSource_, sizeof(diag.snapBuildSource));
+        strlcpy(diag.snapActualBuild, this->actualBuild_, sizeof(diag.snapActualBuild));
         identityAttempts = this->identityAttempts_;
         identityResolved = this->identityResolved_;
         IOLockUnlock(this->lock_);
@@ -909,119 +828,67 @@ void UserPatchRuntime::publishDiagnostics()
     auto& profile = PatchProfile::singleton();
     auto& backend = UserPatchBackend::singleton();
 
-    // Applied-page diagnostics: hex mask plus index lists.  Together with Pages this identifies every
-    // profile record that was never applied (the per-page "applied once" bit is permanent for the boot).
-    auto& diag = this->diag_;
+    // Applied/deferred records: the applied-once bit is permanent for the boot; deferred records are
+    // pages whose workload did not reach the validators in this boot (not an error).
     buildAppliedPageDiagnostics(profile, diag.appliedMask, sizeof(diag.appliedMask), diag.appliedPageList,
-                                sizeof(diag.appliedPageList), diag.unappliedPageList,
-                                sizeof(diag.unappliedPageList));
-
-    // Bounded per-page runtime diagnostics (hash observations, offset-gate rejections, first pager
-    // offset, and the decisive classification of every unapplied record).
-    formatPageMaskHex(profile, &PatchProfile::observedHashMaskWord, diag.observedHashMask,
-                      sizeof(diag.observedHashMask));
-    buildPageIndexList(profile, &PatchProfile::hashObserved, diag.observedHashPageList,
-                       sizeof(diag.observedHashPageList));
-    formatPageMaskHex(profile, &PatchProfile::offsetMismatchMaskWord, diag.offsetMismatchMask,
-                      sizeof(diag.offsetMismatchMask));
-    buildPageIndexList(profile, &PatchProfile::offsetMismatch, diag.offsetMismatchPageList,
-                       sizeof(diag.offsetMismatchPageList));
-    formatPageMaskHex(profile, &PatchProfile::offsetSeenMaskWord, diag.offsetSeenMask, sizeof(diag.offsetSeenMask));
-    buildPageIndexList(profile, &PatchProfile::offsetSeen, diag.offsetSeenPageList, sizeof(diag.offsetSeenPageList));
-    buildObservedOffsetList(profile, diag.observedOffsetList, sizeof(diag.observedOffsetList));
-    buildUnappliedDiagnostics(profile, diag.unappliedDiagnostics, sizeof(diag.unappliedDiagnostics));
-
-    // Expected-offset content evidence: the actual delivered hashes and site-find match counts for
-    // chunks that arrived at a record's exact required pager offset (even when the page hash differs).
-    formatPageMaskHex(profile, &PatchProfile::vnodeRejectedMaskWord, diag.vnodeRejectedMask,
-                      sizeof(diag.vnodeRejectedMask));
-    buildPageIndexList(profile, &PatchProfile::vnodeRejected, diag.vnodeRejectedPageList,
-                       sizeof(diag.vnodeRejectedPageList));
+                                sizeof(diag.appliedPageList), diag.deferredPageList,
+                                sizeof(diag.deferredPageList));
     formatPageMaskHex(profile, &PatchProfile::alreadyPatchedMaskWord, diag.alreadyPatchedMask,
                       sizeof(diag.alreadyPatchedMask));
     buildPageIndexList(profile, &PatchProfile::alreadyPatched, diag.alreadyPatchedPageList,
                        sizeof(diag.alreadyPatchedPageList));
-    formatPageMaskHex(profile, &PatchProfile::hashOnlyAppliedMaskWord, diag.hashOnlyAppliedMask,
-                      sizeof(diag.hashOnlyAppliedMask));
-    buildPageIndexList(profile, &PatchProfile::hashOnlyApplied, diag.hashOnlyAppliedPageList,
-                       sizeof(diag.hashOnlyAppliedPageList));
-    formatPageMaskHex(profile, &PatchProfile::expectedOffsetSeenMaskWord, diag.expectedOffsetSeenMask,
-                      sizeof(diag.expectedOffsetSeenMask));
-    buildExpectedOffsetHashes(profile, diag.expectedOffsetHashes, sizeof(diag.expectedOffsetHashes));
-    buildExpectedOffsetSiteCounts(profile, diag.expectedOffsetSiteCounts, sizeof(diag.expectedOffsetSiteCounts));
-    const UInt32 siteFindAllMatchedPages =
-        buildSiteFindAllMatchedPages(profile, diag.siteFindAllMatchedList, sizeof(diag.siteFindAllMatchedList));
+
+    const char* coverage = "inactive";
+    if (profile.state() == PatchProfile::State::kLoaded) {
+        coverage = profile.appliedPages() >= profile.pageCount() ? "complete" : "workload-deferred";
+    }
 
     const char* const buildText = profile.build()[0] != '\0'
                                       ? profile.build()
-                                      : (actualBuild[0] != '\0' ? actualBuild : "none");
+                                      : (diag.snapActualBuild[0] != '\0' ? diag.snapActualBuild : "none");
 
     service->setProperty("NRedUserPatchState", profile.stateName());
     service->setProperty("NRedUserPatchReason", profile.reasonName());
+    service->setProperty("NRedUserPatchErrorCode", profile.errorCode());
+    service->setProperty("NRedUserPatchErrorContext", profile.errorContext());
     service->setProperty("NRedUserPatchBuild", buildText);
-    service->setProperty("NRedUserPatchBuildSource", buildSource);
-    service->setProperty("NRedUserPatchDeviceTreeBuild", deviceTreeBuild);
-    service->setProperty("NRedUserPatchSysctlBuild", sysctlBuild);
-    service->setProperty("NRedUserPatchXnuBuild", xnuBuild);
+    service->setProperty("NRedUserPatchBuildSource", diag.snapBuildSource);
+    service->setProperty("NRedUserPatchActualBuild",
+                         diag.snapActualBuild[0] != '\0' ? diag.snapActualBuild : "none");
     service->setProperty("NRedUserPatchIdentityResolved",
                          static_cast<unsigned long long>(identityResolved ? 1 : 0), 32);
     service->setProperty("NRedUserPatchIdentityAttempts", static_cast<unsigned long long>(identityAttempts), 32);
     service->setProperty("NRedUserPatchIdentityProvisional",
                          static_cast<unsigned long long>(profile.provisionalBuild() ? 1 : 0), 32);
-    service->setProperty("NRedUserPatchProfileLoadStage", this->profileLoadStageName());
-    service->setProperty("NRedUserPatchDataSource", profile.parsed() ? "personality:NRedOffsetProfile" : "none");
-    service->setProperty("NRedUserPatchErrorCode", profile.errorCode());
-    service->setProperty("NRedUserPatchErrorContext", profile.errorContext());
     service->setProperty("NRedUserPatchApuMask", static_cast<unsigned long long>(profile.apuMask()), 32);
     service->setProperty("NRedUserPatchDeviceID", static_cast<unsigned long long>(profile.deviceID()), 32);
     service->setProperty("NRedUserPatchPages", static_cast<unsigned long long>(profile.pageCount()), 32);
     service->setProperty("NRedUserPatchSites", static_cast<unsigned long long>(profile.siteCount()), 32);
-    service->setProperty("NRedUserPatchHooks", static_cast<unsigned long long>(backend.pageHookInstalled() ? 1 : 0),
-                         32);
+    service->setProperty("NRedUserPatchLoaded", static_cast<unsigned long long>(profile.loaded() ? 1 : 0), 32);
+    service->setProperty("NRedUserPatchProfileCount", this->profileBundleCount_, 32);
+    service->setProperty("NRedUserPatchSelectedProfileBuild",
+                         this->selectedProfileBuild_[0] != '\0' ? this->selectedProfileBuild_ : "none");
+    service->setProperty("NRedUserPatchHooks",
+                         static_cast<unsigned long long>(backend.pageHookInstalled() ? 1 : 0), 32);
     service->setProperty("NRedUserPatchRangeHook",
                          static_cast<unsigned long long>(backend.rangeHookInstalled() ? 1 : 0), 32);
-    service->setProperty("NRedUserPatchLoaded", static_cast<unsigned long long>(profile.loaded() ? 1 : 0), 32);
+    service->setProperty("NRedUserPatchModePageCount",
+                         static_cast<unsigned long long>(profile.pageModeCount(PatchProfile::Mode::kPage)), 32);
+    service->setProperty("NRedUserPatchModeDyldCount",
+                         static_cast<unsigned long long>(profile.pageModeCount(PatchProfile::Mode::kDyld)), 32);
+    service->setProperty("NRedUserPatchCoverage", coverage);
     service->setProperty("NRedUserPatchAppliedPages", static_cast<unsigned long long>(profile.appliedPages()), 32);
-    service->setProperty("NRedUserPatchFindMismatches", static_cast<unsigned long long>(profile.findMismatches()), 32);
-    service->setProperty("NRedUserPatchMatchedPages", static_cast<unsigned long long>(profile.matchedPages()), 32);
-    service->setProperty("NRedUserPatchChunkCalls", static_cast<unsigned long long>(profile.chunkCalls()), 32);
-    service->setProperty("NRedUserPatchWriteFailures", static_cast<unsigned long long>(profile.writeFailures()), 32);
     service->setProperty("NRedUserPatchAppliedPageMask", diag.appliedMask);
     service->setProperty("NRedUserPatchAppliedPageList", diag.appliedPageList);
-    service->setProperty("NRedUserPatchUnappliedPageList", diag.unappliedPageList);
-    service->setProperty("NRedUserPatchObservedHashPageMask", diag.observedHashMask);
-    service->setProperty("NRedUserPatchObservedHashPages", diag.observedHashPageList);
-    service->setProperty("NRedUserPatchOffsetMismatchPageMask", diag.offsetMismatchMask);
-    service->setProperty("NRedUserPatchOffsetMismatchPages", diag.offsetMismatchPageList);
-    service->setProperty("NRedUserPatchOffsetSeenPageMask", diag.offsetSeenMask);
-    service->setProperty("NRedUserPatchOffsetSeenPages", diag.offsetSeenPageList);
-    service->setProperty("NRedUserPatchObservedPageOffsets", diag.observedOffsetList);
-    service->setProperty("NRedUserPatchUnappliedPageDiagnostics", diag.unappliedDiagnostics);
-    service->setProperty("NRedUserPatchOffsetMismatchEvents",
-                         static_cast<unsigned long long>(profile.offsetMismatchEvents()), 32);
-    service->setProperty("NRedUserPatchPendingObservations",
-                         static_cast<unsigned long long>(profile.pendingObservations()), 32);
-    service->setProperty("NRedUserPatchVnodeGate", profile.vnodeGateActive() ? "active" : "legacy-offset");
-    service->setProperty("NRedUserPatchVnodeRejectedPages",
-                         static_cast<unsigned long long>(profile.vnodeRejectedPages()), 32);
-    service->setProperty("NRedUserPatchVnodeRejectedEvents",
-                         static_cast<unsigned long long>(profile.vnodeRejectedEvents()), 32);
-    service->setProperty("NRedUserPatchVnodeRejectedPageMask", diag.vnodeRejectedMask);
-    service->setProperty("NRedUserPatchVnodeRejectedPageList", diag.vnodeRejectedPageList);
+    service->setProperty("NRedUserPatchDeferredPageList", diag.deferredPageList);
     service->setProperty("NRedUserPatchAlreadyPatchedPages",
                          static_cast<unsigned long long>(profile.alreadyPatchedPages()), 32);
     service->setProperty("NRedUserPatchAlreadyPatchedPageMask", diag.alreadyPatchedMask);
     service->setProperty("NRedUserPatchAlreadyPatchedPageList", diag.alreadyPatchedPageList);
-    service->setProperty("NRedUserPatchHashOnlyAppliedPages",
-                         static_cast<unsigned long long>(profile.hashOnlyAppliedPages()), 32);
-    service->setProperty("NRedUserPatchHashOnlyAppliedPageMask", diag.hashOnlyAppliedMask);
-    service->setProperty("NRedUserPatchHashOnlyAppliedPageList", diag.hashOnlyAppliedPageList);
-    service->setProperty("NRedUserPatchExpectedOffsetSeenPageMask", diag.expectedOffsetSeenMask);
-    service->setProperty("NRedUserPatchExpectedOffsetActualHashes", diag.expectedOffsetHashes);
-    service->setProperty("NRedUserPatchExpectedOffsetSiteFindCounts", diag.expectedOffsetSiteCounts);
-    service->setProperty("NRedUserPatchSiteFindAtExpectedOffsetPages", diag.siteFindAllMatchedList);
-    service->setProperty("NRedUserPatchSiteFindAtExpectedOffsetCount",
-                         static_cast<unsigned long long>(siteFindAllMatchedPages), 32);
+    service->setProperty("NRedUserPatchFindMismatches", static_cast<unsigned long long>(profile.findMismatches()), 32);
+    service->setProperty("NRedUserPatchMatchedPages", static_cast<unsigned long long>(profile.matchedPages()), 32);
+    service->setProperty("NRedUserPatchChunkCalls", static_cast<unsigned long long>(profile.chunkCalls()), 32);
+    service->setProperty("NRedUserPatchWriteFailures", static_cast<unsigned long long>(profile.writeFailures()), 32);
 
     IOLockUnlock(this->publishLock_);
 }
@@ -1068,6 +935,7 @@ IOService* PRODUCT_NAME::probe(IOService* provider, SInt32* score)
     ADDPR(selfInstance) = this;
     setProperty("VersionInfo", kextVersion);
     auto* const service = IOService::probe(provider, score);
+
     return ADDPR(startSuccess) ? service : nullptr;
 }
 
@@ -1082,7 +950,7 @@ bool PRODUCT_NAME::start(IOService* provider)
 
     if (ADDPR(startSuccess)) {
         // Fallback load point: the patcher-load callback usually already copied/validated the injected
-        // NRedOffsetProfile and started provisional matching before the validators were routed.  If the
+        // NRedProfiles bundle and started provisional matching before the validators were routed.  If the
         // service instance was not visible then, this is where the profile is loaded.
         UserPatchRuntime::singleton().onServiceStart(this);
     }

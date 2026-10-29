@@ -28,7 +28,7 @@
 // Generic consumer for the NRPT v1 profile format (docs/PatchProfile-Spec.md).
 //
 // The class owns only generic engine state: the parsed and fully validated page/site records copied
-// out of the injected `NRedOffsetProfile` OSData property, the running-system identity gates and the
+// out of the selected `NRedProfiles` bundle profile, the running-system identity gates and the
 // per-chunk matcher used by the code-signing hooks.  It contains no patch data of its own: every page
 // offset, page hash, site offset and find/replace byte comes from the profile.
 //
@@ -46,31 +46,23 @@
 class PatchProfile
 {
 public:
-    // NRPT v1 layout constants (docs/PatchProfile-Spec.md sections 2-7).
+    // NRPT layout constants.  The parser currently accepts the interim v2 page/image tables; the final
+    // v3 byte layout lands with the frozen v3 specification (task-24) and only the loader changes.
     static constexpr size_t kPageSize         = 0x1000U;
     static constexpr size_t kMaxProfileSize   = 65536U;
     static constexpr UInt32 kHeaderSize       = 64U;
-    static constexpr UInt32 kPageRecordSize   = 24U;    // NRPT v1 page record
-    static constexpr UInt32 kPageRecordSizeV2 = 32U;    // NRPT v2 page record
-    static constexpr UInt16 kVersionV1        = 1U;
-    static constexpr UInt16 kVersionV2        = 2U;
+    static constexpr UInt32 kPageRecordSize   = 32U;    // NRPT v3 page record
+    static constexpr UInt16 kVersionV3        = 3U;
 
-    // NRPT v2 target-image metadata limits (vnode-name gate / offline tooling; see docs/PatchProfile-Spec.md).
-    static constexpr UInt32 kMaxImages             = 16U;
-    static constexpr UInt32 kMaxImagePathLength    = 200U;
-    static constexpr UInt32 kImageEntryHeaderSize  = 20U;
-    static constexpr UInt32 kMaxSegmentsPerImage   = 16U;
-    static constexpr UInt32 kMaxSectionsPerImage   = 16U;
-    static constexpr UInt32 kSegmentNameSize       = 16U;
-    static constexpr UInt32 kSectionNameSize       = 16U;
-    static constexpr UInt32 kMaxImageTableSize     = kMaxImages
-                                                   * (kImageEntryHeaderSize + 204U
-                                                      + kMaxSegmentsPerImage * kSegmentNameSize
-                                                      + kMaxSectionsPerImage * kSectionNameSize);
-    static constexpr UInt32 kMaxImageVmSize        = 0xFFFFF000U;
-    static constexpr UInt8  kImageKindStandalone   = 0U;
-    static constexpr UInt8  kImageKindSharedCache  = 1U;
-    static constexpr UInt8  kImageFlagSuffixMatch  = 1U << 0;
+    // Target-image metadata limits (NRPT v3 image table: kind/path/unslid/vmSize only).
+    static constexpr UInt32 kMaxImages            = 16U;
+    static constexpr UInt32 kMaxImagePathLength   = 200U;
+    static constexpr UInt32 kImageEntryHeaderSize = 16U;
+    static constexpr UInt32 kMaxImageTableSize    = kMaxImages * (kImageEntryHeaderSize + 204U);
+    static constexpr UInt32 kMaxImageVmSize       = 0xFFFFF000U;
+    static constexpr UInt8  kImageKindStandalone  = 0U;
+    static constexpr UInt8  kImageKindSharedCache = 1U;
+
 
     static constexpr UInt32 kSiteRecordSize   = 40U;
     static constexpr UInt32 kMaxPages         = 256U;
@@ -80,16 +72,15 @@ public:
     static constexpr UInt32 kMaxSitePatchSize = 16U;
     static constexpr UInt32 kApuMaskKnown     = 0x3FU;
 
-    // Header flags (specification section 3.3).
-    static constexpr UInt32 kHeaderFlagRequireDeviceID = 1U << 0;
-    static constexpr UInt32 kHeaderFlagsKnown          = kHeaderFlagRequireDeviceID;
 
-    // Page `matchFlags` (specification section 4.2).
-    static constexpr UInt16 kMatchRequireOffset = 1U << 0;
-    static constexpr UInt16 kMatchRequireHash   = 1U << 1;
-    static constexpr UInt16 kMatchRequireSites  = 1U << 2;
-    static constexpr UInt16 kMatchKnownFlags    = kMatchRequireOffset | kMatchRequireHash | kMatchRequireSites;
-    static constexpr UInt16 kMatchRequiredFlags = kMatchRequireHash | kMatchRequireSites;
+    // Page mode (NRPT v3): the only route that may apply the page.  `PAGE` is served by
+    // _cs_validate_page, `DYLD` by _cs_validate_range; `RESOLVER` is reserved and never accepted.
+    enum class Mode : UInt8 {
+        kPage     = 1,
+        kDyld     = 2,
+        kResolver = 3,
+    };
+    static const char* modeName(Mode mode);
 
     // Feature state.  `kNoOp` is the fail-closed state: the plugin stays loaded, nothing is written.
     enum class State : UInt8 {
@@ -119,7 +110,7 @@ public:
     bool loadFromData(const void* data, size_t size);
 
     // Provisional identity for the window before the kernel publishes `kern.osversion`: the injected
-    // `NRedSystemBuild` hint may unblock matching only when it is a valid build string AND exactly
+    // provisional `NRedProfiles` candidate may unblock matching only when it is a valid build string AND exactly
     // equals the parsed profile build.  An invalid or mismatched hint is never stored or accepted.
     // Returns true when the engine accepted the provisional state (or a confirmed build is known).
     bool setProvisionalBuild(const char* injectedBuild);
@@ -143,41 +134,24 @@ public:
     bool loaded() const;
 
     // Patches every complete 4 KiB chunk in [data, data + size) whose chunk base is `chunkBase`.
-    // Called from the code-signing hooks only.  `vnode` is the real vnode argument of the hook and is
-    // used for the vnode-name gate (NRPT v2 profiles only) before any content comparison.
-    void applyChunk(const UInt8* data, size_t size, UInt64 chunkBase, void* vnode);
+    // Called from the code-signing hooks only.  `route` is the hook's mode domain: a PAGE record is
+    // only considered by the page hook and a DYLD record only by the range hook.
+    void applyChunk(const UInt8* data, size_t size, UInt64 chunkBase, Mode route);
 
-    // Resolver for the hook's vnode argument (solved by the backend from the kernel).  Without it the
-    // engine stays on the legacy pager-offset gate and never applies NRPT v2 pages that arrive at a
-    // different offset (fail closed, no writes).
-    using tVnodeGetName = const char* (*)(void* vnode);
-    using tVnodePutName = void (*)(const char* name);
-    void setVnodeResolver(tVnodeGetName getName, tVnodePutName putName);
-    bool vnodeGateActive() const;
-
-    // Hook-only matching diagnostics (no acceptance effect):
-    //   vnodeRejectedPages  - pages whose content arrived under a vnode the name gate rejects;
-    //   alreadyPatchedPages - pages recognised as already carrying all replace bytes (no write done);
-    //   hashOnlyAppliedPages- pages applied on a content match even though the pager offset differed
-    //                         (this is the case the legacy offset gate used to reject).
-    UInt32 vnodeRejectedPages() const;
-    UInt32 vnodeRejectedEvents() const;
+    // Pages recognised as already carrying all replace bytes (marked applied, never written).
     UInt32 alreadyPatchedPages() const;
-    UInt32 hashOnlyAppliedPages() const;
-    bool   vnodeRejected(UInt32 pageIndex) const;
     bool   alreadyPatched(UInt32 pageIndex) const;
-    bool   hashOnlyApplied(UInt32 pageIndex) const;
-    UInt64 vnodeRejectedMaskWord(UInt32 wordIndex) const;
     UInt64 alreadyPatchedMaskWord(UInt32 wordIndex) const;
-    UInt64 hashOnlyAppliedMaskWord(UInt32 wordIndex) const;
 
     // Records that no profile property was injected.  Fail-closed `NoOp` (there is no fallback).
     void noteAbsentProfile();
 
-    // NRPT version actually parsed (1 = legacy offset-gated profile, 2 = hook-only vnode-gated profile).
+    // Records a bundle-level selection/validation failure (NRedProfiles layer).  Fail-closed NoOp.
+    void failBundleSelection(Reason reason, const char* code, const char* context);
+
+    // NRPT version actually parsed (v3 only in this consumer).
     UInt16 profileVersion() const;
     UInt32 imageCount() const;
-    bool   directTargetsAvailable() const;
 
     State       state() const;
     Reason      reason() const;
@@ -207,43 +181,13 @@ public:
     static constexpr UInt32 kAppliedMaskWords = (kMaxPages + 63U) / 64U;
     UInt64 appliedMaskWord(UInt32 wordIndex) const;
 
-    // Per-page runtime diagnostics gathered in the hooks (acceptance is unaffected).  They answer
-    // "why was record N never applied?" without another debug build:
-    //   hashObserved  - the full-page hash matched record N at some delivered chunk (any offset);
-    //   offsetMismatch- the hash matched but the record's REQUIRE_OFFSET gate rejected that chunk;
-    //   offsetSeen    - a chunk with exactly the record's required pageFileOffset was delivered;
-    //   firstObservedOffset - the first pager offset at which the record's content was observed.
-    // Never presented: !hashObserved && !offsetSeen (for an offset-gated record).
-    // Content mismatch: !hashObserved && offsetSeen.
-    // Offset namespace mismatch: hashObserved && offsetMismatch.
-    bool   hashObserved(UInt32 pageIndex) const;
-    bool   offsetMismatch(UInt32 pageIndex) const;
-    bool   offsetSeen(UInt32 pageIndex) const;
-    bool   firstObservedOffset(UInt32 pageIndex, UInt64& offset) const;
-    UInt64 observedHashMaskWord(UInt32 wordIndex) const;
-    UInt64 offsetMismatchMaskWord(UInt32 wordIndex) const;
-    UInt64 offsetSeenMaskWord(UInt32 wordIndex) const;
-    UInt32 offsetMismatchEvents() const;
-    UInt32 pendingObservations() const;
-    bool   pageRequiresOffset(UInt32 pageIndex) const;
+    // Per-mode diagnostics: how many profile pages belong to each route (PAGE/DYLD).
+    UInt32 pageModeCount(Mode mode) const;
 
-    // Hard bound on the diagnostics content-observation window: after this many delivered chunks the
-    // engine stops hashing arbitrary chunks for diagnostics (acceptance hashing is unaffected).  This
-    // bounds the cost when a profile record never appears at all.
-    static constexpr UInt32 kDiagnosticsChunkBudget = 65536U;
-
-    // Expected-offset content evidence (diagnostics only, no acceptance effect).  When a chunk arrives
-    // at exactly a record's required pageFileOffset, the engine records the actual delivered
-    // FNV-1a-64 and how many of that record's generated site find bytes matched, even when the
-    // full-page hash differs.  This separates "the target page changed slightly" (site finds may still
-    // match) from "an unrelated page at a colliding pager offset" (no finds match), and the actual
-    // hashes can be searched offline for the source image.
-    static constexpr UInt32 kExpectedOffsetHashSlots = 4U;
-    UInt32 expectedOffsetHashCount(UInt32 pageIndex) const;
-    bool   expectedOffsetHashEntry(UInt32 pageIndex, UInt32 slot, UInt64& hash, UInt32& sitesFound,
-                                   UInt32& sitesTotal) const;
-    bool   expectedOffsetSeen(UInt32 pageIndex) const;
-    UInt64 expectedOffsetSeenMaskWord(UInt32 wordIndex) const;
+    // Running hardware identity (set once by the backend's DeviceInfo detection).
+    UInt32 runningApuMask() const;
+    UInt32 runningDeviceID() const;
+    bool   runningApuKnown() const;
 
     // Runtime counters (monotonic, atomics; safe to read from any context).
     UInt32 appliedPages() const;
@@ -262,14 +206,14 @@ private:
     // index the static site array.
     struct Page
     {
-        UInt64 pageFileOffset;
+        UInt64 pageFileOffset;    // diagnostic only; never part of page identity
         UInt64 pageHash;
         UInt32 firstSite;
         UInt16 siteCount;
-        UInt16 matchFlags;
-        // NRPT v2 target-image metadata (zero for v1 profiles).
+        UInt8  mode;              // Mode: which route may apply this page
+        UInt8  flags;             // reserved (v3)
         UInt16 imageIndex;
-        UInt32 pageVmOffset;
+        UInt32 pageVmOffset;      // evidence only
     };
 
     // One validated NRPT v2 target image (the segment/section name tables are validated and then
@@ -277,9 +221,7 @@ private:
     struct Image
     {
         UInt8  kind;
-        UInt8  flags;
-        UInt8  segmentCount;
-        UInt8  sectionCount;
+        UInt8  reserved;
         UInt64 unslidVmaddr;
         UInt32 vmSize;
         char   path[kMaxImagePathLength + 1];
@@ -302,26 +244,17 @@ private:
     PatchProfile(PatchProfile&&) = delete;
     PatchProfile& operator=(PatchProfile&&) = delete;
 
-    bool loadHeader(const UInt8* data, size_t size, UInt32& pageCount, UInt32& siteCount, UInt32& headerFlags,
-                    UInt16& version, UInt16& imageCount, UInt32& imageTableSize, UInt32& pageRecordSize);
+    bool loadHeader(const UInt8* data, size_t size, UInt32& pageCount, UInt32& siteCount, UInt16& version,
+                    UInt16& imageCount, UInt32& imageTableSize, UInt32& pageRecordSize);
     bool loadImageTable(const UInt8* table, UInt32 imageCount, UInt32 imageTableSize);
-    bool loadPageTable(const UInt8* table, UInt32 pageCount, UInt32 siteCount, UInt16 version);
-    bool loadPageTableV1(const UInt8* table, UInt32 pageCount, UInt32 siteCount);
-    bool loadPageTableV2(const UInt8* table, UInt32 pageCount, UInt32 siteCount);
+    bool loadPageTable(const UInt8* table, UInt32 pageCount, UInt32 siteCount);
     bool loadSiteTable(const UInt8* table, UInt32 siteCount, UInt32 pageCount);
     void evaluateIdentity();
     bool fail(Reason reason, const char* code, const char* context);
     void revokeBuild(Reason reason, const char* context);
     bool takeLogBudget();
-    void applyPage(const UInt8* page, UInt64 chunkBase, void* vnode);
-    bool vnodeGateAccepts(UInt32 pageIndex, const char* vnodeName) const;
+    void applyPage(const UInt8* page, UInt64 chunkBase, Mode route);
     bool markAlreadyPatched(UInt32 pageIndex, const UInt8* page);
-    void recordVnodeRejected(UInt32 pageIndex);
-    void recordHashObservation(UInt32 pageIndex, UInt64 chunkBase);
-    void recordExpectedOffsetEvidence(UInt32 pageIndex, UInt64 pageHash, const UInt8* page);
-    void recordOffsetSeen(UInt32 pageIndex);
-    void recordOffsetMismatch(UInt32 pageIndex);
-    bool diagnosticsActive() const;
     static bool maskBitSet(const volatile UInt64* bits, UInt32 pageIndex);
     static bool parseBuildField(const UInt8* field, char* out, size_t outSize);
 
@@ -336,7 +269,6 @@ private:
     char   build_[kMaxBuildLength + 1]{};
     UInt32 apuMask_{0};
     UInt32 deviceID_{0};
-    UInt32 headerFlags_{0};
     UInt16 pageCount_{0};
     UInt16 siteCount_{0};
     UInt16 profileVersion_{0};
@@ -344,18 +276,10 @@ private:
     Image  images_[kMaxImages]{};
     bool   profileParsed_{false};
 
-    // Hook-side vnode resolver (solved by the backend; may stay null, which keeps the legacy offset gate).
-    tVnodeGetName vnodeGetName_{nullptr};
-    tVnodePutName vnodePutName_{nullptr};
-
     // Hook-only matching diagnostics.
-    volatile UInt64 vnodeRejectedBits_[kAppliedMaskWords]{};
     volatile UInt64 alreadyPatchedBits_[kAppliedMaskWords]{};
-    volatile UInt64 hashOnlyAppliedBits_[kAppliedMaskWords]{};
-    volatile UInt32 vnodeRejectedCount_{0};
-    volatile UInt32 vnodeRejectedEventCount_{0};
     volatile UInt32 alreadyPatchedCount_{0};
-    volatile UInt32 hashOnlyAppliedCount_{0};
+
     bool   loadAttempted_{false};
 
     // Running-system identity.
@@ -380,17 +304,6 @@ private:
 
     // Bounded per-page runtime diagnostics.  Hashing every delivered chunk is only needed until every
     // record has been observed; kDiagnosticsChunkBudget also bounds the cost for records that never appear.
-    volatile UInt64 observedHashBits_[kAppliedMaskWords]{};
-    volatile UInt64 offsetMismatchBits_[kAppliedMaskWords]{};
-    volatile UInt64 offsetSeenBits_[kAppliedMaskWords]{};
-    volatile UInt64 firstObservedOffsets_[kMaxPages]{};
-    volatile UInt32 pendingObservationCount_{0};
-    volatile UInt32 offsetMismatchEventCount_{0};
-    volatile UInt64 expectedOffsetSeenBits_[kAppliedMaskWords]{};
-    volatile UInt64 expectedOffsetHashes_[kMaxPages][kExpectedOffsetHashSlots]{};
-    volatile UInt8  expectedOffsetSitesFound_[kMaxPages][kExpectedOffsetHashSlots]{};
-    volatile UInt16 expectedOffsetSitesTotal_[kMaxPages][kExpectedOffsetHashSlots]{};
-    volatile UInt32 expectedOffsetHashCounts_[kMaxPages]{};
 
     volatile UInt32 appliedPageCount_{0};
     volatile UInt32 findMismatchCount_{0};

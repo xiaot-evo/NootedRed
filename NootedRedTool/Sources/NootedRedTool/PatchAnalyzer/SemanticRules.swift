@@ -247,6 +247,7 @@ enum SemanticRules {
             vdaFactoryEngineType,
             vdaFeedbackStride,
             vdaChipFamily,
+            vcn2EncoderSourcePitch,
             appleGVAAcceleratorFallback
         ]
     }
@@ -901,6 +902,179 @@ enum SemanticRules {
                               replace: replacement,
                               intent: "accept chip family 0x8E in AddrLib",
                               matchedInstruction: instruction.text)]
+        }
+    )
+
+    // MARK: VCN2 encoder source pitch
+
+    /// `Vcn2Encoder::setEncodeParams` reconstructs the source line pitch from the encoded
+    /// target width (`mov ecx,[rdx+0x84]; mov eax,[rdi+0x424]; imul eax,ecx; add eax,0xff;
+    /// and eax,0xffffff00`) instead of reading the real texture pitch fields (`[rdx+0x80]`
+    /// bytes per line, `[rdx+0x84]` element size). The reconstruction mis-strides APU /
+    /// Retina screen-recording frames (scanline distortion and horizontal squeeze, chroma
+    /// offsets drift). The rule locates that parsed instruction sequence in the function and
+    /// rewrites it, length-preserving, as a direct read of the pitch fields while leaving the
+    /// division by the element size that follows untouched.
+    ///
+    /// The upstream 15.8.x table expresses the same intent as a 32-byte byte patch that starts
+    /// two bytes inside the preceding `vxorps` (i.e. it would leave the VEX prefix `C5 F8`
+    /// in front of `mov eax,[rdx+0x80]`, which is not a decodable instruction). This rule works
+    /// on instruction boundaries instead: the 25-byte reconstruction block becomes two v3 sites
+    /// (12 + 13 bytes; the NRPT v3 wire limit is 16 bytes per site).
+    private static let vcn2EncoderSourcePitch = SemanticRule(
+        id: "vda.encoder.source_pitch",
+        driver: .vda,
+        description: "Vcn2Encoder::setEncodeParams: read the true source texture pitch instead of "
+            + "reconstructing it from the encoded width",
+        functions: [
+            RuleFunctionTarget(description: "Vcn2Encoder::setEncodeParams",
+                               resolve: { image, decoder in
+                                   try FunctionResolution.bySymbol(
+                                       "__ZN11Vcn2Encoder15setEncodeParamsEPvP15VAVendorTexture",
+                                       in: image, decoder: decoder)
+                               },
+                               expectedSites: 2)
+        ],
+        match: { analysis, decoder, _ in
+            let instructions = analysis.instructions
+            var candidates: [[DecodedInstruction]] = []
+            if instructions.count >= 5 {
+                for index in 0...(instructions.count - 5) {
+                    let block = Array(instructions[index..<(index + 5)])
+                    let elementSizeLoad = block[0]
+                    let widthLoad = block[1]
+                    let multiply = block[2]
+                    let roundUp = block[3]
+                    let alignDown = block[4]
+                    guard elementSizeLoad.mnemonic == "mov",
+                          let elementParsed = elementSizeLoad.parsed,
+                          elementParsed.operands.count == 2,
+                          elementParsed.operand0?.register?.name == "ecx",
+                          elementParsed.operand0?.register?.width == 32,
+                          let elementMemory = elementParsed.operand1?.memory,
+                          elementMemory.base?.name == "rdx",
+                          elementMemory.index == nil,
+                          elementMemory.displacement == 0x84,
+                          widthLoad.mnemonic == "mov",
+                          let widthParsed = widthLoad.parsed,
+                          widthParsed.operands.count == 2,
+                          widthParsed.operand0?.register?.name == "eax",
+                          widthParsed.operand0?.register?.width == 32,
+                          let widthMemory = widthParsed.operand1?.memory,
+                          widthMemory.base?.name == "rdi",
+                          widthMemory.index == nil,
+                          widthMemory.displacement == 0x424,
+                          multiply.mnemonic == "imul",
+                          let multiplyParsed = multiply.parsed,
+                          multiplyParsed.operands.count == 2,
+                          multiplyParsed.operand0?.register?.name == "eax",
+                          multiplyParsed.operand1?.register?.name == "ecx",
+                          roundUp.mnemonic == "add",
+                          let roundUpParsed = roundUp.parsed,
+                          roundUpParsed.operands.count == 2,
+                          roundUpParsed.operand0?.register?.name == "eax",
+                          roundUpParsed.operand1?.immediate == 0xff,
+                          alignDown.mnemonic == "and",
+                          let alignParsed = alignDown.parsed,
+                          alignParsed.operands.count == 2,
+                          alignParsed.operand0?.register?.name == "eax",
+                          alignParsed.operand1?.immediate == 0xffffff00,
+                          elementSizeLoad.endAddress == widthLoad.address,
+                          widthLoad.endAddress == multiply.address,
+                          multiply.endAddress == roundUp.address,
+                          roundUp.endAddress == alignDown.address else {
+                        continue
+                    }
+                    // The untouched tail must be `xor edx,edx; div ecx`, i.e. the width/pitch
+                    // conversion the replacement feeds.
+                    guard let xorInstruction = analysis.nextInstruction(after: alignDown),
+                          xorInstruction.mnemonic == "xor",
+                          let xorParsed = xorInstruction.parsed,
+                          xorParsed.operands.count == 2,
+                          xorParsed.operand0?.register?.name == "edx",
+                          xorParsed.operand1?.register?.name == "edx",
+                          let divide = analysis.nextInstruction(after: xorInstruction),
+                          divide.mnemonic == "div",
+                          divide.parsed?.operand0?.register?.name == "ecx" else {
+                        continue
+                    }
+                    candidates.append(block)
+                }
+            }
+            guard candidates.count == 1, let block = candidates.first else {
+                throw AnalyzerError.ambiguous(
+                    "\(analysis.imageLabel): \(candidates.count) VCN2 pitch reconstruction blocks in "
+                        + "\(analysis.functionName)")
+            }
+            let elementSizeLoad = block[0]
+            let widthLoad = block[1]
+            let multiply = block[2]
+            let roundUp = block[3]
+            let alignDown = block[4]
+
+            // Site 1: replace the source pitch/element-size loads with reads of the real
+            // texture pitch (+0x80) and element size (+0x84); same registers, same length.
+            let findA = elementSizeLoad.bytes + widthLoad.bytes
+            let replaceA: [UInt8] = [0x8B, 0x82, 0x80, 0x00, 0x00, 0x00,
+                                      0x8B, 0x8A, 0x84, 0x00, 0x00, 0x00]
+            guard findA.count == replaceA.count, findA.count <= NRPTFormat.maxSitePatchSize else {
+                throw AnalyzerError.validation("VCN2 pitch load replacement is not length-preserving")
+            }
+            let decodedA = try ReplacementEncoding.decodeValidated(decoder, bytes: replaceA,
+                                                                   address: elementSizeLoad.address)
+            guard decodedA.count == 2,
+                  decodedA[0].mnemonic == "mov",
+                  decodedA[0].parsed?.operand0?.register?.name == "eax",
+                  decodedA[0].parsed?.operand1?.memory?.base?.name == "rdx",
+                  decodedA[0].parsed?.operand1?.memory?.displacement == 0x80,
+                  decodedA[1].mnemonic == "mov",
+                  decodedA[1].parsed?.operand0?.register?.name == "ecx",
+                  decodedA[1].parsed?.operand1?.memory?.base?.name == "rdx",
+                  decodedA[1].parsed?.operand1?.memory?.displacement == 0x84 else {
+                throw AnalyzerError.validation("VCN2 pitch load replacement does not decode to the pitch reads")
+            }
+
+            // Site 2: the width reconstruction (`imul`, round-up `add`, alignment `and`) becomes
+            // NOPs, so the following `xor edx,edx; div ecx` turns the true pitch into the width.
+            let findB = multiply.bytes + roundUp.bytes + alignDown.bytes
+            let replaceB = [UInt8](repeating: 0x90, count: findB.count)
+            guard findB.count == replaceB.count, findB.count <= NRPTFormat.maxSitePatchSize else {
+                throw AnalyzerError.validation("VCN2 pitch reconstruction replacement is not length-preserving")
+            }
+            let decodedB = try ReplacementEncoding.decodeValidated(decoder, bytes: replaceB,
+                                                                   address: multiply.address)
+            guard decodedB.count == findB.count, decodedB.allSatisfy(\.isNoOp) else {
+                throw AnalyzerError.validation("VCN2 pitch reconstruction replacement does not decode to NOPs")
+            }
+
+            var details: [String: String] = [
+                "sourcePitchField": "dx+0x80",
+                "elementSizeField": "dx+0x84",
+                "removedReconstruction": "imul eax,ecx; add eax,0xff; and eax,0xffffff00",
+                "keptConversion": "xor edx,edx; div ecx; store [rbx+0x18]/[rbx+0x1c]",
+                "upstreamFallbackNote": "upstream 15.8.x byte patch starts 2 bytes into the preceding "
+                    + "vxorps and is not instruction-aligned; this rule uses the parsed block boundaries"
+            ]
+            details["findA"] = Hex.spaced(findA)
+            details["replaceA"] = Hex.spaced(replaceA)
+            details["findB"] = Hex.spaced(findB)
+            return [
+                SiteMatch(function: analysis,
+                          instructionAddresses: [elementSizeLoad.address],
+                          find: findA,
+                          replace: replaceA,
+                          intent: "read the true source texture pitch (+0x80) and element size (+0x84)",
+                          matchedInstruction: [elementSizeLoad.text, widthLoad.text].joined(separator: "; "),
+                          details: details),
+                SiteMatch(function: analysis,
+                          instructionAddresses: [multiply.address],
+                          find: findB,
+                          replace: replaceB,
+                          intent: "drop the encoded-width reconstruction and keep the native pitch conversion",
+                          matchedInstruction: [multiply.text, roundUp.text, alignDown.text]
+                              .joined(separator: "; "),
+                          details: details)
+            ]
         }
     )
 

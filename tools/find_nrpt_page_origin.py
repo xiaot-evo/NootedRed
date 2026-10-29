@@ -26,9 +26,9 @@ Usage:
     tools/find_nrpt_page_origin.py --ioreg-file /tmp/nootedred-ioreg.txt \
         --profile build/profile-24H232/nred-24H232.nrpt
 
-    # NRPT v2 profile: expected hashes plus each record's target image/pageVmOffset
+    # NRPT v3 profile: expected hashes plus each record's mode, target image and pageVmOffset
     tools/find_nrpt_page_origin.py --ioreg-file /tmp/nootedred-ioreg.txt \
-        --profile build/profile-24H232-v2/nred-24H232-v2.nrpt
+        --profile build/profile-24H232-v3/nred-24H232-v3.nrpt
 
     # explicit candidate images / fixture directory
     tools/find_nrpt_page_origin.py --hashes 0x... --image /path/to/binary --image-dir fixtures/15.8.2-clean
@@ -56,13 +56,12 @@ import tempfile
 
 PAGE_SIZE = 4096
 NRPT_HEADER_SIZE = 64
-NRPT_PAGE_RECORD_SIZE_V1 = 24
-NRPT_PAGE_RECORD_SIZE_V2 = 32
-NRPT_VERSION_V1 = 1
-NRPT_VERSION_V2 = 2
+NRPT_PAGE_RECORD_SIZE = 32
+NRPT_VERSION = 3
 NRPT_MAX_IMAGES = 16
-NRPT_IMAGE_ENTRY_HEADER_SIZE = 20
+NRPT_IMAGE_ENTRY_HEADER_SIZE = 16
 NRPT_MAX_IMAGE_PATH_LENGTH = 200
+NRPT_MODE_NAMES = {1: "PAGE", 2: "DYLD", 3: "RESOLVER"}
 NATIVE_SCAN_THRESHOLD_BYTES = 64 * 1024 * 1024
 HASH_SCAN_SOURCE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "test", "hash_scan.c")
@@ -95,15 +94,14 @@ def fnv1a64(data: bytes) -> int:
 
 
 class NRPTPage:
-    __slots__ = ("index", "page_file_offset", "page_hash", "match_flags", "image_index",
-                 "page_vm_offset")
+    __slots__ = ("index", "page_file_offset", "page_hash", "mode", "image_index", "page_vm_offset")
 
-    def __init__(self, index: int, page_file_offset: int, page_hash: int, match_flags: int,
-                 image_index: int = 0, page_vm_offset: int = 0) -> None:
+    def __init__(self, index: int, page_file_offset: int, page_hash: int, mode: int,
+                 image_index: int, page_vm_offset: int) -> None:
         self.index = index
         self.page_file_offset = page_file_offset
         self.page_hash = page_hash
-        self.match_flags = match_flags
+        self.mode = mode
         self.image_index = image_index
         self.page_vm_offset = page_vm_offset
 
@@ -124,7 +122,7 @@ def _round_up4(value: int) -> int:
 
 
 def load_nrpt_profile(path: str) -> tuple[str, int, list[NRPTPage], list[NRPTImage]]:
-    """Minimal strict NRPT reader (v1 hook-only and v2 image-metadata profiles)."""
+    """Minimal strict NRPT v3 reader (mode/image metadata used for evidence only)."""
     with open(path, "rb") as handle:
         data = handle.read()
     if len(data) < NRPT_HEADER_SIZE:
@@ -132,64 +130,53 @@ def load_nrpt_profile(path: str) -> tuple[str, int, list[NRPTPage], list[NRPTIma
     if data[0:4] != b"NRPT":
         raise ValueError(f"{path}: not an NRPT profile (bad magic)")
     version, header_size = struct.unpack_from("<HH", data, 4)
-    if version not in (NRPT_VERSION_V1, NRPT_VERSION_V2) or header_size != NRPT_HEADER_SIZE:
-        raise ValueError(f"{path}: unsupported NRPT version/header ({version}/{header_size})")
+    if version != NRPT_VERSION or header_size != NRPT_HEADER_SIZE:
+        raise ValueError(f"{path}: unsupported NRPT version/header ({version}/{header_size}); v3 only")
     build = data[8:24].split(b"\x00", 1)[0].decode("ascii", "replace")
     page_count, site_count = struct.unpack_from("<HH", data, 32)
     page_table_size, site_table_size, payload_checksum = struct.unpack_from("<III", data, 36)
-    image_count = 0
-    image_table_size = 0
-    page_record_size = NRPT_PAGE_RECORD_SIZE_V1
-    if version == NRPT_VERSION_V2:
-        image_count = struct.unpack_from("<H", data, 52)[0]
-        image_table_size = struct.unpack_from("<I", data, 54)[0]
-        page_record_size = NRPT_PAGE_RECORD_SIZE_V2
-    if page_table_size != page_count * page_record_size:
-        raise ValueError(f"{path}: pageTableSize mismatch for NRPT v{version}")
+    image_count = struct.unpack_from("<H", data, 52)[0]
+    image_table_size = struct.unpack_from("<I", data, 54)[0]
+    if page_table_size != page_count * NRPT_PAGE_RECORD_SIZE:
+        raise ValueError(f"{path}: pageTableSize mismatch for NRPT v3")
     expected_size = NRPT_HEADER_SIZE + page_table_size + site_table_size + image_table_size
     if expected_size != len(data):
         raise ValueError(f"{path}: total size mismatch (header says {expected_size}, file is {len(data)})")
-    payload = data[NRPT_HEADER_SIZE:]
-    if fnv1a32(payload) != payload_checksum:
+    if fnv1a32(data[NRPT_HEADER_SIZE:]) != payload_checksum:
         raise ValueError(f"{path}: payload checksum mismatch")
 
     images: list[NRPTImage] = []
-    if version == NRPT_VERSION_V2:
-        cursor = NRPT_HEADER_SIZE + page_table_size + site_table_size
-        end = cursor + image_table_size
-        if end > len(data):
-            raise ValueError(f"{path}: truncated image table")
-        for image_index in range(image_count):
-            if end - cursor < NRPT_IMAGE_ENTRY_HEADER_SIZE:
-                raise ValueError(f"{path}: truncated image entry")
-            kind = data[cursor]
-            path_length = struct.unpack_from("<H", data, cursor + 2)[0]
-            unslid_vmaddr = struct.unpack_from("<Q", data, cursor + 4)[0]
-            vm_size = struct.unpack_from("<I", data, cursor + 12)[0]
-            segment_count = data[cursor + 16]
-            section_count = data[cursor + 17]
-            if not 1 <= path_length <= NRPT_MAX_IMAGE_PATH_LENGTH:
-                raise ValueError(f"{path}: invalid image path length {path_length}")
-            path_field_size = _round_up4(path_length + 1)
-            entry_size = (NRPT_IMAGE_ENTRY_HEADER_SIZE + path_field_size
-                          + segment_count * 16 + section_count * 16)
-            if end - cursor < entry_size:
-                raise ValueError(f"{path}: image entry exceeds image table")
-            base = cursor + NRPT_IMAGE_ENTRY_HEADER_SIZE
-            image_path = data[base:base + path_length].decode("ascii", "replace")
-            images.append(NRPTImage(image_index, kind, image_path, unslid_vmaddr, vm_size))
-            cursor += entry_size
-        if cursor != end:
-            raise ValueError(f"{path}: imageTableSize mismatch")
+    cursor = NRPT_HEADER_SIZE + page_table_size + site_table_size
+    end = cursor + image_table_size
+    if not 1 <= image_count <= NRPT_MAX_IMAGES or end > len(data):
+        raise ValueError(f"{path}: invalid image table")
+    for image_index in range(image_count):
+        if end - cursor < NRPT_IMAGE_ENTRY_HEADER_SIZE:
+            raise ValueError(f"{path}: truncated image entry")
+        kind = data[cursor]
+        path_length = struct.unpack_from("<H", data, cursor + 2)[0]
+        unslid_vmaddr = struct.unpack_from("<Q", data, cursor + 4)[0]
+        vm_size = struct.unpack_from("<I", data, cursor + 12)[0]
+        if not 1 <= path_length <= NRPT_MAX_IMAGE_PATH_LENGTH:
+            raise ValueError(f"{path}: invalid image path length {path_length}")
+        entry_size = NRPT_IMAGE_ENTRY_HEADER_SIZE + _round_up4(path_length + 1)
+        if end - cursor < entry_size:
+            raise ValueError(f"{path}: image entry exceeds image table")
+        base = cursor + NRPT_IMAGE_ENTRY_HEADER_SIZE
+        image_path = data[base:base + path_length].decode("ascii", "replace")
+        images.append(NRPTImage(image_index, kind, image_path, unslid_vmaddr, vm_size))
+        cursor += entry_size
+    if cursor != end:
+        raise ValueError(f"{path}: imageTableSize mismatch")
 
     pages: list[NRPTPage] = []
     for index in range(page_count):
-        offset = NRPT_HEADER_SIZE + index * page_record_size
+        offset = NRPT_HEADER_SIZE + index * NRPT_PAGE_RECORD_SIZE
         page_file_offset, page_hash = struct.unpack_from("<QQ", data, offset)
-        match_flags = struct.unpack_from("<H", data, offset + 22)[0]
-        image_index = struct.unpack_from("<H", data, offset + 24)[0] if version == NRPT_VERSION_V2 else 0
-        page_vm_offset = struct.unpack_from("<I", data, offset + 28)[0] if version == NRPT_VERSION_V2 else 0
-        pages.append(NRPTPage(index, page_file_offset, page_hash, match_flags, image_index, page_vm_offset))
+        mode = data[offset + 22]
+        image_index = struct.unpack_from("<H", data, offset + 24)[0]
+        page_vm_offset = struct.unpack_from("<I", data, offset + 28)[0]
+        pages.append(NRPTPage(index, page_file_offset, page_hash, mode, image_index, page_vm_offset))
     return build, version, pages, images
 
 
@@ -350,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hashes", action="append", default=[],
                         help="hash spec, e.g. '0:0x0123...' or comma-separated list (repeatable)")
     parser.add_argument("--ioreg-file", help=f"file containing an ioreg dump with {DEVICE_TREE_PROPERTY}")
-    parser.add_argument("--profile", help="NRPT v1/v2 profile to show the expected hash and target-image metadata per record index")
+    parser.add_argument("--profile", help="NRPT v3 profile to show the expected hash, mode and target-image metadata per record index")
     parser.add_argument("--image", action="append", default=[], help="explicit candidate image (repeatable)")
     parser.add_argument("--image-dir", action="append", default=[],
                         help="candidate image directory scanned recursively (repeatable)")
@@ -429,32 +416,31 @@ def main(argv: list[str] | None = None) -> int:
         origins = [{"image": image, "offset": offset, "page_index": offset // PAGE_SIZE,
                     "page_offset_hex": f"0x{offset:X}"} for image, offset in matches.get(digest, [])]
         expected = None
-        match_flags = None
+        expected_mode = None
         expected_offset = None
         expected_image = None
         expected_page_vm_offset = None
         if index is not None and index in pages_by_index:
             page = pages_by_index[index]
             expected = page.page_hash
+            expected_mode = NRPT_MODE_NAMES.get(page.mode, f"mode{page.mode}")
             expected_offset = page.page_file_offset
-            match_flags = page.match_flags
-            if profile_version == NRPT_VERSION_V2:
-                image = images_by_index.get(page.image_index)
-                if image is not None:
-                    expected_image = {
-                        "index": image.index,
-                        "kind": "standalone-file" if image.kind == 0 else "dyld-shared-cache",
-                        "path": image.path,
-                        "unslid_vmaddr": f"0x{image.unslid_vmaddr:X}",
-                        "vm_size": f"0x{image.vm_size:X}",
-                    }
-                expected_page_vm_offset = page.page_vm_offset
+            image = images_by_index.get(page.image_index)
+            if image is not None:
+                expected_image = {
+                    "index": image.index,
+                    "kind": "standalone-file" if image.kind == 0 else "dyld-shared-cache",
+                    "path": image.path,
+                    "unslid_vmaddr": f"0x{image.unslid_vmaddr:X}",
+                    "vm_size": f"0x{image.vm_size:X}",
+                }
+            expected_page_vm_offset = page.page_vm_offset
         entry = {
             "index": index,
             "actual_hash": f"0x{digest:016X}",
             "expected_hash": f"0x{expected:016X}" if expected is not None else None,
             "expected_page_file_offset": f"0x{expected_offset:X}" if expected_offset is not None else None,
-            "match_flags": f"0x{match_flags:04X}" if match_flags is not None else None,
+            "expected_mode": expected_mode,
             "expected_image": expected_image,
             "expected_page_vm_offset": (f"0x{expected_page_vm_offset:X}"
                                         if expected_page_vm_offset is not None else None),
@@ -472,8 +458,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f" ({verdict}, profile offset 0x{expected_offset:X})", end="")
         print()
         if expected_image is not None:
-            print(f"    profile target: image[{expected_image['index']}] {expected_image['kind']} "
-                  f"{expected_image['path']} pageVmOffset=0x{expected_page_vm_offset:X} "
+            print(f"    profile target: mode={expected_mode} image[{expected_image['index']}] "
+                  f"{expected_image['kind']} {expected_image['path']} "
+                  f"pageVmOffset=0x{expected_page_vm_offset:X} "
                   f"(unslid 0x{int(expected_image['unslid_vmaddr'], 16):X})")
         if origins:
             for origin in origins:

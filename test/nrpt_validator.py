@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
-# NootedRed NRPT v1 offline validator
+# NootedRed NRPT v3 offline validator
 #
-# Independent, host-side simulation of the NootedRedUserPatch page-matching engine.
-# Normative contract: docs/PatchProfile-Spec.md (NRPT v1, frozen 2026-10-29), sections
-# 1-13 in particular. This file is intentionally an independent implementation (Python,
-# stdlib only) of the same algorithm the kext must execute, so that a generator bug
-# cannot "validate itself" against the Swift reference codec.
+# Independent, host-side simulation of the NootedRedUserPatch hook-only page/range engine.
+# Normative contract: docs/PatchProfile-Spec.md (NRPT v3, frozen 2026-10-29).
 #
 # What it does:
-#   1. Strictly decodes an NRPT v1 profile (all E001..E032 rules, stable error codes).
-#   2. Resolves every page record against a CLEAN fixture (real macOS tree via --fixtures,
-#      or a synthetic tree in the unit tests) by locating the exact 4 KiB window whose
-#      FNV-1a-64 equals pageHash. Apple binaries are read in place, never copied.
-#   3. Simulates the kext matching algorithm EXACTLY (spec section 8): per-page offset gate,
-#      full-page FNV-1a-64 hash gate, all site finds, replace writes, applied-once bitmap,
-#      first-matching-record authoritative / no try-next-record after a site mismatch.
-#   4. Reports per page and per site: identity results, find matches, bytes written,
-#      resulting page hash, and false-positive checks for unintended fixture pages.
-#   5. Rejects false positives and any partial application (atomic per page).
+#   1. Strictly decodes one NRPT v3 profile (all E001..E041 rules) and/or an `NRedProfiles`
+#      bundle (E050..E053), and selects exactly one profile for the target identity.
+#   2. Applies the profile to a CLEAN fixture (extracted macOS tree) with the exact hook
+#      semantics: mode routing (PAGE via _cs_validate_page, DYLD via _cs_validate_range),
+#      optional vnode-name gate, full-page FNV-1a-64 + all site finds identity (no offset
+#      identity), atomic writes, applied-once, and the already-patched pass.
+#   3. Re-resolves each record's target image/page evidence against the fixture (image kind,
+#      path, __TEXT geometry, subcache mapping, pageVmOffset/pageFileOffset consistency) and
+#      verifies the clean page content.
+#   4. Reports per-page/per-site results, false-positive/duplicate-content findings, route
+#      simulations, mutation rejection and bundle selection.
 #
 # Usage:
-#   python3 test/nrpt_validator.py --profile <profile.nrpt> --fixtures / \
-#       --expected-build 24H232 --device-id 0x1638 --report build/validation-report.json
+#   python3 test/nrpt_validator.py --profile <profile.nrpt> --fixtures version-fixtures/15.8.2 \
+#       --expected-build 24H232 --device-id 0x1638 --report build/report.json --mutation-sweep
+#   python3 test/nrpt_validator.py --bundle-plist <NRedProfiles.plist> --fixtures ... \
+#       --expected-build 24H232 --device-id 0x1638 --report build/report.json
 #
-# Exit code: 0 = PASS (deployable), 1 = FAIL, 2 = usage/IO error.
+# Exit: 0 = PASS (deployable), 1 = FAIL, 2 = usage/IO error.
 #
-# No Apple binaries are embedded or required at test time; synthetic fixtures are generated
-# by test/test_nrpt_validator.py. The full-cache hash scan uses an optional native helper
-# (test/hash_scan.c, compiled on demand with clang) because pure-Python FNV-1a over a multi-GB
-# dyld shared cache is too slow; a pure-Python fallback keeps the tool dependency-free.
+# No Apple binaries are embedded or checked in; the fixture images are read in place.
 
 from __future__ import annotations
 
@@ -39,82 +36,27 @@ import json
 import os
 import plistlib
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Iterator, Optional, Sequence
+from typing import Callable, Optional, Sequence
 
-__version__ = "1.0"
+__version__ = "3.0"
 
 # ---------------------------------------------------------------------------
-# NRPT v1 constants (docs/PatchProfile-Spec.md sections 2-7)
+# NRPT v3 constants (docs/PatchProfile-Spec.md sections 1-8)
 # ---------------------------------------------------------------------------
 
 MAGIC = b"NRPT"
-VERSION = 1  # default/back-compat alias; see VERSION_V1/VERSION_V2
-VERSION_V1 = 1
-VERSION_V2 = 2
+VERSION = 3
 HEADER_SIZE = 64
-PAGE_RECORD_SIZE = 24  # v1
-PAGE_RECORD_SIZE_V1 = 24
-PAGE_RECORD_SIZE_V2 = 32
+PAGE_RECORD_SIZE = 32
 SITE_RECORD_SIZE = 40
+IMAGE_ENTRY_HEADER_SIZE = 16
 PAGE_SIZE = 4096
-BUILD_FIELD_SIZE = 16
-MAX_BUILD_BYTES = 15
-MAX_PROFILE_SIZE = 64 * 1024
-MAX_PAGES = 256
-MAX_SITES = 1024
-MAX_SITES_PER_PAGE = 64
-MAX_SITE_PATCH_SIZE = 16
-KNOWN_APU_MASK = 0x3F
 
-HEADER_FLAG_REQUIRE_DEVICE_ID = 0x0001
-KNOWN_HEADER_FLAGS = HEADER_FLAG_REQUIRE_DEVICE_ID
-
-MATCH_REQUIRE_OFFSET = 0x0001
-MATCH_REQUIRE_HASH = 0x0002
-MATCH_REQUIRE_SITES = 0x0004
-KNOWN_MATCH_FLAGS = 0x0007
-REQUIRED_MATCH_FLAGS = MATCH_REQUIRE_HASH | MATCH_REQUIRE_SITES
-DEFAULT_MATCH_FLAGS = MATCH_REQUIRE_OFFSET | MATCH_REQUIRE_HASH | MATCH_REQUIRE_SITES
-
-# NRPT v2 target-image metadata (spec section 0).
-H_IMAGE_COUNT = 52
-H_IMAGE_TABLE_SIZE = 54
-H_RESERVED_V2 = 58
-H_RESERVED_V2_SIZE = 6
-MAX_IMAGES = 16
-MAX_IMAGE_PATH_LENGTH = 200
-IMAGE_ENTRY_HEADER_SIZE = 20
-MAX_SEGMENTS_PER_IMAGE = 16
-MAX_SECTIONS_PER_IMAGE = 16
-SEGMENT_NAME_SIZE = 16
-SECTION_NAME_SIZE = 16
-MAX_IMAGE_VM_SIZE = 0xFFFFF000
-IMAGE_KIND_STANDALONE = 0
-IMAGE_KIND_SHARED_CACHE = 1
-IMAGE_FLAG_SUFFIX_MATCH = 0x01
-KNOWN_IMAGE_FLAGS = IMAGE_FLAG_SUFFIX_MATCH
-
-
-def round_up4(value: int) -> int:
-    return (value + 3) & ~3
-
-
-MAX_IMAGE_TABLE_SIZE = MAX_IMAGES * (
-    IMAGE_ENTRY_HEADER_SIZE
-    + round_up4(MAX_IMAGE_PATH_LENGTH + 1)
-    + MAX_SEGMENTS_PER_IMAGE * SEGMENT_NAME_SIZE
-    + MAX_SECTIONS_PER_IMAGE * SECTION_NAME_SIZE
-)
-
-BUILD_ALPHABET = frozenset(
-    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-"
-)
-
-# Header field offsets (spec section 3).
 H_MAGIC = 0
 H_VERSION = 4
 H_HEADER_SIZE = 6
@@ -126,27 +68,50 @@ H_SITE_COUNT = 34
 H_PAGE_TABLE_SIZE = 36
 H_SITE_TABLE_SIZE = 40
 H_PAYLOAD_CHECKSUM = 44
-H_FLAGS = 48
-H_RESERVED = 52
-H_RESERVED_SIZE = 12
+H_RESERVED0 = 48
+H_IMAGE_COUNT = 52
+H_IMAGE_TABLE_SIZE = 54
+H_RESERVED1 = 58
+H_RESERVED1_SIZE = 6
 
-# APU family masks (spec section 3.2).
-APU_RAVEN = 1 << 0
-APU_RAVEN2 = 1 << 1
-APU_PICASSO = 1 << 2
-APU_RENOIR = 1 << 3
-APU_RENOIR_E = 1 << 4
-APU_GREEN_SARDINE = 1 << 5
+P_PAGE_FILE_OFFSET = 0
+P_PAGE_HASH = 8
+P_FIRST_SITE = 16
+P_SITE_COUNT = 20
+P_MODE = 22
+P_FLAGS = 23
+P_IMAGE_INDEX = 24
+P_RESERVED = 26
+P_PAGE_VM_OFFSET = 28
 
-# PCI device ID -> candidate APU family mask (spec section 3.2, mainline selectPatchSet rule).
-DEVICE_CANDIDATE_MASK = {
-    0x15DD: APU_RAVEN,
-    0x15D8: APU_RAVEN2 | APU_PICASSO,
-    0x1636: APU_RENOIR | APU_RENOIR_E,
-    0x164C: APU_RENOIR | APU_RENOIR_E,
-    0x15E7: APU_RENOIR | APU_GREEN_SARDINE,
-    0x1638: APU_RENOIR | APU_GREEN_SARDINE,
-}
+MAX_PROFILE_SIZE = 64 * 1024
+MAX_PAGES = 256
+MAX_SITES = 1024
+MAX_SITES_PER_PAGE = 64
+MAX_SITE_PATCH_SIZE = 16
+MAX_IMAGES = 16
+MAX_IMAGE_PATH_LENGTH = 200
+MAX_IMAGE_VM_SIZE = 0xFFFFF000
+MAX_IMAGE_TABLE_SIZE = 16 * (16 + 204)  # 3520
+MAX_BUNDLE_ENTRIES = 16
+KNOWN_APU_MASK = 0x3F
+BUILD_FIELD_SIZE = 16
+MAX_BUILD_BYTES = 15
+BUILD_ALPHABET = frozenset(
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-"
+)
+
+MODE_PAGE = 1
+MODE_DYLD = 2
+MODE_RESOLVER = 3
+MODE_NAMES = {MODE_PAGE: "PAGE", MODE_DYLD: "DYLD", MODE_RESOLVER: "RESOLVER"}
+
+IMAGE_KIND_STANDALONE = 0
+IMAGE_KIND_SHARED_CACHE = 1
+IMAGE_KIND_NAMES = {IMAGE_KIND_STANDALONE: "standalone-file", IMAGE_KIND_SHARED_CACHE: "dyld-shared-cache"}
+
+BUNDLE_ROOT_KEY = "NRedProfiles"
+BUNDLE_ENTRY_KEYS = ("Build", "APUMask", "DeviceID", "Profile")
 
 ERROR_NAMES = {
     "E001": "truncated",
@@ -156,8 +121,8 @@ ERROR_NAMES = {
     "E005": "invalidBuild",
     "E006": "invalidApuMask",
     "E007": "invalidDeviceID",
-    "E008": "unsupportedHeaderFlags",
-    "E009": "headerReservedNotZero",
+    "E008": "reservedHeaderFieldNotZero",
+    "E009": "reservedHeaderBytesNotZero",
     "E010": "profileTooLarge",
     "E011": "pageTableSizeMismatch",
     "E012": "siteTableSizeMismatch",
@@ -165,9 +130,9 @@ ERROR_NAMES = {
     "E014": "payloadChecksumMismatch",
     "E015": "pageCountOutOfRange",
     "E016": "siteCountOutOfRange",
-    "E017": "pageOffsetMisaligned",
-    "E018": "unsupportedPageMatchFlags",
-    "E019": "requiredPageMatchFlagMissing",
+    "E017": "pageFileOffsetMisaligned",
+    "E018": "unsupportedPageMode",
+    "E019": "pageModeImageKindMismatch",
     "E020": "pageSiteRangeInvalid",
     "E021": "nonCanonicalSiteRange",
     "E022": "siteCountSumMismatch",
@@ -181,8 +146,7 @@ ERROR_NAMES = {
     "E030": "overlappingSiteWrites",
     "E031": "duplicatePageIdentity",
     "E032": "emptyProfile",
-    "E033": "invalidPageHashInput",  # codec-level helper (pageHash length)
-    # NRPT v2 target-image metadata (spec section 0.5).
+    "E033": "invalidPageSize",
     "E034": "invalidImageCount",
     "E035": "invalidImageEntry",
     "E036": "imageTableSizeMismatch",
@@ -191,11 +155,25 @@ ERROR_NAMES = {
     "E039": "duplicateImagePath",
     "E040": "invalidPageVmOffset",
     "E041": "invalidImageGeometry",
+    "E050": "bundleCountOutOfRange",
+    "E051": "duplicateBundleBuild",
+    "E052": "bundleEntryProfileMismatch",
+    "E053": "invalidBundleEntry",
+}
+
+# PCI device ID -> candidate APU family mask (spec section 3.2).
+DEVICE_CANDIDATE_MASK = {
+    0x15DD: 1 << 0,
+    0x15D8: (1 << 1) | (1 << 2),
+    0x1636: (1 << 3) | (1 << 4),
+    0x164C: (1 << 3) | (1 << 4),
+    0x15E7: (1 << 3) | (1 << 5),
+    0x1638: (1 << 3) | (1 << 5),
 }
 
 
 class NRPTCodecError(Exception):
-    """Stable NRPT v1 validation error (spec section 11)."""
+    """Stable NRPT v3 validation error."""
 
     def __init__(self, code: str, detail: str = "") -> None:
         if code not in ERROR_NAMES:
@@ -210,7 +188,7 @@ class NRPTCodecError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Small integer helpers
+# Integer / hash helpers
 # ---------------------------------------------------------------------------
 
 
@@ -238,13 +216,11 @@ def _p64(value: int) -> bytes:
     return int(value).to_bytes(8, "little")
 
 
-# ---------------------------------------------------------------------------
-# Hash functions (spec section 1.1)
-# ---------------------------------------------------------------------------
+def round_up4(value: int) -> int:
+    return (value + 3) & ~3
 
 
 def fnv1a32(data: bytes) -> int:
-    """Standard FNV-1a 32-bit."""
     value = 0x811C9DC5
     for byte in data:
         value = ((value ^ byte) * 0x01000193) & 0xFFFFFFFF
@@ -252,7 +228,6 @@ def fnv1a32(data: bytes) -> int:
 
 
 def fnv1a64(data: bytes) -> int:
-    """Standard FNV-1a 64-bit."""
     value = 0xCBF29CE484222325
     for byte in data:
         value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
@@ -260,16 +235,13 @@ def fnv1a64(data: bytes) -> int:
 
 
 def page_hash(page: bytes) -> int:
-    """FNV-1a-64 over exactly one 4 KiB page (spec section 1.1 / 4)."""
     if len(page) != PAGE_SIZE:
-        raise NRPTCodecError(
-            "E033", f"pageHash input must be exactly {PAGE_SIZE} bytes, got {len(page)}"
-        )
+        raise NRPTCodecError("E033", f"pageHash input must be exactly {PAGE_SIZE} bytes")
     return fnv1a64(page)
 
 
 # ---------------------------------------------------------------------------
-# Model (mirrors ProfileCodec.swift types)
+# Model
 # ---------------------------------------------------------------------------
 
 
@@ -281,48 +253,16 @@ class Site:
     flags: int = 0
 
     @property
-    def find_size(self) -> int:
+    def size(self) -> int:
         return len(self.find)
-
-    @property
-    def replace_size(self) -> int:
-        return len(self.replace)
-
-
-@dataclass
-class Page:
-    page_file_offset: int
-    page_hash: int
-    match_flags: int
-    sites: list[Site] = field(default_factory=list)
-    # NRPT v2 target-image metadata (ignored for v1 profiles).
-    image_index: int = 0
-    page_vm_offset: int = 0
-
-
-@dataclass
-class Header:
-    build: str
-    apu_mask: int
-    device_id: int
-    flags: int = 0
-    version: int = VERSION_V1
-    # Derived v2 header metadata (not part of model equality; decoded profiles expose it for reports).
-    image_count: int = field(default=0, compare=False)
-    image_table_size: int = field(default=0, compare=False)
 
 
 @dataclass
 class Image:
-    """NRPT v2 target-image table entry (spec section 0.4)."""
-
     kind: int
     path: str
     unslid_vmaddr: int
     vm_size: int
-    segments: list[str] = field(default_factory=list)
-    sections: list[str] = field(default_factory=list)
-    flags: int = IMAGE_FLAG_SUFFIX_MATCH
 
     @property
     def path_bytes(self) -> bytes:
@@ -330,20 +270,35 @@ class Image:
 
     @property
     def entry_size(self) -> int:
-        return (
-            IMAGE_ENTRY_HEADER_SIZE
-            + round_up4(len(self.path_bytes) + 1)
-            + len(self.segments) * SEGMENT_NAME_SIZE
-            + len(self.sections) * SECTION_NAME_SIZE
-        )
+        return IMAGE_ENTRY_HEADER_SIZE + round_up4(len(self.path_bytes) + 1)
+
+    @property
+    def basename(self) -> str:
+        return self.path.rsplit("/", 1)[-1]
+
+
+@dataclass
+class Page:
+    page_file_offset: int
+    page_hash: int
+    mode: int
+    image_index: int
+    page_vm_offset: int
+    sites: list[Site] = field(default_factory=list)
+
+
+@dataclass
+class Header:
+    build: str
+    apu_mask: int
+    device_id: int
 
 
 @dataclass
 class Profile:
     header: Header
-    pages: list[Page] = field(default_factory=list)
-    version: int = VERSION_V1
     images: list[Image] = field(default_factory=list)
+    pages: list[Page] = field(default_factory=list)
 
     @property
     def page_count(self) -> int:
@@ -354,20 +309,14 @@ class Profile:
         return sum(len(page.sites) for page in self.pages)
 
     @property
-    def page_record_size(self) -> int:
-        return PAGE_RECORD_SIZE_V2 if self.version == VERSION_V2 else PAGE_RECORD_SIZE_V1
-
-    @property
     def image_table_size(self) -> int:
-        if self.version != VERSION_V2:
-            return 0
         return sum(image.entry_size for image in self.images)
 
     @property
     def encoded_size(self) -> int:
         return (
             HEADER_SIZE
-            + self.page_count * self.page_record_size
+            + self.page_count * PAGE_RECORD_SIZE
             + self.site_count * SITE_RECORD_SIZE
             + self.image_table_size
         )
@@ -380,8 +329,8 @@ class Profile:
 
 def encode_build_field(build: str) -> bytes:
     raw = build.encode("utf-8")
-    if len(raw) < 1 or len(raw) > MAX_BUILD_BYTES:
-        raise NRPTCodecError("E005", f"build must be 1..{MAX_BUILD_BYTES} bytes, got {len(raw)}")
+    if not 1 <= len(raw) <= MAX_BUILD_BYTES:
+        raise NRPTCodecError("E005", f"build must be 1..{MAX_BUILD_BYTES} bytes")
     if any(byte not in BUILD_ALPHABET for byte in raw):
         raise NRPTCodecError("E005", f"build contains a forbidden character: {build!r}")
     return raw + b"\x00" * (BUILD_FIELD_SIZE - len(raw))
@@ -389,14 +338,14 @@ def encode_build_field(build: str) -> bytes:
 
 def decode_build_field(field: bytes) -> str:
     if len(field) != BUILD_FIELD_SIZE:
-        raise NRPTCodecError("E005", f"build field must be {BUILD_FIELD_SIZE} bytes")
+        raise NRPTCodecError("E005", "build field must be 16 bytes")
     nul = field.find(b"\x00")
     if nul < 0:
         raise NRPTCodecError("E005", "build field has no NUL terminator")
     if nul < 1 or nul > MAX_BUILD_BYTES:
         raise NRPTCodecError("E005", f"build string must be 1..{MAX_BUILD_BYTES} bytes")
     if any(byte != 0 for byte in field[nul:]):
-        raise NRPTCodecError("E005", "build field has non-zero bytes after the NUL terminator")
+        raise NRPTCodecError("E005", "build field has non-zero bytes after the NUL")
     raw = field[:nul]
     if any(byte not in BUILD_ALPHABET for byte in raw):
         raise NRPTCodecError("E005", f"build contains a forbidden character: {raw!r}")
@@ -404,45 +353,33 @@ def decode_build_field(field: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Model validation (spec sections 3-7; mirrors ProfileCodec.validate order)
+# Profile model validation (spec sections 3-7)
 # ---------------------------------------------------------------------------
 
 
-def _is_allowed_image_path_byte(byte: int) -> bool:
+def _is_printable(byte: int) -> bool:
     return 0x20 <= byte <= 0x7E
 
 
 def validate_image_path(path: str, context: str = "image") -> None:
-    """Spec section 0.4: absolute canonical path, 1...200 printable ASCII bytes."""
     raw = path.encode("utf-8")
     if not 1 <= len(raw) <= MAX_IMAGE_PATH_LENGTH:
         raise NRPTCodecError("E037", f"{context}: path length {len(raw)}")
     if not raw.startswith(b"/"):
         raise NRPTCodecError("E037", f"{context}: path is not absolute")
-    if not all(_is_allowed_image_path_byte(byte) for byte in raw):
-        raise NRPTCodecError("E037", f"{context}: path has a non-printable byte")
+    if not all(_is_printable(byte) for byte in raw):
+        raise NRPTCodecError("E037", f"{context}: non-printable path byte")
 
 
-def is_valid_fixed_name(raw: bytes, capacity: int) -> bool:
-    """A 16-byte NUL-padded, 1...15 printable-ASCII unique image/segment/section name."""
-    if len(raw) != capacity:
-        return False
-    nul = raw.find(b"\x00")
-    if nul < 1 or nul > capacity - 1:
-        return False
-    if any(byte != 0 for byte in raw[nul:]):
-        return False
-    return all(_is_allowed_image_path_byte(byte) for byte in raw[:nul])
-
-
-def validate_image_name_model(name: str, capacity: int, context: str) -> None:
-    raw = name.encode("utf-8")
-    if not is_valid_fixed_name(raw.ljust(capacity, b"\x00"), capacity):
-        raise NRPTCodecError("E038", f"{context}: invalid name {name!r}")
+def validate_header_model(header: Header) -> None:
+    encode_build_field(header.build)
+    if header.apu_mask == 0 or (header.apu_mask & ~KNOWN_APU_MASK) != 0:
+        raise NRPTCodecError("E006", f"apuMask=0x{header.apu_mask:08X}")
+    if header.device_id > 0xFFFF:
+        raise NRPTCodecError("E007", f"deviceID=0x{header.device_id:08X}")
 
 
 def validate_images_model(profile: Profile) -> None:
-    """NRPT v2 image-table model rules (spec sections 0.4 and 0.5)."""
     if not 1 <= len(profile.images) <= MAX_IMAGES:
         raise NRPTCodecError("E034", f"imageCount={len(profile.images)}")
     if profile.image_table_size > MAX_IMAGE_TABLE_SIZE:
@@ -450,26 +387,8 @@ def validate_images_model(profile: Profile) -> None:
     for image_index, image in enumerate(profile.images):
         context = f"image[{image_index}]"
         if image.kind not in (IMAGE_KIND_STANDALONE, IMAGE_KIND_SHARED_CACHE):
-            raise NRPTCodecError("E035", f"{context}: kind={image.kind}")
-        if (image.flags & ~KNOWN_IMAGE_FLAGS) != 0 or (image.flags & IMAGE_FLAG_SUFFIX_MATCH) == 0:
-            raise NRPTCodecError("E035", f"{context}: flags=0x{image.flags:02X}")
+            raise NRPTCodecError("E041", f"{context}: kind={image.kind}")
         validate_image_path(image.path, context)
-        if not 1 <= len(image.segments) <= MAX_SEGMENTS_PER_IMAGE:
-            raise NRPTCodecError("E035", f"{context}: segmentCount={len(image.segments)}")
-        if not 0 <= len(image.sections) <= MAX_SECTIONS_PER_IMAGE:
-            raise NRPTCodecError("E035", f"{context}: sectionCount={len(image.sections)}")
-        seen: set[str] = set()
-        for name in image.segments:
-            validate_image_name_model(name, SEGMENT_NAME_SIZE, context + " segment")
-            if name in seen:
-                raise NRPTCodecError("E038", f"{context}: duplicate segment name {name!r}")
-            seen.add(name)
-        seen.clear()
-        for name in image.sections:
-            validate_image_name_model(name, SECTION_NAME_SIZE, context + " section")
-            if name in seen:
-                raise NRPTCodecError("E038", f"{context}: duplicate section name {name!r}")
-            seen.add(name)
         if not 0 < image.vm_size <= MAX_IMAGE_VM_SIZE:
             raise NRPTCodecError("E041", f"{context}: imageVmSize={image.vm_size}")
         if image.kind == IMAGE_KIND_SHARED_CACHE and image.unslid_vmaddr == 0:
@@ -480,28 +399,8 @@ def validate_images_model(profile: Profile) -> None:
                 raise NRPTCodecError("E039", f"{context} duplicates image[{other_index}]")
 
 
-def validate_header_model(header: Header) -> None:
-    encode_build_field(header.build)  # E005
-    if header.apu_mask == 0 or (header.apu_mask & ~KNOWN_APU_MASK) != 0:
-        raise NRPTCodecError("E006", f"apuMask=0x{header.apu_mask:08X}")
-    if header.flags & HEADER_FLAG_REQUIRE_DEVICE_ID:
-        if not 1 <= header.device_id <= 0xFFFF:
-            raise NRPTCodecError(
-                "E007", f"deviceID=0x{header.device_id:08X} invalid with REQUIRE_DEVICE_ID"
-            )
-    else:
-        if header.device_id != 0:
-            raise NRPTCodecError(
-                "E007", f"deviceID=0x{header.device_id:08X} non-zero without REQUIRE_DEVICE_ID"
-            )
-    if (header.flags & ~KNOWN_HEADER_FLAGS) != 0:
-        raise NRPTCodecError("E008", f"header flags=0x{header.flags:08X}")
-
-
 def validate_model(profile: Profile) -> None:
-    """All model-level rules; raises the first violation (spec section 11 codes)."""
-    if profile.version not in (VERSION_V1, VERSION_V2):
-        raise NRPTCodecError("E003", f"version={profile.version}")
+    """All model-level rules; raises the first violation with its stable v3 code."""
     validate_header_model(profile.header)
 
     if not profile.pages:
@@ -513,60 +412,51 @@ def validate_model(profile: Profile) -> None:
         raise NRPTCodecError("E016", f"siteCount={total_sites}")
     if total_sites < 1:
         raise NRPTCodecError("E016", f"siteCount={total_sites}")
-    if profile.version == VERSION_V2:
-        validate_images_model(profile)
+    validate_images_model(profile)
     if profile.encoded_size > MAX_PROFILE_SIZE:
         raise NRPTCodecError("E010", f"encoded size {profile.encoded_size}")
 
     global_site_index = 0
     for page_index, page in enumerate(profile.pages):
         if (page.page_file_offset & 0x0FFF) != 0:
+            raise NRPTCodecError("E017", f"page[{page_index}] pageFileOffset not 4 KiB aligned")
+        if page.mode not in (MODE_PAGE, MODE_DYLD):
+            raise NRPTCodecError("E018", f"page[{page_index}] mode={page.mode}")
+        if not 0 <= page.image_index < len(profile.images):
             raise NRPTCodecError(
-                "E017",
-                f"page[{page_index}] pageFileOffset=0x{page.page_file_offset:X} is not 4 KiB aligned",
+                "E038", f"page[{page_index}] imageIndex={page.image_index} imageCount={len(profile.images)}"
             )
-        if (page.match_flags & ~KNOWN_MATCH_FLAGS) != 0:
-            raise NRPTCodecError(
-                "E018", f"page[{page_index}] matchFlags=0x{page.match_flags:04X}"
-            )
-        if (page.match_flags & REQUIRED_MATCH_FLAGS) != REQUIRED_MATCH_FLAGS:
-            raise NRPTCodecError(
-                "E019", f"page[{page_index}] matchFlags=0x{page.match_flags:04X}"
-            )
+        image = profile.images[page.image_index]
+        if page.mode == MODE_PAGE and image.kind != IMAGE_KIND_STANDALONE:
+            raise NRPTCodecError("E019", f"page[{page_index}] PAGE mode with cache image kind")
+        if page.mode == MODE_DYLD and image.kind != IMAGE_KIND_SHARED_CACHE:
+            raise NRPTCodecError("E019", f"page[{page_index}] DYLD mode with standalone image kind")
         if not 1 <= len(page.sites) <= MAX_SITES_PER_PAGE:
             raise NRPTCodecError(
                 "E023", f"page[{page_index}] siteCount={len(page.sites)} (allowed 1..{MAX_SITES_PER_PAGE})"
             )
-        if profile.version == VERSION_V2:
-            if not 0 <= page.image_index < len(profile.images):
-                raise NRPTCodecError(
-                    "E038", f"page[{page_index}] imageIndex={page.image_index} imageCount={len(profile.images)}"
-                )
-            target_image = profile.images[page.image_index]
-            if (page.page_vm_offset & 0x0FFF) != 0 or page.page_vm_offset + PAGE_SIZE > target_image.vm_size:
-                raise NRPTCodecError(
-                    "E040",
-                    f"page[{page_index}] pageVmOffset=0x{page.page_vm_offset:X} imageVmSize=0x{target_image.vm_size:X}",
-                )
+        if (page.page_vm_offset & 0x0FFF) != 0 or page.page_vm_offset + PAGE_SIZE > image.vm_size:
+            raise NRPTCodecError(
+                "E040",
+                f"page[{page_index}] pageVmOffset=0x{page.page_vm_offset:X} imageVmSize=0x{image.vm_size:X}",
+            )
 
         writes: list[tuple[int, int, int]] = []
         for local_index, site in enumerate(page.sites):
             site_index = global_site_index + local_index
-            find_size = site.find_size
-            replace_size = site.replace_size
+            find_size = len(site.find)
+            replace_size = len(site.replace)
             if not 1 <= find_size <= MAX_SITE_PATCH_SIZE or not 1 <= replace_size <= MAX_SITE_PATCH_SIZE:
                 raise NRPTCodecError(
-                    "E024",
-                    f"site[{site_index}] findSize={find_size} replaceSize={replace_size}",
+                    "E024", f"site[{site_index}] findSize={find_size} replaceSize={replace_size}"
                 )
             if find_size != replace_size:
                 raise NRPTCodecError(
                     "E025", f"site[{site_index}] findSize={find_size} replaceSize={replace_size}"
                 )
-            if site.site_in_page + find_size > PAGE_SIZE or site.site_in_page + replace_size > PAGE_SIZE:
+            if site.site_in_page + find_size > PAGE_SIZE:
                 raise NRPTCodecError(
-                    "E026",
-                    f"site[{site_index}] siteInPage=0x{site.site_in_page:X} size={find_size}",
+                    "E026", f"site[{site_index}] siteInPage=0x{site.site_in_page:X} size={find_size}"
                 )
             if site.find == site.replace:
                 raise NRPTCodecError("E028", f"site[{site_index}] find equals replace")
@@ -577,233 +467,197 @@ def validate_model(profile: Profile) -> None:
         ordered = sorted(writes)
         for previous, current in zip(ordered, ordered[1:]):
             if current[0] < previous[1]:
-                raise NRPTCodecError(
-                    "E030",
-                    f"page[{page_index}] sites {previous[2]} and {current[2]} overlap "
-                    f"[0x{previous[0]:X},0x{previous[1]:X}) / [0x{current[0]:X},0x{current[1]:X})",
-                )
-
+                raise NRPTCodecError("E030", f"page[{page_index}] overlapping site writes")
         global_site_index += len(page.sites)
 
-    # Identity uniqueness (spec section 6 rule 5).
+    # Duplicate page identity: same pageHash in the same mode is invalid (spec 6.3).
     for page_index in range(len(profile.pages)):
         page = profile.pages[page_index]
         for other_index in range(page_index):
             other = profile.pages[other_index]
-            if page.page_hash != other.page_hash:
-                continue
-            both_require_offset = (
-                (page.match_flags & MATCH_REQUIRE_OFFSET) != 0
-                and (other.match_flags & MATCH_REQUIRE_OFFSET) != 0
-            )
-            if page.page_file_offset == other.page_file_offset or not both_require_offset:
+            if page.mode == other.mode and page.page_hash == other.page_hash:
                 raise NRPTCodecError(
                     "E031",
-                    f"page[{page_index}] duplicates the identity of page[{other_index}] "
-                    f"(hash=0x{page.page_hash:016X})",
+                    f"page[{page_index}] duplicates page[{other_index}] identity in mode {MODE_NAMES[page.mode]}",
                 )
 
 
 # ---------------------------------------------------------------------------
-# Decode (spec sections 2-7 and 11; mirrors ProfileCodec.decode order)
+# Canonical encoder
 # ---------------------------------------------------------------------------
 
 
-def _parse_image_table(
-    data: bytes, base: int, image_count: int, image_table_size: int
-) -> list[Image]:
-    """NRPT v2 image table (spec section 0.4); raises the stable E034-E041 codes."""
+def encode(profile: Profile) -> bytes:
+    """Canonical NRPT v3 encoder; derives counts, table sizes and the payload checksum."""
+    validate_model(profile)
+
+    page_table = bytearray()
+    site_table = bytearray()
+    first_site = 0
+    for page in profile.pages:
+        page_table += _p64(page.page_file_offset)
+        page_table += _p64(page.page_hash)
+        page_table += _p32(first_site)
+        page_table += _p16(len(page.sites))
+        page_table += bytes((page.mode, 0))
+        page_table += _p16(page.image_index)
+        page_table += _p16(0)
+        page_table += _p32(page.page_vm_offset)
+        first_site += len(page.sites)
+
+        for site in page.sites:
+            find_size = len(site.find)
+            replace_size = len(site.replace)
+            site_table += _p16(site.site_in_page)
+            site_table += bytes((find_size, replace_size))
+            site_table += site.find + b"\x00" * (MAX_SITE_PATCH_SIZE - find_size)
+            site_table += site.replace + b"\x00" * (MAX_SITE_PATCH_SIZE - replace_size)
+            site_table += _p32(site.flags)
+
+    image_table = bytearray()
+    for image in profile.images:
+        path = image.path_bytes
+        image_table += bytes((image.kind, 0))
+        image_table += _p16(len(path))
+        image_table += _p64(image.unslid_vmaddr)
+        image_table += _p32(image.vm_size)
+        image_table += path + b"\x00" * (round_up4(len(path) + 1) - len(path))
+
+    payload = bytes(page_table) + bytes(site_table) + bytes(image_table)
+    output = bytearray()
+    output += MAGIC
+    output += _p16(VERSION)
+    output += _p16(HEADER_SIZE)
+    output += encode_build_field(profile.header.build)
+    output += _p32(profile.header.apu_mask)
+    output += _p32(profile.header.device_id)
+    output += _p16(len(profile.pages))
+    output += _p16(first_site)
+    output += _p32(len(page_table))
+    output += _p32(len(site_table))
+    output += _p32(fnv1a32(payload))
+    output += _p32(0)  # reserved0
+    output += _p16(len(profile.images))
+    output += _p32(len(image_table))
+    output += b"\x00" * H_RESERVED1_SIZE
+    output += payload
+    if len(output) != profile.encoded_size:
+        raise NRPTCodecError("E013", "encoder produced an inconsistent size")
+    return bytes(output)
+
+
+# ---------------------------------------------------------------------------
+# Strict decoder
+# ---------------------------------------------------------------------------
+
+
+def _parse_image_table(data: bytes, base: int, image_count: int, image_table_size: int) -> list[Image]:
     cursor = base
     end = base + image_table_size
     if end > len(data):
-        raise NRPTCodecError("E035", f"image table extends past profile ({image_table_size} bytes)")
+        raise NRPTCodecError("E035", "image table extends past the profile")
     images: list[Image] = []
     for image_index in range(image_count):
         if end - cursor < IMAGE_ENTRY_HEADER_SIZE:
             raise NRPTCodecError("E035", f"image[{image_index}]: truncated entry header")
         kind = data[cursor]
-        flags = data[cursor + 1]
+        reserved = data[cursor + 1]
         path_length = _u16(data, cursor + 2)
         unslid_vmaddr = _u64(data, cursor + 4)
         vm_size = _u32(data, cursor + 12)
-        segment_count = data[cursor + 16]
-        section_count = data[cursor + 17]
-        reserved = _u16(data, cursor + 18)
-
         if (
             reserved != 0
-            or (flags & ~KNOWN_IMAGE_FLAGS) != 0
-            or (flags & IMAGE_FLAG_SUFFIX_MATCH) == 0
             or kind not in (IMAGE_KIND_STANDALONE, IMAGE_KIND_SHARED_CACHE)
             or not 1 <= path_length <= MAX_IMAGE_PATH_LENGTH
-            or not 1 <= segment_count <= MAX_SEGMENTS_PER_IMAGE
-            or section_count > MAX_SECTIONS_PER_IMAGE
         ):
             raise NRPTCodecError("E035", f"image[{image_index}]: invalid entry header")
-
-        path_field_size = round_up4(path_length + 1)
-        entry_size = (
-            IMAGE_ENTRY_HEADER_SIZE
-            + path_field_size
-            + segment_count * SEGMENT_NAME_SIZE
-            + section_count * SECTION_NAME_SIZE
-        )
+        entry_size = IMAGE_ENTRY_HEADER_SIZE + round_up4(path_length + 1)
         if end - cursor < entry_size:
             raise NRPTCodecError("E035", f"image[{image_index}]: entry exceeds image table")
-
         path_base = cursor + IMAGE_ENTRY_HEADER_SIZE
         if data[path_base + path_length] != 0 or data[path_base] != ord("/"):
             raise NRPTCodecError("E037", f"image[{image_index}]: path is not NUL-terminated absolute")
         for index in range(path_length):
-            if not _is_allowed_image_path_byte(data[path_base + index]):
+            if not _is_printable(data[path_base + index]):
                 raise NRPTCodecError("E037", f"image[{image_index}]: non-printable path byte")
-        for index in range(path_length + 1, path_field_size):
+        for index in range(path_length + 1, round_up4(path_length + 1)):
             if data[path_base + index] != 0:
                 raise NRPTCodecError("E035", f"image[{image_index}]: path padding not zero")
         path = data[path_base : path_base + path_length].decode("ascii")
-
-        names = path_base + path_field_size
-        segments: list[str] = []
-        seen_segments: set[str] = set()
-        for segment in range(segment_count):
-            raw = data[names + segment * SEGMENT_NAME_SIZE : names + (segment + 1) * SEGMENT_NAME_SIZE]
-            if not is_valid_fixed_name(raw, SEGMENT_NAME_SIZE):
-                raise NRPTCodecError("E038", f"image[{image_index}]: invalid segment name")
-            name = raw.split(b"\x00", 1)[0].decode("ascii")
-            if name in seen_segments:
-                raise NRPTCodecError("E038", f"image[{image_index}]: duplicate segment name {name!r}")
-            seen_segments.add(name)
-            segments.append(name)
-        names += segment_count * SEGMENT_NAME_SIZE
-        sections: list[str] = []
-        seen_sections: set[str] = set()
-        for section in range(section_count):
-            raw = data[names + section * SECTION_NAME_SIZE : names + (section + 1) * SECTION_NAME_SIZE]
-            if not is_valid_fixed_name(raw, SECTION_NAME_SIZE):
-                raise NRPTCodecError("E038", f"image[{image_index}]: invalid section name")
-            name = raw.split(b"\x00", 1)[0].decode("ascii")
-            if name in seen_sections:
-                raise NRPTCodecError("E038", f"image[{image_index}]: duplicate section name {name!r}")
-            seen_sections.add(name)
-            sections.append(name)
-
-        if vm_size == 0 or vm_size > MAX_IMAGE_VM_SIZE or (
+        if not 0 < vm_size <= MAX_IMAGE_VM_SIZE or (
             kind == IMAGE_KIND_SHARED_CACHE and unslid_vmaddr == 0
         ):
             raise NRPTCodecError("E041", f"image[{image_index}]: invalid image geometry")
         for other in images:
             if other.kind == kind and other.path == path:
                 raise NRPTCodecError("E039", f"image[{image_index}]: duplicate image path")
-        images.append(
-            Image(
-                kind=kind,
-                path=path,
-                unslid_vmaddr=unslid_vmaddr,
-                vm_size=vm_size,
-                segments=segments,
-                sections=sections,
-                flags=flags,
-            )
-        )
+        images.append(Image(kind=kind, path=path, unslid_vmaddr=unslid_vmaddr, vm_size=vm_size))
         cursor += entry_size
-
     if cursor != end:
         raise NRPTCodecError("E036", f"imageTableSize {image_table_size} != derived {cursor - base}")
     return images
 
 
 def decode(data: bytes) -> Profile:
-    """Strict, all-or-nothing NRPT decoder (v1 back-compatibility, v2 image metadata)."""
+    """Strict, all-or-nothing NRPT v3 decoder (v1/v2 are rejected with E003)."""
     if len(data) < HEADER_SIZE:
         raise NRPTCodecError("E001", f"{len(data)} bytes < {HEADER_SIZE}")
-
     if data[H_MAGIC : H_MAGIC + 4] != MAGIC:
         raise NRPTCodecError("E002", f"magic={data[H_MAGIC:H_MAGIC + 4]!r}")
-
     version = _u16(data, H_VERSION)
-    if version not in (VERSION_V1, VERSION_V2):
+    if version != VERSION:
         raise NRPTCodecError("E003", f"version={version}")
-
     header_size = _u16(data, H_HEADER_SIZE)
     if header_size != HEADER_SIZE:
         raise NRPTCodecError("E004", f"headerSize={header_size}")
 
     build = decode_build_field(data[H_BUILD : H_BUILD + BUILD_FIELD_SIZE])
-
     apu_mask = _u32(data, H_APU_MASK)
     if apu_mask == 0 or (apu_mask & ~KNOWN_APU_MASK) != 0:
         raise NRPTCodecError("E006", f"apuMask=0x{apu_mask:08X}")
-
-    header_flags = _u32(data, H_FLAGS)
     device_id = _u32(data, H_DEVICE_ID)
-    if header_flags & HEADER_FLAG_REQUIRE_DEVICE_ID:
-        if not 1 <= device_id <= 0xFFFF:
-            raise NRPTCodecError(
-                "E007", f"deviceID=0x{device_id:08X} invalid with REQUIRE_DEVICE_ID"
-            )
-    else:
-        if device_id != 0:
-            raise NRPTCodecError(
-                "E007", f"deviceID=0x{device_id:08X} non-zero without REQUIRE_DEVICE_ID"
-            )
-    if (header_flags & ~KNOWN_HEADER_FLAGS) != 0:
-        raise NRPTCodecError("E008", f"header flags=0x{header_flags:08X}")
-
-    if version == VERSION_V2:
-        reserved = data[H_RESERVED_V2 : H_RESERVED_V2 + H_RESERVED_V2_SIZE]
-    else:
-        reserved = data[H_RESERVED : H_RESERVED + H_RESERVED_SIZE]
-    if any(byte != 0 for byte in reserved):
-        raise NRPTCodecError("E009", "header reserved bytes are not all zero")
+    if device_id > 0xFFFF:
+        raise NRPTCodecError("E007", f"deviceID=0x{device_id:08X}")
+    if any(byte != 0 for byte in data[H_RESERVED0 : H_RESERVED0 + 4]):
+        raise NRPTCodecError("E008", "header bytes 48-51 are not zero")
+    if any(byte != 0 for byte in data[H_RESERVED1 : H_RESERVED1 + H_RESERVED1_SIZE]):
+        raise NRPTCodecError("E009", "header bytes 58-63 are not zero")
 
     if len(data) > MAX_PROFILE_SIZE:
         raise NRPTCodecError("E010", f"actual size {len(data)} > {MAX_PROFILE_SIZE}")
 
     page_count = _u16(data, H_PAGE_COUNT)
     site_count = _u16(data, H_SITE_COUNT)
-    if page_count < 1:
+    if page_count == 0:
         raise NRPTCodecError("E032", f"pageCount={page_count}")
     if page_count > MAX_PAGES:
         raise NRPTCodecError("E015", f"pageCount={page_count}")
     if site_count < 1 or site_count > MAX_SITES:
         raise NRPTCodecError("E016", f"siteCount={site_count}")
-
-    image_count = 0
-    stored_image_table_size = 0
-    page_record_size = PAGE_RECORD_SIZE_V1
-    if version == VERSION_V2:
-        image_count = _u16(data, H_IMAGE_COUNT)
-        stored_image_table_size = _u32(data, H_IMAGE_TABLE_SIZE)
-        page_record_size = PAGE_RECORD_SIZE_V2
-        if not 1 <= image_count <= MAX_IMAGES:
-            raise NRPTCodecError("E034", f"imageCount={image_count}")
-        if (
-            stored_image_table_size < image_count * IMAGE_ENTRY_HEADER_SIZE
-            or stored_image_table_size > MAX_IMAGE_TABLE_SIZE
-        ):
-            raise NRPTCodecError("E035", f"imageTableSize={stored_image_table_size}")
-
-    encoded_size = HEADER_SIZE + page_count * page_record_size + site_count * SITE_RECORD_SIZE + stored_image_table_size
-    if encoded_size > MAX_PROFILE_SIZE:
-        raise NRPTCodecError("E010", f"computed size {encoded_size} > {MAX_PROFILE_SIZE}")
+    image_count = _u16(data, H_IMAGE_COUNT)
+    image_table_size = _u32(data, H_IMAGE_TABLE_SIZE)
+    if not 1 <= image_count <= MAX_IMAGES:
+        raise NRPTCodecError("E034", f"imageCount={image_count}")
+    if image_table_size < image_count * IMAGE_ENTRY_HEADER_SIZE or image_table_size > MAX_IMAGE_TABLE_SIZE:
+        raise NRPTCodecError("E035", f"imageTableSize={image_table_size}")
 
     stored_page_table_size = _u32(data, H_PAGE_TABLE_SIZE)
-    expected_page_table_size = page_count * page_record_size
+    expected_page_table_size = page_count * PAGE_RECORD_SIZE
     if stored_page_table_size != expected_page_table_size:
         raise NRPTCodecError(
             "E011", f"pageTableSize={stored_page_table_size} expected {expected_page_table_size}"
         )
-
     stored_site_table_size = _u32(data, H_SITE_TABLE_SIZE)
     expected_site_table_size = site_count * SITE_RECORD_SIZE
     if stored_site_table_size != expected_site_table_size:
         raise NRPTCodecError(
             "E012", f"siteTableSize={stored_site_table_size} expected {expected_site_table_size}"
         )
-
+    encoded_size = HEADER_SIZE + expected_page_table_size + expected_site_table_size + image_table_size
+    if encoded_size > MAX_PROFILE_SIZE:
+        raise NRPTCodecError("E010", f"computed size {encoded_size} > {MAX_PROFILE_SIZE}")
     if len(data) != encoded_size:
         raise NRPTCodecError("E013", f"actual size {len(data)} expected {encoded_size}")
-
     stored_checksum = _u32(data, H_PAYLOAD_CHECKSUM)
     computed_checksum = fnv1a32(data[HEADER_SIZE:])
     if stored_checksum != computed_checksum:
@@ -811,79 +665,62 @@ def decode(data: bytes) -> Profile:
             "E014", f"stored=0x{stored_checksum:08X} computed=0x{computed_checksum:08X}"
         )
 
-    pages_base = HEADER_SIZE
-    site_table_base = pages_base + expected_page_table_size
-    images: list[Image] = []
-    if version == VERSION_V2:
-        images = _parse_image_table(
-            data,
-            site_table_base + expected_site_table_size,
-            image_count,
-            stored_image_table_size,
-        )
+    images = _parse_image_table(
+        data, HEADER_SIZE + expected_page_table_size + expected_site_table_size, image_count, image_table_size
+    )
 
     pages: list[Page] = []
     running_first_site = 0
     for page_index in range(page_count):
-        record = pages_base + page_index * page_record_size
-        page_file_offset = _u64(data, record)
-        page_content_hash = _u64(data, record + 8)
-        first_site = _u32(data, record + 16)
-        page_sites = _u16(data, record + 20)
-        raw_match_flags = _u16(data, record + 22)
-        image_index = 0
-        page_vm_offset = 0
-        if version == VERSION_V2:
-            image_index = _u16(data, record + 24)
-            page_reserved = _u16(data, record + 26)
-            page_vm_offset = _u32(data, record + 28)
+        record = HEADER_SIZE + page_index * PAGE_RECORD_SIZE
+        page_file_offset = _u64(data, record + P_PAGE_FILE_OFFSET)
+        page_content_hash = _u64(data, record + P_PAGE_HASH)
+        first_site = _u32(data, record + P_FIRST_SITE)
+        page_sites = _u16(data, record + P_SITE_COUNT)
+        mode = data[record + P_MODE]
+        flags = data[record + P_FLAGS]
+        image_index = _u16(data, record + P_IMAGE_INDEX)
+        reserved = _u16(data, record + P_RESERVED)
+        page_vm_offset = _u32(data, record + P_PAGE_VM_OFFSET)
 
         if (page_file_offset & 0x0FFF) != 0:
+            raise NRPTCodecError("E017", f"page[{page_index}] pageFileOffset not 4 KiB aligned")
+        if mode not in (MODE_PAGE, MODE_DYLD):
+            raise NRPTCodecError("E018", f"page[{page_index}] mode={mode}")
+        if flags != 0 or reserved != 0 or image_index >= image_count:
             raise NRPTCodecError(
-                "E017",
-                f"page[{page_index}] pageFileOffset=0x{page_file_offset:X} is not 4 KiB aligned",
+                "E038",
+                f"page[{page_index}] flags={flags} reserved={reserved} imageIndex={image_index}",
             )
-        if (raw_match_flags & ~KNOWN_MATCH_FLAGS) != 0:
-            raise NRPTCodecError("E018", f"page[{page_index}] matchFlags=0x{raw_match_flags:04X}")
-        if (raw_match_flags & REQUIRED_MATCH_FLAGS) != REQUIRED_MATCH_FLAGS:
-            raise NRPTCodecError("E019", f"page[{page_index}] matchFlags=0x{raw_match_flags:04X}")
-        if not 1 <= page_sites <= MAX_SITES_PER_PAGE:
-            raise NRPTCodecError("E023", f"page[{page_index}] siteCount={page_sites}")
+        image = images[image_index]
+        if mode == MODE_PAGE and image.kind != IMAGE_KIND_STANDALONE:
+            raise NRPTCodecError("E019", f"page[{page_index}] PAGE mode with cache image kind")
+        if mode == MODE_DYLD and image.kind != IMAGE_KIND_SHARED_CACHE:
+            raise NRPTCodecError("E019", f"page[{page_index}] DYLD mode with standalone image kind")
         if first_site != running_first_site:
-            raise NRPTCodecError(
-                "E021",
-                f"page[{page_index}] firstSite={first_site} expected {running_first_site}",
-            )
+            raise NRPTCodecError("E021", f"page[{page_index}] firstSite={first_site} expected {running_first_site}")
         if first_site + page_sites > site_count:
             raise NRPTCodecError(
                 "E020",
-                f"page[{page_index}] firstSite={first_site} siteCount={page_sites} "
-                f"header siteCount={site_count}",
+                f"page[{page_index}] firstSite={first_site} siteCount={page_sites} header={site_count}",
             )
-        if version == VERSION_V2:
-            if page_reserved != 0 or image_index >= image_count:
-                raise NRPTCodecError(
-                    "E038",
-                    f"page[{page_index}] imageIndex={image_index} reserved={page_reserved} imageCount={image_count}",
-                )
-            if (page_vm_offset & 0x0FFF) != 0 or page_vm_offset + PAGE_SIZE > images[image_index].vm_size:
-                raise NRPTCodecError(
-                    "E040",
-                    f"page[{page_index}] pageVmOffset=0x{page_vm_offset:X} "
-                    f"imageVmSize=0x{images[image_index].vm_size:X}",
-                )
+        if not 1 <= page_sites <= MAX_SITES_PER_PAGE:
+            raise NRPTCodecError("E023", f"page[{page_index}] siteCount={page_sites}")
+        if (page_vm_offset & 0x0FFF) != 0 or page_vm_offset + PAGE_SIZE > image.vm_size:
+            raise NRPTCodecError(
+                "E040", f"page[{page_index}] pageVmOffset=0x{page_vm_offset:X} imageVmSize=0x{image.vm_size:X}"
+            )
 
         sites: list[Site] = []
         for local_index in range(page_sites):
             global_index = running_first_site + local_index
-            site_base = site_table_base + global_index * SITE_RECORD_SIZE
+            site_base = HEADER_SIZE + expected_page_table_size + global_index * SITE_RECORD_SIZE
             site_in_page = _u16(data, site_base)
             find_size = data[site_base + 2]
             replace_size = data[site_base + 3]
             if not 1 <= find_size <= MAX_SITE_PATCH_SIZE or not 1 <= replace_size <= MAX_SITE_PATCH_SIZE:
                 raise NRPTCodecError(
-                    "E024",
-                    f"site[{global_index}] findSize={find_size} replaceSize={replace_size}",
+                    "E024", f"site[{global_index}] findSize={find_size} replaceSize={replace_size}"
                 )
             if find_size != replace_size:
                 raise NRPTCodecError(
@@ -893,10 +730,8 @@ def decode(data: bytes) -> Profile:
                 raise NRPTCodecError(
                     "E026", f"site[{global_index}] siteInPage=0x{site_in_page:X} size={find_size}"
                 )
-            find_base = site_base + 4
-            replace_base = find_base + MAX_SITE_PATCH_SIZE
-            find_field = data[find_base : find_base + MAX_SITE_PATCH_SIZE]
-            replace_field = data[replace_base : replace_base + MAX_SITE_PATCH_SIZE]
+            find_field = data[site_base + 4 : site_base + 20]
+            replace_field = data[site_base + 20 : site_base + 36]
             if any(byte != 0 for byte in find_field[find_size:]) or any(
                 byte != 0 for byte in replace_field[replace_size:]
             ):
@@ -914,134 +749,195 @@ def decode(data: bytes) -> Profile:
             Page(
                 page_file_offset=page_file_offset,
                 page_hash=page_content_hash,
-                match_flags=raw_match_flags,
-                sites=sites,
+                mode=mode,
                 image_index=image_index,
                 page_vm_offset=page_vm_offset,
+                sites=sites,
             )
         )
         running_first_site += page_sites
 
     if running_first_site != site_count:
-        raise NRPTCodecError(
-            "E022", f"summed site count {running_first_site} != header siteCount {site_count}"
-        )
+        raise NRPTCodecError("E022", f"summed site count {running_first_site} != header {site_count}")
 
     profile = Profile(
-        header=Header(
-            build=build,
-            apu_mask=apu_mask,
-            device_id=device_id,
-            flags=header_flags,
-            version=version,
-            image_count=image_count,
-            image_table_size=stored_image_table_size,
-        ),
-        pages=pages,
-        version=version,
+        header=Header(build=build, apu_mask=apu_mask, device_id=device_id),
         images=images,
+        pages=pages,
     )
     validate_model(profile)
     return profile
 
 
-# ---------------------------------------------------------------------------
-# Encode (canonical bytes; used for test vectors and cross-checking the generator)
-# ---------------------------------------------------------------------------
-
-
-def encode_fixed_name(name: str, capacity: int) -> bytes:
-    raw = name.encode("utf-8")
-    if not is_valid_fixed_name(raw.ljust(capacity, b"\x00"), capacity):
-        raise NRPTCodecError("E038", f"invalid image name {name!r}")
-    return raw + b"\x00" * (capacity - len(raw))
-
-
-def encode_image_table(images: Sequence[Image]) -> bytes:
-    """Canonical NRPT v2 image table (spec section 0.4)."""
-    table = bytearray()
-    for image in images:
-        path = image.path_bytes
-        path_field_size = round_up4(len(path) + 1)
-        table += bytes((image.kind, image.flags))
-        table += _p16(len(path))
-        table += _p64(image.unslid_vmaddr)
-        table += _p32(image.vm_size)
-        table += bytes((len(image.segments), len(image.sections)))
-        table += _p16(0)  # reserved
-        table += path
-        table += b"\x00" * (path_field_size - len(path))
-        for name in image.segments:
-            table += encode_fixed_name(name, SEGMENT_NAME_SIZE)
-        for name in image.sections:
-            table += encode_fixed_name(name, SECTION_NAME_SIZE)
-    return bytes(table)
-
-
-def encode(profile: Profile) -> bytes:
-    """Canonical NRPT encoder (v1 or v2 per profile.version). Derives all counts and checksum."""
-    validate_model(profile)
-    version = profile.version
-
-    page_table = bytearray()
-    site_table = bytearray()
-    first_site = 0
-    for page in profile.pages:
-        page_table += _p64(page.page_file_offset)
-        page_table += _p64(page.page_hash)
-        page_table += _p32(first_site)
-        page_table += _p16(len(page.sites))
-        page_table += _p16(page.match_flags)
-        if version == VERSION_V2:
-            page_table += _p16(page.image_index)
-            page_table += _p16(0)  # reserved
-            page_table += _p32(page.page_vm_offset)
-        first_site += len(page.sites)
-
-        for site in page.sites:
-            site_table += _p16(site.site_in_page)
-            site_table += bytes((site.find_size, site.replace_size))
-            site_table += site.find + b"\x00" * (MAX_SITE_PATCH_SIZE - site.find_size)
-            site_table += site.replace + b"\x00" * (MAX_SITE_PATCH_SIZE - site.replace_size)
-            site_table += _p32(site.flags)
-
-    image_table = encode_image_table(profile.images) if version == VERSION_V2 else b""
-    payload = bytes(page_table) + bytes(site_table) + image_table
-    output = bytearray()
-    output += MAGIC
-    output += _p16(version)
-    output += _p16(HEADER_SIZE)
-    output += encode_build_field(profile.header.build)
-    output += _p32(profile.header.apu_mask)
-    output += _p32(profile.header.device_id)
-    output += _p16(len(profile.pages))
-    output += _p16(first_site)
-    output += _p32(len(page_table))
-    output += _p32(len(site_table))
-    output += _p32(fnv1a32(payload))
-    output += _p32(profile.header.flags)
-    if version == VERSION_V2:
-        output += _p16(len(profile.images))
-        output += _p32(len(image_table))
-        output += b"\x00" * H_RESERVED_V2_SIZE
-    else:
-        output += b"\x00" * H_RESERVED_SIZE
-    output += payload
-    if len(output) != profile.encoded_size:
-        raise NRPTCodecError("E013", "encoder produced an inconsistent size")
-    return bytes(output)
-
+# ===========================================================================
+# Part 2 follows: bundle model/selection, hook simulation, fixture validation, CLI.
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
-# Kext matching simulation (spec section 8)
+# NRedProfiles bundle model and selection (spec section 8)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BundleEntry:
+    build: str
+    apu_mask: int
+    device_id: int
+    profile_data: bytes
+    source: str = ""
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.profile_data).hexdigest()
+
+
+@dataclass
+class Bundle:
+    entries: list[BundleEntry] = field(default_factory=list)
+
+    def profiles(self) -> list[Profile]:
+        return [decode(entry.profile_data) for entry in self.entries]
+
+
+@dataclass
+class Selection:
+    status: str  # selected | unsupportedBuild | apuMismatch | deviceMismatch
+    index: Optional[int] = None
+    profile: Optional[Profile] = None
+
+    @property
+    def selected(self) -> bool:
+        return self.status == "selected"
+
+
+def validate_bundle_model(bundle: Bundle) -> None:
+    """E050-E053 bundle rules; each profile must also decode structurally."""
+    if not 1 <= len(bundle.entries) <= MAX_BUNDLE_ENTRIES:
+        raise NRPTCodecError("E050", f"profileCount={len(bundle.entries)}")
+    seen_builds: set[str] = set()
+    for index, entry in enumerate(bundle.entries):
+        try:
+            decode_build_field(encode_build_field(entry.build))
+        except NRPTCodecError as error:
+            raise NRPTCodecError("E053", f"bundle[{index}]: invalid Build: {error}") from error
+        if entry.build in seen_builds:
+            raise NRPTCodecError("E051", f"bundle[{index}]: duplicate Build {entry.build!r}")
+        seen_builds.add(entry.build)
+        if not 1 <= entry.apu_mask <= KNOWN_APU_MASK or (entry.apu_mask & ~KNOWN_APU_MASK) != 0:
+            raise NRPTCodecError("E053", f"bundle[{index}]: invalid APUMask=0x{entry.apu_mask:08X}")
+        if entry.device_id > 0xFFFF:
+            raise NRPTCodecError("E053", f"bundle[{index}]: invalid DeviceID=0x{entry.device_id:08X}")
+        try:
+            profile = decode(entry.profile_data)
+        except NRPTCodecError:
+            raise
+        if profile.header.build != entry.build:
+            raise NRPTCodecError(
+                "E052",
+                f"bundle[{index}]: Build {entry.build!r} != profile build {profile.header.build!r}",
+            )
+        if profile.header.apu_mask != entry.apu_mask:
+            raise NRPTCodecError(
+                "E052",
+                f"bundle[{index}]: APUMask 0x{entry.apu_mask:08X} != profile 0x{profile.header.apu_mask:08X}",
+            )
+        if profile.header.device_id != entry.device_id:
+            raise NRPTCodecError(
+                "E052",
+                f"bundle[{index}]: DeviceID 0x{entry.device_id:04X} != profile 0x{profile.header.device_id:04X}",
+            )
+
+
+def decode_bundle_plist(data: bytes) -> Bundle:
+    """Decode the `NRedProfiles` Info.plist array (exact keys; E053 on structure)."""
+    try:
+        root = plistlib.loads(data)
+    except Exception as error:  # plistlib raises several exception types
+        raise NRPTCodecError("E053", f"bundle is not a plist: {error}") from error
+    if not isinstance(root, dict) or set(root.keys()) != {BUNDLE_ROOT_KEY}:
+        raise NRPTCodecError("E053", f"bundle root must be a dict with the single key {BUNDLE_ROOT_KEY!r}")
+    raw_entries = root[BUNDLE_ROOT_KEY]
+    if not isinstance(raw_entries, list):
+        raise NRPTCodecError("E053", f"{BUNDLE_ROOT_KEY} must be an array")
+    entries: list[BundleEntry] = []
+    for index, raw in enumerate(raw_entries):
+        if not isinstance(raw, dict):
+            raise NRPTCodecError("E053", f"bundle[{index}] is not a dictionary")
+        if set(raw.keys()) != set(BUNDLE_ENTRY_KEYS):
+            raise NRPTCodecError(
+                "E053", f"bundle[{index}] keys must be exactly {list(BUNDLE_ENTRY_KEYS)}"
+            )
+        build = raw["Build"]
+        apu_mask = raw["APUMask"]
+        device_id = raw["DeviceID"]
+        profile_data = raw["Profile"]
+        if not isinstance(build, str):
+            raise NRPTCodecError("E053", f"bundle[{index}].Build must be a string")
+        if isinstance(apu_mask, bool) or not isinstance(apu_mask, int):
+            raise NRPTCodecError("E053", f"bundle[{index}].APUMask must be an integer")
+        if isinstance(device_id, bool) or not isinstance(device_id, int):
+            raise NRPTCodecError("E053", f"bundle[{index}].DeviceID must be an integer")
+        if not isinstance(profile_data, (bytes, bytearray)):
+            raise NRPTCodecError("E053", f"bundle[{index}].Profile must be a data value")
+        entries.append(
+            BundleEntry(
+                build=build,
+                apu_mask=apu_mask,
+                device_id=device_id,
+                profile_data=bytes(profile_data),
+            )
+        )
+    bundle = Bundle(entries=entries)
+    validate_bundle_model(bundle)
+    return bundle
+
+
+def bundle_plist_dict(bundle: Bundle) -> dict:
+    return {
+        BUNDLE_ROOT_KEY: [
+            {
+                "Build": entry.build,
+                "APUMask": entry.apu_mask,
+                "DeviceID": entry.device_id,
+                "Profile": entry.profile_data,
+            }
+            for entry in bundle.entries
+        ]
+    }
+
+
+def encode_bundle_plist(bundle: Bundle) -> bytes:
+    """Deterministic XML plist for `NRedProfiles` (used by the injection tool and tests)."""
+    validate_bundle_model(bundle)
+    return plistlib.dumps(bundle_plist_dict(bundle), fmt=plistlib.FMT_XML, sort_keys=False)
+
+
+def select_profile(bundle: Bundle, build: str, apu_mask: int, device_id: int) -> Selection:
+    """Spec section 8: exact build, then APU-mask intersection, then device ID (when gated)."""
+    entry_index = next((index for index, entry in enumerate(bundle.entries) if entry.build == build), None)
+    if entry_index is None:
+        return Selection(status="unsupportedBuild")
+    entry = bundle.entries[entry_index]
+    profile = decode(entry.profile_data)
+    if (entry.apu_mask & apu_mask) == 0:
+        return Selection(status="apuMismatch", index=entry_index, profile=profile)
+    if profile.header.device_id != 0 and profile.header.device_id != device_id:
+        return Selection(status="deviceMismatch", index=entry_index, profile=profile)
+    return Selection(status="selected", index=entry_index, profile=profile)
+
+
+def candidate_apu_mask(device_id: int) -> Optional[int]:
+    return DEVICE_CANDIDATE_MASK.get(device_id)
+
+
+# ---------------------------------------------------------------------------
+# Hook matching simulation (spec section 9; no offset identity)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class ChunkResult:
-    """Result of simulating one delivered 4 KiB chunk through the kext algorithm."""
-
-    status: str  # "applied" | "siteFindMismatch" | "alreadyApplied" | "noMatch"
+    status: str  # applied | siteFindMismatch | alreadyApplied | alreadyPatched | noMatch
     page_index: Optional[int] = None
     site_index: Optional[int] = None
     data: Optional[bytes] = None
@@ -1052,74 +948,82 @@ class ChunkResult:
         return self.status == "applied"
 
 
-def page_identity_matches(page: Page, data: bytes, chunk_base: Optional[int]) -> bool:
-    """Spec section 8 identity gates (offset if required, then full-page hash)."""
-    if len(data) != PAGE_SIZE:
-        return False
-    if page.match_flags & MATCH_REQUIRE_OFFSET:
-        if chunk_base is None or (chunk_base & 0x0FFF) != 0:
-            return False
-        if page.page_file_offset != chunk_base:
-            return False
-    if page.match_flags & MATCH_REQUIRE_HASH:
-        if fnv1a64(data) != page.page_hash:
-            return False
-    return True
+def vnode_gate_accepts(profile: Profile, page: Page, vnode_name: Optional[str]) -> bool:
+    """Defense-in-depth vnode gate (spec 9.1); never identity."""
+    if vnode_name is None:
+        return True
+    image = profile.images[page.image_index]
+    if page.mode == MODE_PAGE:
+        return image.basename in vnode_name
+    return "dyld_shared_cache" in vnode_name or "dyld" in vnode_name
+
+
+def sites_identity_matches(page: Page, data: bytes) -> tuple[bool, Optional[int]]:
+    for site_index, site in enumerate(page.sites):
+        start = site.site_in_page
+        if data[start : start + site.size] != site.find:
+            return False, site_index
+    return True, None
 
 
 def apply_chunk(
     profile: Profile,
     data: bytes,
-    chunk_base: Optional[int],
-    applied_pages: set[int],
+    mode: int,
+    *,
+    chunk_base: Optional[int] = None,
+    vnode_name: Optional[str] = None,
+    vnode_gate: bool = True,
+    applied: Optional[set[int]] = None,
+    already_patched: Optional[set[int]] = None,
 ) -> ChunkResult:
-    """Simulate one `_cs_validate_page` delivery through the NRPT v1 engine.
-
-    Exactly spec section 8:
-      - records are tried in profile order;
-      - identity = offset (when required) + FNV-1a-64 hash;
-      - a matched but already-applied record stops with no write and no fallback;
-      - a find mismatch on a matched record stops with ZERO writes for the chunk;
-      - all replaces are written only after every find matched (atomic page).
-    `applied_pages` is the boot-persistent applied bitmap and is mutated on success.
-    """
+    """Simulate one delivered 4 KiB chunk through one validation hook domain."""
+    applied = applied if applied is not None else set()
+    already_patched = already_patched if already_patched is not None else set()
     if len(data) != PAGE_SIZE:
         return ChunkResult(status="noMatch")
 
+    # First matching record in table order is authoritative for this chunk.
     for page_index, page in enumerate(profile.pages):
-        if not page_identity_matches(page, data, chunk_base):
+        if page.mode != mode:
             continue
-
-        if page_index in applied_pages:
+        if vnode_gate and not vnode_gate_accepts(profile, page, vnode_name):
+            continue
+        if fnv1a64(data) != page.page_hash:
+            continue
+        if page_index in applied:
             return ChunkResult(status="alreadyApplied", page_index=page_index)
-
-        for site_index, site in enumerate(page.sites):
-            start = site.site_in_page
-            if data[start : start + site.find_size] != site.find:
-                return ChunkResult(
-                    status="siteFindMismatch", page_index=page_index, site_index=site_index
-                )
-
+        matched, bad_site = sites_identity_matches(page, data)
+        if not matched:
+            return ChunkResult(status="siteFindMismatch", page_index=page_index, site_index=bad_site)
         patched = bytearray(data)
         writes: list[dict] = []
         for site in page.sites:
             start = site.site_in_page
-            end = start + site.replace_size
+            end = start + site.size
             patched[start:end] = site.replace
             writes.append(
                 {
                     "siteInPage": site.site_in_page,
-                    "findSize": site.find_size,
+                    "findSize": site.size,
                     "findHex": site.find.hex(),
                     "replaceHex": site.replace.hex(),
                     "originalHex": bytes(data[start:end]).hex(),
                 }
             )
+        applied.add(page_index)
+        return ChunkResult(status="applied", page_index=page_index, data=bytes(patched), writes=writes)
 
-        applied_pages.add(page_index)
-        return ChunkResult(
-            status="applied", page_index=page_index, data=bytes(patched), writes=writes
-        )
+    # No original-page identity matched: recognise an already-patched delivery (no write).
+    for page_index, page in enumerate(profile.pages):
+        if page.mode != mode:
+            continue
+        if vnode_gate and not vnode_gate_accepts(profile, page, vnode_name):
+            continue
+        if all(data[site.site_in_page : site.site_in_page + site.size] == site.replace for site in page.sites):
+            applied.add(page_index)
+            already_patched.add(page_index)
+            return ChunkResult(status="alreadyPatched", page_index=page_index)
 
     return ChunkResult(status="noMatch")
 
@@ -1128,21 +1032,39 @@ def apply_range(
     profile: Profile,
     data: bytes,
     range_base: int,
-    applied_pages: set[int],
+    mode: int = MODE_DYLD,
+    *,
+    vnode_name: Optional[str] = None,
+    vnode_gate: bool = True,
+    applied: Optional[set[int]] = None,
+    already_patched: Optional[set[int]] = None,
 ) -> list[ChunkResult]:
-    """Simulate `_cs_validate_range` delivery: only whole 4 KiB chunks are processed (spec section 9)."""
+    applied = applied if applied is not None else set()
+    already_patched = already_patched if already_patched is not None else set()
     results: list[ChunkResult] = []
-    chunk_count = len(data) // PAGE_SIZE
-    for index in range(chunk_count):
+    for index in range(len(data) // PAGE_SIZE):
         start = index * PAGE_SIZE
-        chunk = data[start : start + PAGE_SIZE]
-        results.append(apply_chunk(profile, chunk, range_base + start, applied_pages))
+        results.append(
+            apply_chunk(
+                profile,
+                data[start : start + PAGE_SIZE],
+                mode,
+                chunk_base=range_base + start,
+                vnode_name=vnode_name,
+                vnode_gate=vnode_gate,
+                applied=applied,
+                already_patched=already_patched,
+            )
+        )
     return results
 
 
 # ---------------------------------------------------------------------------
-# Fixture discovery and page resolution (spec sections 4.3 and 13)
+# Fixture discovery and NRPT v3 metadata re-resolution
 # ---------------------------------------------------------------------------
+
+LC_SEGMENT_64 = 0x19
+MACHO_MAGIC_64 = 0xFEEDFACF
 
 DEFAULT_IMAGE_GLOBS = (
     "System/Library/Extensions/AMD*GLDriver.bundle/Contents/MacOS/*",
@@ -1159,237 +1081,6 @@ class FixtureImage:
     path: str
     name: str
     size: int
-
-
-def discover_images(
-    fixture_root: str, extra_images: Optional[Sequence[str]] = None
-) -> list[FixtureImage]:
-    """Discover clean candidate images under the fixture root (deterministic order)."""
-    seen: set[str] = set()
-    images: list[FixtureImage] = []
-    candidates: list[str] = []
-    for pattern in DEFAULT_IMAGE_GLOBS:
-        candidates.extend(glob.glob(os.path.join(fixture_root, pattern)))
-    for extra in extra_images or ():
-        candidates.append(extra)
-
-    for candidate in sorted(candidates):
-        try:
-            resolved = os.path.realpath(candidate)
-        except OSError:
-            continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        if not os.path.isfile(resolved):
-            continue
-        lower = os.path.basename(resolved).lower()
-        if (
-            lower.endswith(".map")
-            or lower.endswith(".atlas")
-            or lower.endswith(".symbols")
-            or lower.endswith(".dylddata")
-            or ".dsym" in resolved.lower()
-            or lower.startswith("_")
-        ):
-            continue
-        try:
-            size = os.path.getsize(resolved)
-        except OSError:
-            continue
-        if size < PAGE_SIZE:
-            continue
-        images.append(FixtureImage(path=resolved, name=os.path.basename(resolved), size=size))
-    images.sort(key=lambda image: (image.name, image.path))
-    return images
-
-
-def read_chunk(path: str, offset: int, size: int = PAGE_SIZE) -> bytes:
-    with open(path, "rb") as handle:
-        handle.seek(offset)
-        return handle.read(size)
-
-
-def resolve_page(page: Page, images: Sequence[FixtureImage]) -> list[tuple[FixtureImage, int, bytes]]:
-    """Resolve a page record to clean fixture content.
-
-    Offset-required records only accept the exact chunk at `pageFileOffset`; hash-only records
-    scan every aligned 4 KiB window of every candidate image (content identity, spec section 4.3).
-    Returns all matches (normally exactly one).
-    """
-    matches: list[tuple[FixtureImage, int, bytes]] = []
-    if page.match_flags & MATCH_REQUIRE_OFFSET:
-        offset = page.page_file_offset
-        for image in images:
-            if offset + PAGE_SIZE > image.size:
-                continue
-            chunk = read_chunk(image.path, offset)
-            if len(chunk) == PAGE_SIZE and fnv1a64(chunk) == page.page_hash:
-                matches.append((image, offset, chunk))
-        return matches
-
-    for image in images:
-        offset = 0
-        with open(image.path, "rb") as handle:
-            while offset + PAGE_SIZE <= image.size:
-                chunk = handle.read(PAGE_SIZE)
-                if len(chunk) != PAGE_SIZE:
-                    break
-                if fnv1a64(chunk) == page.page_hash:
-                    matches.append((image, offset, chunk))
-                offset += PAGE_SIZE
-    return matches
-
-
-# ---------------------------------------------------------------------------
-# Full-fixture page hash scan (hash-only record identity, spec section 13)
-# ---------------------------------------------------------------------------
-#
-# Hash-only records (REQUIRE_OFFSET cleared) identify a page by content alone, so the
-# false-positive check must prove that no other aligned 4 KiB page of the fixture has the same
-# FNV-1a-64. A real macOS fixture is several GB; pure-Python FNV-1a is ~4 MB/s, so a small C helper
-# (test/hash_scan.c) is compiled on demand and used when available. The pure-Python fallback is
-# exact and is used for small fixtures and for the unit tests.
-
-NATIVE_SCAN_THRESHOLD_BYTES = 64 * 1024 * 1024
-HASH_SCAN_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hash_scan.c")
-
-
-def native_hash_scan_binary() -> Optional[str]:
-    """Compile test/hash_scan.c on demand; return the binary path or None when unavailable."""
-    if not os.path.isfile(HASH_SCAN_SOURCE):
-        return None
-    compiler = shutil.which("clang") or shutil.which("cc") or shutil.which("gcc")
-    if compiler is None:
-        return None
-    try:
-        with open(HASH_SCAN_SOURCE, "rb") as handle:
-            source_digest = hashlib.sha256(handle.read()).hexdigest()[:16]
-    except OSError:
-        return None
-    binary_path = os.path.join(tempfile.gettempdir(), f"nrpt_hash_scan_{source_digest}")
-    if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
-        return binary_path
-    try:
-        completed = subprocess.run(
-            [compiler, "-O2", "-o", binary_path, HASH_SCAN_SOURCE],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0 or not os.path.isfile(binary_path):
-        return None
-    return binary_path
-
-
-def python_page_hash_scan(
-    images: Sequence[FixtureImage], queries: Iterable[int]
-) -> dict[int, list[tuple[str, int]]]:
-    """Pure-Python exact scan: hash every aligned 4 KiB page of every candidate image."""
-    wanted = set(queries)
-    results: dict[int, list[tuple[str, int]]] = {query: [] for query in wanted}
-    if not wanted:
-        return results
-    for image in images:
-        offset = 0
-        with open(image.path, "rb") as handle:
-            while offset + PAGE_SIZE <= image.size:
-                chunk = handle.read(PAGE_SIZE)
-                if len(chunk) != PAGE_SIZE:
-                    break
-                digest = fnv1a64(chunk)
-                if digest in results:
-                    results[digest].append((image.path, offset))
-                offset += PAGE_SIZE
-    return results
-
-
-def native_page_hash_scan(
-    images: Sequence[FixtureImage], queries: Iterable[int], binary_path: str
-) -> Optional[dict[int, list[tuple[str, int]]]]:
-    """Exact scan through the compiled C helper; returns None when the helper fails."""
-    wanted = sorted(set(queries))
-    if not wanted:
-        return {}
-    query_handle = tempfile.NamedTemporaryFile(
-        mode="w", prefix="nrpt-hash-queries-", suffix=".txt", delete=False
-    )
-    try:
-        for query in wanted:
-            query_handle.write(f"{query:016x}\n")
-        query_handle.close()
-        command = [binary_path, query_handle.name] + [image.path for image in images]
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=900)
-        if completed.returncode != 0:
-            return None
-        results: dict[int, list[tuple[str, int]]] = {query: [] for query in wanted}
-        for line in completed.stdout.splitlines():
-            fields = line.split("\t")
-            if len(fields) != 3:
-                continue
-            try:
-                digest = int(fields[0], 16)
-                image_index = int(fields[1])
-                offset = int(fields[2], 16)
-            except ValueError:
-                continue
-            if digest not in results or not 0 <= image_index < len(images):
-                continue
-            results[digest].append((images[image_index].path, offset))
-        return results
-    except (OSError, subprocess.SubprocessError):
-        return None
-    finally:
-        if not query_handle.closed:
-            query_handle.close()
-        try:
-            os.unlink(query_handle.name)
-        except OSError:
-            pass
-
-
-def scan_fixture_page_hashes(
-    images: Sequence[FixtureImage],
-    queries: Iterable[int],
-    *,
-    allow_native: bool = True,
-) -> tuple[dict[int, list[tuple[str, int]]], str]:
-    """Scan the fixture for the given page hashes. Returns (matches, mode)."""
-    wanted = set(queries)
-    total_bytes = sum(image.size for image in images)
-    if allow_native and total_bytes > NATIVE_SCAN_THRESHOLD_BYTES:
-        binary_path = native_hash_scan_binary()
-        if binary_path is not None:
-            print(
-                f"hash scan: {len(wanted)} identity hash(es) over {len(images)} image(s) "
-                f"({total_bytes / 1e9:.2f} GB) via native helper",
-                file=sys.stderr,
-            )
-            results = native_page_hash_scan(images, wanted, binary_path)
-            if results is not None:
-                return results, "native"
-            print("hash scan: native helper failed, falling back to Python", file=sys.stderr)
-    print(
-        f"hash scan: {len(wanted)} identity hash(es) over {len(images)} image(s) "
-        f"({total_bytes / 1e9:.2f} GB) via Python (may be slow)",
-        file=sys.stderr,
-    )
-    return python_page_hash_scan(images, wanted), "python"
-
-
-# ---------------------------------------------------------------------------
-# NRPT v2 metadata re-resolution against the clean fixture (spec section 0.6)
-# ---------------------------------------------------------------------------
-#
-# The validator must not trust the profile's target-image metadata: it re-resolves every page's
-# (imageIndex, pageVmOffset) into the clean fixture and verifies the file, segment, section, file
-# offset and page hash. Standalone Mach-O images are parsed from the fixture file; shared-cache
-# images are located through the dyld cache mapping tables and the cache image-text list.
-
-LC_SEGMENT_64 = 0x19
-MACHO_MAGIC_64 = 0xFEEDFACF
 
 
 @dataclass
@@ -1430,18 +1121,16 @@ def _cstring(raw: bytes) -> str:
     return raw.split(b"\x00", 1)[0].decode("ascii", "replace")
 
 
-def parse_macho_header(read_at: Callable[[int, int], bytes]) -> list[MachOSegment]:
-    """Minimal LC_SEGMENT_64 parser for fixture verification (raises ValueError)."""
+def parse_macho_segments(read_at: Callable[[int, int], bytes]) -> list[MachOSegment]:
     header = read_at(0, 32)
     if len(header) != 32:
         raise ValueError("truncated Mach-O header")
-    magic = int.from_bytes(header[0:4], "little")
-    if magic != MACHO_MAGIC_64:
-        raise ValueError(f"unexpected Mach-O magic 0x{magic:08X}")
+    if int.from_bytes(header[0:4], "little") != MACHO_MAGIC_64:
+        raise ValueError("unexpected Mach-O magic")
     ncmds = int.from_bytes(header[16:20], "little")
     sizeofcmds = int.from_bytes(header[20:24], "little")
     if not 0 < ncmds <= 4096 or sizeofcmds > 1024 * 1024:
-        raise ValueError(f"implausible Mach-O load commands ({ncmds}/{sizeofcmds})")
+        raise ValueError("implausible Mach-O load commands")
     commands = read_at(32, sizeofcmds)
     if len(commands) != sizeofcmds:
         raise ValueError("truncated Mach-O load commands")
@@ -1467,7 +1156,7 @@ def parse_macho_header(read_at: Callable[[int, int], bytes]) -> list[MachOSegmen
             nsects = int.from_bytes(commands[cursor + 64 : cursor + 68], "little")
             section_base = cursor + 72
             if nsects > 128 or section_base + nsects * 80 > cursor + cmdsize:
-                raise ValueError("invalid section count in LC_SEGMENT_64")
+                raise ValueError("invalid section count")
             for section_index in range(nsects):
                 base = section_base + section_index * 80
                 segment.sections.append(
@@ -1484,78 +1173,99 @@ def parse_macho_header(read_at: Callable[[int, int], bytes]) -> list[MachOSegmen
     return segments
 
 
-def _segment_containing(segments: Sequence[MachOSegment], address: int) -> Optional[MachOSegment]:
+def segment_containing(segments: Sequence[MachOSegment], address: int) -> Optional[MachOSegment]:
     for segment in segments:
         if segment.vmaddr <= address < segment.vmaddr + segment.vmsize:
             return segment
     return None
 
 
-def _section_containing(segments: Sequence[MachOSegment], address: int) -> Optional[MachOSection]:
-    for segment in segments:
-        for section in segment.sections:
-            if section.addr <= address < section.addr + section.size:
-                return section
-    return None
+def discover_images(fixture_root: str) -> list[FixtureImage]:
+    seen: set[str] = set()
+    images: list[FixtureImage] = []
+    candidates: list[str] = []
+    for pattern in DEFAULT_IMAGE_GLOBS:
+        candidates.extend(glob.glob(os.path.join(fixture_root, pattern)))
+    for candidate in sorted(candidates):
+        resolved = os.path.realpath(candidate)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not os.path.isfile(resolved):
+            continue
+        name = os.path.basename(resolved)
+        if name.endswith((".map", ".atlas", ".symbols", ".dylddata")) or name.startswith("_"):
+            continue
+        size = os.path.getsize(resolved)
+        if size < PAGE_SIZE:
+            continue
+        images.append(FixtureImage(path=resolved, name=name, size=size))
+    images.sort(key=lambda image: (image.name, image.path))
+    return images
+
+
+def read_chunk(path: str, offset: int, size: int = PAGE_SIZE) -> bytes:
+    with open(path, "rb") as handle:
+        handle.seek(offset)
+        return handle.read(size)
 
 
 @dataclass
 class ImageResolution:
-    image_index: int
+    index: int
     kind: int
     path: str
     unslid_vmaddr: int
     vm_size: int
-    segment_count: int
-    section_count: int
+    text_vmaddr: int
+    text_vmsize: int
+    file: str
+    verified: bool
 
 
 @dataclass
-class PageMetadataResolution:
+class PageResolution:
+    page_index: int
     image_index: int
     image_kind: int
     image_path: str
-    image_unslid_vmaddr: int
-    image_vm_size: int
+    mode: int
+    page_file_offset: int
     page_vm_offset: int
     page_start: int
+    resolved_file: str
+    resolved_offset: int
+    evidence_consistent: bool
     segment: str
     section: Optional[str]
-    file: str
-    file_offset: int
-    namespace: str
     page: bytes
 
 
 class FixtureCatalog:
-    """Fixture-side v2 image/page metadata re-resolution."""
-
-    def __init__(self, fixture_root: str, images: Sequence[FixtureImage], profile: "Profile") -> None:
+    def __init__(self, fixture_root: str, profile: Profile) -> None:
         self.fixture_root = fixture_root
-        self.images = images
-        self._profile = profile
+        self.profile = profile
+        self.images = discover_images(fixture_root)
         self.cache_files = [
             image
-            for image in images
-            if os.path.basename(image.path).startswith("dyld_shared_cache_x86_64h")
-            and not os.path.basename(image.path).endswith((".map", ".atlas", ".symbols"))
+            for image in self.images
+            if image.name.startswith("dyld_shared_cache_x86_64h")
+            and not image.name.endswith((".map", ".atlas", ".symbols"))
         ]
-        self._cache_mappings: Optional[list[CacheMapping]] = None
-        self._cache_image_texts: Optional[list[CacheImageText]] = None
+        self._mappings: Optional[list[CacheMapping]] = None
+        self._image_texts: Optional[list[CacheImageText]] = None
         self.image_resolutions: list[ImageResolution] = []
-        self.page_resolutions: dict[int, PageMetadataResolution] = {}
+        self.page_resolutions: dict[int, PageResolution] = {}
 
     # -- dyld cache helpers -------------------------------------------------
 
-    def _load_cache_mappings(self) -> list[CacheMapping]:
-        if self._cache_mappings is not None:
-            return self._cache_mappings
+    def _load_mappings(self) -> list[CacheMapping]:
+        if self._mappings is not None:
+            return self._mappings
         mappings: list[CacheMapping] = []
         for cache_file in self.cache_files:
             header = read_chunk(cache_file.path, 0, 0x300)
-            if len(header) != 0x300:
-                continue
-            if header[:4] != b"dyld":
+            if len(header) != 0x300 or header[:4] != b"dyld":
                 continue
             mapping_offset = _u32(header, 0x10)
             mapping_count = _u32(header, 0x14)
@@ -1575,254 +1285,206 @@ class FixtureCatalog:
                     )
                 )
         mappings.sort(key=lambda mapping: mapping.va)
-        self._cache_mappings = mappings
+        self._mappings = mappings
         return mappings
 
-    def _load_cache_image_texts(self) -> list[CacheImageText]:
-        if self._cache_image_texts is not None:
-            return self._cache_image_texts
+    def _load_image_texts(self) -> list[CacheImageText]:
+        if self._image_texts is not None:
+            return self._image_texts
         texts: list[CacheImageText] = []
-        main_cache = next(
-            (image for image in self.cache_files if os.path.basename(image.path) == "dyld_shared_cache_x86_64h"),
-            None,
+        main = next(
+            (image for image in self.cache_files if image.name == "dyld_shared_cache_x86_64h"), None
         )
-        if main_cache is not None:
-            header = read_chunk(main_cache.path, 0, 0x100)
+        if main is not None:
+            header = read_chunk(main.path, 0, 0x100)
             if len(header) == 0x100:
                 images_offset = _u64(header, 0x88)
                 images_count = _u64(header, 0x90)
                 if 0 < images_count < 100000 and images_offset > 0:
-                    raw = read_chunk(main_cache.path, images_offset, images_count * 32)
-                    for index in range(images_count if len(raw) == images_count * 32 else 0):
-                        base = index * 32
-                        load_address = _u64(raw, base + 16)
-                        text_size = _u32(raw, base + 24)
-                        path_offset = _u32(raw, base + 28)
-                        name_bytes = read_chunk(main_cache.path, path_offset, 512)
-                        texts.append(
-                            CacheImageText(
-                                load_address=load_address,
-                                text_size=text_size,
-                                path=_cstring(name_bytes),
+                    raw = read_chunk(main.path, images_offset, images_count * 32)
+                    if len(raw) == images_count * 32:
+                        for index in range(images_count):
+                            base = index * 32
+                            texts.append(
+                                CacheImageText(
+                                    load_address=_u64(raw, base + 16),
+                                    text_size=_u32(raw, base + 24),
+                                    path=_cstring(read_chunk(main.path, _u32(raw, base + 28), 512)),
+                                )
                             )
-                        )
-        self._cache_image_texts = texts
+        self._image_texts = texts
         return texts
 
-    def _cache_file_offset(self, path: str, offset: int, size: int) -> bytes:
-        with open(path, "rb") as handle:
-            handle.seek(offset)
-            return handle.read(size)
-
-    def _mapping_for(self, address: int) -> Optional[CacheMapping]:
-        for mapping in self._load_cache_mappings():
+    def _mapping(self, address: int) -> Optional[CacheMapping]:
+        for mapping in self._load_mappings():
             if mapping.va <= address < mapping.va + mapping.size:
                 return mapping
         return None
 
+    def _cache_reader(self, mapping: CacheMapping, base: int) -> Callable[[int, int], bytes]:
+        def read_at(offset: int, size: int) -> bytes:
+            with open(mapping.path, "rb") as handle:
+                handle.seek(base + offset)
+                return handle.read(size)
+
+        return read_at
+
     # -- verification -------------------------------------------------------
 
+    def _standalone_file(self, image: Image) -> str:
+        return os.path.join(self.fixture_root, image.path.lstrip("/"))
+
     def verify_image(self, image_index: int) -> ImageResolution:
-        image = self._image_model(image_index)
+        image = self.profile.images[image_index]
         if image.kind == IMAGE_KIND_STANDALONE:
-            fixture_path = os.path.join(self.fixture_root, image.path.lstrip("/"))
+            fixture_path = self._standalone_file(image)
             if not os.path.isfile(fixture_path):
-                raise ValidationFailure(
+                raise NRPTCodecError(
                     "E037", f"image[{image_index}] {image.path} not present in fixture ({fixture_path})"
                 )
             with open(fixture_path, "rb") as handle:
-                def read_at(offset: int, size: int, _handle=handle) -> bytes:
-                    _handle.seek(offset)
-                    return _handle.read(size)
-
-                segments = parse_macho_header(read_at)
+                segments = parse_macho_segments(lambda offset, size: (handle.seek(offset), handle.read(size))[1])
             text = next((segment for segment in segments if segment.name == "__TEXT"), None)
-            if text is None:
-                raise ValidationFailure("E041", f"image[{image_index}] has no __TEXT segment")
-            if text.vmaddr != image.unslid_vmaddr or text.vmsize != image.vm_size:
-                raise ValidationFailure(
-                    "E041",
-                    f"image[{image_index}] __TEXT geometry mismatch: "
-                    f"fixture vmaddr=0x{text.vmaddr:X} vmsize=0x{text.vmsize:X}, "
-                    f"profile vmaddr=0x{image.unslid_vmaddr:X} vmsize=0x{image.vm_size:X}",
+            if text is None or text.vmaddr != image.unslid_vmaddr or text.vmsize != image.vm_size:
+                raise NRPTCodecError(
+                    "E041", f"image[{image_index}] fixture __TEXT geometry does not match the profile image"
                 )
+            resolution = ImageResolution(
+                index=image_index,
+                kind=image.kind,
+                path=image.path,
+                unslid_vmaddr=image.unslid_vmaddr,
+                vm_size=image.vm_size,
+                text_vmaddr=text.vmaddr,
+                text_vmsize=text.vmsize,
+                file=fixture_path,
+                verified=True,
+            )
         elif image.kind == IMAGE_KIND_SHARED_CACHE:
-            texts = self._load_cache_image_texts()
             match = next(
                 (
                     text
-                    for text in texts
+                    for text in self._load_image_texts()
                     if text.load_address == image.unslid_vmaddr
                     and (text.path == image.path or text.path.endswith(image.path))
                 ),
                 None,
             )
             if match is None:
-                raise ValidationFailure(
+                raise NRPTCodecError(
                     "E041",
                     f"image[{image_index}] {image.path} (unslid 0x{image.unslid_vmaddr:X}) "
-                    "not found in the fixture dyld cache image-text list",
+                    "not in the fixture dyld cache image-text list",
                 )
             if match.text_size != image.vm_size:
-                raise ValidationFailure(
+                raise NRPTCodecError(
                     "E041",
-                    f"image[{image_index}] __TEXT vmsize mismatch: fixture 0x{match.text_size:X}, "
-                    f"profile 0x{image.vm_size:X}",
+                    f"image[{image_index}] fixture __TEXT vmsize 0x{match.text_size:X} != profile 0x{image.vm_size:X}",
                 )
-            mapping = self._mapping_for(image.unslid_vmaddr)
+            mapping = self._mapping(image.unslid_vmaddr)
             if mapping is None:
-                raise ValidationFailure(
-                    "E041", f"image[{image_index}] unslid address is not in any fixture cache mapping"
-                )
-            header_offset = mapping.file_offset + (image.unslid_vmaddr - mapping.va)
-
-            def read_at(offset: int, size: int, _path=mapping.path, _base=header_offset) -> bytes:
-                return self._cache_file_offset(_path, _base + offset, size)
-
-            segments = parse_macho_header(read_at)
+                raise NRPTCodecError("E041", f"image[{image_index}] unslid address not in any fixture mapping")
+            header_base = mapping.file_offset + (image.unslid_vmaddr - mapping.va)
+            segments = parse_macho_segments(self._cache_reader(mapping, header_base))
             text = next((segment for segment in segments if segment.name == "__TEXT"), None)
             if text is None or text.vmaddr != image.unslid_vmaddr or text.vmsize != image.vm_size:
-                raise ValidationFailure(
-                    "E041", f"image[{image_index}] fixture Mach-O __TEXT geometry does not match metadata"
+                raise NRPTCodecError(
+                    "E041", f"image[{image_index}] fixture Mach-O __TEXT geometry does not match the profile image"
                 )
+            resolution = ImageResolution(
+                index=image_index,
+                kind=image.kind,
+                path=image.path,
+                unslid_vmaddr=image.unslid_vmaddr,
+                vm_size=image.vm_size,
+                text_vmaddr=text.vmaddr,
+                text_vmsize=text.vmsize,
+                file=mapping.path,
+                verified=True,
+            )
         else:  # pragma: no cover - model validation rejects unknown kinds
-            raise ValidationFailure("E041", f"image[{image_index}] has unsupported kind {image.kind}")
+            raise NRPTCodecError("E041", f"image[{image_index}] unsupported kind")
 
-        self._verify_name_lists(image_index, segments)
-        resolution = ImageResolution(
-            image_index=image_index,
-            kind=image.kind,
-            path=image.path,
-            unslid_vmaddr=image.unslid_vmaddr,
-            vm_size=image.vm_size,
-            segment_count=len(image.segments),
-            section_count=len(image.sections),
-        )
         self.image_resolutions.append(resolution)
         return resolution
 
-    def _image_model(self, image_index: int) -> Image:
-        return self._profile.images[image_index]
-
-    def _verify_name_lists(self, image_index: int, segments: Sequence[MachOSegment]) -> None:
-        image = self._image_model(image_index)
-        parsed_segments = {segment.name for segment in segments}
-        parsed_sections = {section.name for segment in segments for section in segment.sections}
-        for name in image.segments:
-            if name not in parsed_segments:
-                raise ValidationFailure(
-                    "E041", f"image[{image_index}] profile segment {name!r} is absent from the fixture image"
-                )
-        for name in image.sections:
-            if name not in parsed_sections:
-                raise ValidationFailure(
-                    "E041", f"image[{image_index}] profile section {name!r} is absent from the fixture image"
-                )
-        if "__TEXT" not in image.segments:
-            raise ValidationFailure("E041", f"image[{image_index}] profile segment list lacks __TEXT")
-
-    def resolve_page(self, profile: Profile, page_index: int) -> PageMetadataResolution:
-        page = profile.pages[page_index]
-        image = profile.images[page.image_index]
+    def resolve_page(self, page_index: int) -> PageResolution:
+        page = self.profile.pages[page_index]
+        image = self.profile.images[page.image_index]
         page_start = image.unslid_vmaddr + page.page_vm_offset
+        if page_start + PAGE_SIZE > image.unslid_vmaddr + image.vm_size:
+            raise NRPTCodecError(
+                "E040", f"page[{page_index}] pageStart 0x{page_start:X} leaves the image extent"
+            )
 
         if image.kind == IMAGE_KIND_STANDALONE:
-            fixture_path = os.path.join(self.fixture_root, image.path.lstrip("/"))
+            fixture_path = self._standalone_file(image)
             with open(fixture_path, "rb") as handle:
-                def read_at(offset: int, size: int, _handle=handle) -> bytes:
-                    _handle.seek(offset)
-                    return _handle.read(size)
-
-                segments = parse_macho_header(read_at)
-                segment = _segment_containing(segments, page_start)
-                section = _section_containing(segments, page_start)
-                if segment is None or segment.name not in image.segments:
-                    raise ValidationFailure(
-                        "E040",
-                        f"page[{page_index}] pageStart 0x{page_start:X} is not inside a profile segment",
-                    )
-                section_name = section.name if section is not None else None
-                if section_name is not None and section_name not in image.sections:
-                    raise ValidationFailure(
-                        "E040",
-                        f"page[{page_index}] pageStart 0x{page_start:X} lies in section {section_name!r} "
-                        "which the profile's image metadata does not list",
-                    )
-                file_offset = segment.fileoff + (page_start - segment.vmaddr)
-                if page.page_file_offset != file_offset:
-                    raise ValidationFailure(
-                        "E040",
-                        f"page[{page_index}] profile pageFileOffset 0x{page.page_file_offset:X} != "
-                        f"re-resolved standalone file offset 0x{file_offset:X}",
-                    )
-                page_bytes = self._cache_file_offset(fixture_path, file_offset, PAGE_SIZE)
-                resolved_file, namespace = fixture_path, "standalone-file-offset"
-        else:
-            mapping = self._mapping_for(page_start)
-            if mapping is None:
-                raise ValidationFailure(
-                    "E040", f"page[{page_index}] pageStart 0x{page_start:X} is not in a fixture cache mapping"
-                )
-            header_mapping = self._mapping_for(image.unslid_vmaddr)
-            if header_mapping is None:
-                raise ValidationFailure(
-                    "E041",
-                    f"image[{page.image_index}] unslid header address 0x{image.unslid_vmaddr:X} "
-                    "is not in a fixture cache mapping",
-                )
-            header_offset = header_mapping.file_offset + (image.unslid_vmaddr - header_mapping.va)
-
-            def read_at(offset: int, size: int, _path=header_mapping.path, _base=header_offset) -> bytes:
-                return self._cache_file_offset(_path, _base + offset, size)
-
-            segments = parse_macho_header(read_at)
-            segment = _segment_containing(segments, page_start)
-            section = _section_containing(segments, page_start)
-            if segment is None or segment.name not in image.segments:
-                raise ValidationFailure(
-                    "E040",
-                    f"page[{page_index}] pageStart 0x{page_start:X} is not inside a profile segment",
-                )
-            section_name = section.name if section is not None else None
-            if section_name is not None and section_name not in image.sections:
-                raise ValidationFailure(
-                    "E040",
-                    f"page[{page_index}] pageStart 0x{page_start:X} lies in section {section_name!r} "
-                    "which the profile's image metadata does not list",
-                )
-            file_offset = mapping.file_offset + (page_start - mapping.va)
-            if page.page_file_offset != file_offset:
-                raise ValidationFailure(
-                    "E040",
-                    f"page[{page_index}] profile pageFileOffset 0x{page.page_file_offset:X} != "
-                    f"re-resolved subcache file offset 0x{file_offset:X}",
-                )
-            page_bytes = self._cache_file_offset(mapping.path, file_offset, PAGE_SIZE)
-            resolved_file, namespace = mapping.path, "subcache-file-offset"
-
-        if len(page_bytes) != PAGE_SIZE:
-            raise ValidationFailure(
-                "E040", f"page[{page_index}] fixture page read at 0x{page.page_file_offset:X} is truncated"
+                segments = parse_macho_segments(lambda offset, size: (handle.seek(offset), handle.read(size))[1])
+            segment = segment_containing(segments, page_start)
+            section = next(
+                (
+                    section
+                    for segment_candidate in segments
+                    for section in segment_candidate.sections
+                    if section.addr <= page_start < section.addr + section.size
+                ),
+                None,
             )
+            if segment is None:
+                raise NRPTCodecError("E040", f"page[{page_index}] pageStart is not inside a fixture segment")
+            resolved_offset = segment.fileoff + (page_start - segment.vmaddr)
+            resolved_file = fixture_path
+        else:
+            mapping = self._mapping(page_start)
+            if mapping is None:
+                raise NRPTCodecError("E040", f"page[{page_index}] pageStart is not in a fixture cache mapping")
+            resolved_offset = mapping.file_offset + (page_start - mapping.va)
+            resolved_file = mapping.path
+            segment = MachOSegment(name="__TEXT", vmaddr=image.unslid_vmaddr, vmsize=image.vm_size,
+                                   fileoff=0, filesize=image.vm_size)
+            section = MachOSection(name="__text", segname="__TEXT", addr=page_start, size=PAGE_SIZE, offset=0)
+            header_mapping = self._mapping(image.unslid_vmaddr)
+            if header_mapping is None:
+                raise NRPTCodecError("E041", f"page[{page_index}] image header address not mapped")
+            header_base = header_mapping.file_offset + (image.unslid_vmaddr - header_mapping.va)
+            segments = parse_macho_segments(self._cache_reader(header_mapping, header_base))
+            real_segment = segment_containing(segments, page_start)
+            if real_segment is not None:
+                segment = real_segment
+                section = next(
+                    (
+                        candidate
+                        for segment_candidate in segments
+                        for candidate in segment_candidate.sections
+                        if candidate.addr <= page_start < candidate.addr + candidate.size
+                    ),
+                    section,
+                )
+
+        page_bytes = read_chunk(resolved_file, resolved_offset, PAGE_SIZE)
+        if len(page_bytes) != PAGE_SIZE:
+            raise NRPTCodecError("E040", f"page[{page_index}] fixture page read is truncated")
         if fnv1a64(page_bytes) != page.page_hash:
-            raise ValidationFailure(
+            raise NRPTCodecError(
                 "E040",
                 f"page[{page_index}] clean fixture page hash 0x{fnv1a64(page_bytes):016X} != "
                 f"profile pageHash 0x{page.page_hash:016X}",
             )
-        resolution = PageMetadataResolution(
+        resolution = PageResolution(
+            page_index=page_index,
             image_index=page.image_index,
             image_kind=image.kind,
             image_path=image.path,
-            image_unslid_vmaddr=image.unslid_vmaddr,
-            image_vm_size=image.vm_size,
+            mode=page.mode,
+            page_file_offset=page.page_file_offset,
             page_vm_offset=page.page_vm_offset,
             page_start=page_start,
+            resolved_file=resolved_file,
+            resolved_offset=resolved_offset,
+            evidence_consistent=(page.page_file_offset == resolved_offset),
             segment=segment.name,
-            section=section_name,
-            file=resolved_file,
-            file_offset=file_offset,
-            namespace=namespace,
+            section=section.name if section is not None else None,
             page=page_bytes,
         )
         self.page_resolutions[page_index] = resolution
@@ -1830,25 +1492,138 @@ class FixtureCatalog:
 
 
 # ---------------------------------------------------------------------------
-# Offline validation of a profile against a clean fixture
+# Full-fixture content scan (false-positive / duplicate check)
+# ---------------------------------------------------------------------------
+
+NATIVE_SCAN_THRESHOLD_BYTES = 64 * 1024 * 1024
+HASH_SCAN_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hash_scan.c")
+
+
+def native_hash_scan_binary() -> Optional[str]:
+    if not os.path.isfile(HASH_SCAN_SOURCE):
+        return None
+    compiler = shutil.which("clang") or shutil.which("cc") or shutil.which("gcc")
+    if compiler is None:
+        return None
+    with open(HASH_SCAN_SOURCE, "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()[:16]
+    binary_path = os.path.join(tempfile.gettempdir(), f"nrpt_hash_scan_{digest}")
+    if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
+        return binary_path
+    try:
+        completed = subprocess.run(
+            [compiler, "-O2", "-o", binary_path, HASH_SCAN_SOURCE],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0 or not os.path.isfile(binary_path):
+        return None
+    return binary_path
+
+
+def python_page_hash_scan(
+    files: Sequence[str], queries: Sequence[int]
+) -> dict[int, list[tuple[str, int]]]:
+    wanted = set(queries)
+    results: dict[int, list[tuple[str, int]]] = {query: [] for query in wanted}
+    for path in files:
+        offset = 0
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            while offset + PAGE_SIZE <= size:
+                chunk = handle.read(PAGE_SIZE)
+                if len(chunk) != PAGE_SIZE:
+                    break
+                digest = fnv1a64(chunk)
+                if digest in results:
+                    results[digest].append((path, offset))
+                offset += PAGE_SIZE
+    return results
+
+
+def native_page_hash_scan(
+    files: Sequence[str], queries: Sequence[int], binary_path: str
+) -> Optional[dict[int, list[tuple[str, int]]]]:
+    wanted = sorted(set(queries))
+    if not wanted:
+        return {}
+    handle = tempfile.NamedTemporaryFile(mode="w", prefix="nrpt-v3-queries-", suffix=".txt", delete=False)
+    try:
+        for query in wanted:
+            handle.write(f"{query:016x}\n")
+        handle.close()
+        completed = subprocess.run(
+            [binary_path, handle.name] + list(files), capture_output=True, text=True, timeout=900
+        )
+        if completed.returncode != 0:
+            return None
+        results: dict[int, list[tuple[str, int]]] = {query: [] for query in wanted}
+        for line in completed.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) != 3:
+                continue
+            try:
+                digest = int(fields[0], 16)
+                file_index = int(fields[1])
+                offset = int(fields[2], 16)
+            except ValueError:
+                continue
+            if digest in results and 0 <= file_index < len(files):
+                results[digest].append((files[file_index], offset))
+        return results
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        if not handle.closed:
+            handle.close()
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+
+
+def scan_fixture_page_hashes(
+    files: Sequence[str], queries: Sequence[int], *, allow_native: bool = True
+) -> tuple[dict[int, list[tuple[str, int]]], str]:
+    total = sum(os.path.getsize(path) for path in files)
+    if allow_native and total > NATIVE_SCAN_THRESHOLD_BYTES:
+        binary = native_hash_scan_binary()
+        if binary is not None:
+            print(
+                f"hash scan: {len(set(queries))} hash(es) over {len(files)} file(s) "
+                f"({total / 1e9:.2f} GB) via native helper",
+                file=sys.stderr,
+            )
+            results = native_page_hash_scan(files, queries, binary)
+            if results is not None:
+                return results, "native"
+            print("hash scan: native helper failed; using Python", file=sys.stderr)
+    print(
+        f"hash scan: {len(set(queries))} hash(es) over {len(files)} file(s) "
+        f"({total / 1e9:.2f} GB) via Python (may be slow)",
+        file=sys.stderr,
+    )
+    return python_page_hash_scan(files, queries), "python"
+
+
+# ---------------------------------------------------------------------------
+# Offline validation against a clean fixture
 # ---------------------------------------------------------------------------
 
 
-@dataclass
 class ValidationFailure(Exception):
-    code: str
-    detail: str
+    def __init__(self, code: str, detail: str) -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}")
 
-    def __str__(self) -> str:  # pragma: no cover - trivial
-        return f"{self.code}: {self.detail}"
 
-
-def _fixture_build(fixture_root: str) -> Optional[str]:
-    candidates = [
+def fixture_build(fixture_root: str) -> Optional[str]:
+    for candidate in (
         os.path.join(fixture_root, "System/Library/CoreServices/SystemVersion.plist"),
         os.path.join(fixture_root, "SystemVersion.plist"),
-    ]
-    for candidate in candidates:
+    ):
         if not os.path.isfile(candidate):
             continue
         try:
@@ -1862,30 +1637,29 @@ def _fixture_build(fixture_root: str) -> Optional[str]:
     return None
 
 
-def _candidate_apu_mask_for_device(device_id: int) -> Optional[int]:
-    return DEVICE_CANDIDATE_MASK.get(device_id)
+def vnode_name_for(page: Page, profile: Profile, resolution: PageResolution) -> str:
+    image = profile.images[page.image_index]
+    if page.mode == MODE_PAGE:
+        return image.basename
+    return os.path.basename(resolution.resolved_file)
 
 
 def validate_profile_against_fixture(
     profile: Profile,
-    images: Sequence[FixtureImage],
     *,
     profile_path: str,
     profile_bytes: bytes,
     fixture_root: str,
     expected_build: Optional[str] = None,
     device_id: Optional[int] = None,
+    expected_apu_mask: Optional[int] = None,
+    bundle: Optional[Bundle] = None,
+    selection: Optional[Selection] = None,
     mutation_sweep: bool = False,
-    range_simulation: bool = True,
-    hash_only_scan: bool = True,
+    route_simulation: bool = True,
     native_hash_scan: bool = True,
-    duplicate_content_scan: bool = True,
+    strict_false_positives: bool = False,
 ) -> dict:
-    """Apply `profile` to the clean fixture exactly like the kext and build a report dict.
-
-    Raises ValidationFailure for deployability failures. Returns the report dict otherwise
-    (identity warnings are reported inside, not raised).
-    """
     report: dict = {
         "tool": "test/nrpt_validator.py",
         "toolVersion": __version__,
@@ -1893,554 +1667,461 @@ def validate_profile_against_fixture(
             "path": profile_path,
             "size": len(profile_bytes),
             "sha256": hashlib.sha256(profile_bytes).hexdigest(),
-            "magic": MAGIC.decode("ascii"),
-            "version": profile.version,
-            "format": f"v{profile.version}",
+            "magic": MAGIC.decode(),
+            "version": VERSION,
             "build": profile.header.build,
-            "imageCount": len(profile.images),
             "apuMask": f"0x{profile.header.apu_mask:08X}",
             "deviceID": f"0x{profile.header.device_id:04X}",
-            "headerFlags": f"0x{profile.header.flags:08X}",
             "pageCount": profile.page_count,
             "siteCount": profile.site_count,
+            "modePageCount": sum(1 for page in profile.pages if page.mode == MODE_PAGE),
+            "modeDyldCount": sum(1 for page in profile.pages if page.mode == MODE_DYLD),
             "payloadChecksum": f"0x{fnv1a32(profile_bytes[HEADER_SIZE:]):08X}",
             "checksumOk": True,
+            "imageCount": len(profile.images),
         },
-        "fixture": {
-            "root": fixture_root,
-            "build": None,
-            "imageCount": len(images),
-            "images": [{"name": image.name, "size": image.size} for image in images],
-        },
+        "fixture": {"root": fixture_root, "build": None, "imageCount": 0, "images": []},
         "identity": {},
-        "pages": [],
-        "hashScan": {
-            "mode": "not-needed",
-            "queries": 0,
-            "pagesHashed": 0,
-            "candidateBytes": 0,
-        },
+        "bundle": None,
+        "selection": None,
         "images": [],
-        "duplicateContent": [],
+        "pages": [],
         "falsePositiveChecks": [],
+        "duplicateContent": [],
+        "routeSimulation": {},
         "mutationSweep": [],
-        "rangeSimulation": [],
         "warnings": [],
         "summary": {},
         "result": "PASS",
     }
 
-    # --- fixture build identity -------------------------------------------------
-    fixture_build = _fixture_build(fixture_root)
-    report["fixture"]["build"] = fixture_build
-    effective_expected_build = expected_build or fixture_build
-    build_check: dict = {"expected": effective_expected_build, "profile": profile.header.build}
-    if effective_expected_build is None:
+    images = discover_images(fixture_root)
+    report["fixture"]["imageCount"] = len(images)
+    report["fixture"]["images"] = [{"name": image.name, "size": image.size} for image in images]
+    if not images:
+        raise ValidationFailure("E037", f"no candidate fixture images under {fixture_root}")
+
+    # --- identity gates -----------------------------------------------------
+    fixture_version = fixture_build(fixture_root)
+    report["fixture"]["build"] = fixture_version
+    expected = expected_build or fixture_version
+    build_check: dict = {"expected": expected, "profile": profile.header.build}
+    if expected is None:
         build_check["status"] = "unknown"
-        report["warnings"].append(
-            "fixture build could not be determined; build gate not verified offline"
-        )
-    elif effective_expected_build == profile.header.build:
+        report["warnings"].append("fixture build unknown; build gate not verified offline")
+    elif expected == profile.header.build:
         build_check["status"] = "pass"
     else:
-        build_check["status"] = "fail"
+        report["result"] = "FAIL"
         raise ValidationFailure(
-            "E005",
-            f"profile build {profile.header.build!r} != fixture build {effective_expected_build!r}",
+            "E005", f"profile build {profile.header.build!r} != expected build {expected!r}"
         )
     report["identity"]["build"] = build_check
 
-    # --- APU / device identity --------------------------------------------------
+    running_apu_mask = expected_apu_mask
+    if running_apu_mask is None and device_id is not None:
+        running_apu_mask = candidate_apu_mask(device_id)
     apu_check: dict = {
         "apuMask": f"0x{profile.header.apu_mask:08X}",
         "deviceID": f"0x{profile.header.device_id:04X}",
-        "requireDeviceID": (profile.header.flags & HEADER_FLAG_REQUIRE_DEVICE_ID) != 0,
         "runningDeviceID": f"0x{device_id:04X}" if device_id is not None else None,
-        "candidateMask": None,
+        "runningApuMask": f"0x{running_apu_mask:08X}" if running_apu_mask is not None else None,
         "status": "unknown",
     }
-    if device_id is not None:
-        candidate_mask = _candidate_apu_mask_for_device(device_id)
-        apu_check["candidateMask"] = (
-            f"0x{candidate_mask:08X}" if candidate_mask is not None else None
-        )
-        if candidate_mask is None:
+    if running_apu_mask is not None:
+        if running_apu_mask == 0:
             apu_check["status"] = "fail"
-            raise ValidationFailure(
-                "E007", f"running device 0x{device_id:04X} has no candidate APU family (fail closed)"
-            )
-        if (profile.header.apu_mask & candidate_mask) == 0:
+            report["result"] = "FAIL"
+            raise ValidationFailure("E006", "running APU family mask is unknown (0)")
+        if (profile.header.apu_mask & running_apu_mask) == 0:
             apu_check["status"] = "fail"
+            report["result"] = "FAIL"
             raise ValidationFailure(
                 "E006",
-                f"apuMask 0x{profile.header.apu_mask:08X} does not intersect candidate mask "
-                f"0x{candidate_mask:08X} for device 0x{device_id:04X}",
+                f"apuMask 0x{profile.header.apu_mask:08X} does not intersect running mask "
+                f"0x{running_apu_mask:08X}",
             )
-        if apu_check["requireDeviceID"] and profile.header.device_id != device_id:
+        if profile.header.device_id != 0 and device_id is not None and profile.header.device_id != device_id:
             apu_check["status"] = "fail"
+            report["result"] = "FAIL"
             raise ValidationFailure(
                 "E007",
-                f"profile deviceID 0x{profile.header.device_id:04X} != running device "
-                f"0x{device_id:04X} while REQUIRE_DEVICE_ID is set",
+                f"profile deviceID 0x{profile.header.device_id:04X} != running device 0x{device_id:04X}",
             )
         apu_check["status"] = "pass"
     else:
-        report["warnings"].append(
-            "running device ID not supplied (--device-id); APU/device gate not verified offline"
-        )
+        report["warnings"].append("running APU/device identity not supplied; APU/device gate not verified")
     report["identity"]["apuAndDevice"] = apu_check
 
-    # --- NRPT v2: re-resolve the target-image metadata against the clean fixture ----
-    catalog: Optional[FixtureCatalog] = None
-    if profile.version == VERSION_V2:
-        catalog = FixtureCatalog(fixture_root, images, profile)
-        try:
-            for image_index in range(len(profile.images)):
-                catalog.verify_image(image_index)
-        except ValidationFailure:
+    # --- bundle/selection report -------------------------------------------
+    if bundle is not None:
+        report["bundle"] = {
+            "profileCount": len(bundle.entries),
+            "entries": [
+                {
+                    "index": index,
+                    "build": entry.build,
+                    "apuMask": f"0x{entry.apu_mask:08X}",
+                    "deviceID": f"0x{entry.device_id:04X}",
+                    "profileSha256": entry.sha256,
+                    "profileSize": len(entry.profile_data),
+                }
+                for index, entry in enumerate(bundle.entries)
+            ],
+        }
+    if selection is not None:
+        report["selection"] = {
+            "status": selection.status,
+            "index": selection.index,
+            "build": bundle.entries[selection.index].build if (bundle and selection.index is not None) else None,
+        }
+        if not selection.selected:
             report["result"] = "FAIL"
-            raise
-        report["images"] = [
+            raise ValidationFailure("E050", f"bundle selection failed: {selection.status}")
+
+    # --- fixture metadata + page resolution --------------------------------
+    catalog = FixtureCatalog(fixture_root, profile)
+    for image_index in range(len(profile.images)):
+        try:
+            resolution = catalog.verify_image(image_index)
+        except NRPTCodecError as error:
+            report["result"] = "FAIL"
+            raise ValidationFailure(error.code, error.detail) from error
+        report["images"].append(
             {
-                "index": resolution.image_index,
-                "kind": "standalone-file" if resolution.kind == IMAGE_KIND_STANDALONE else "dyld-shared-cache",
+                "index": resolution.index,
+                "kind": IMAGE_KIND_NAMES[resolution.kind],
                 "path": resolution.path,
                 "unslidVmaddr": f"0x{resolution.unslid_vmaddr:X}",
                 "vmSize": f"0x{resolution.vm_size:X}",
-                "segments": resolution.segment_count,
-                "sections": resolution.section_count,
-                "verified": True,
+                "textVmaddr": f"0x{resolution.text_vmaddr:X}",
+                "textVmSize": f"0x{resolution.text_vmsize:X}",
+                "file": os.path.basename(resolution.file),
+                "verified": resolution.verified,
             }
-            for resolution in catalog.image_resolutions
-        ]
-
-    # --- resolve every intended page against the clean fixture ------------------
-    # Hash-only records (REQUIRE_OFFSET cleared) identify pages by content, so one full-fixture
-    # scan answers both resolution and the false-positive obligation. The same scan doubles as the
-    # content-duplicate analysis (identical 4 KiB pages elsewhere in the fixture): with
-    # REQUIRE_OFFSET set such a duplicate is not an identity match (the offset differs), but it is
-    # still useful deployability evidence.
-    hash_only_indices = [
-        index
-        for index, page in enumerate(profile.pages)
-        if not (page.match_flags & MATCH_REQUIRE_OFFSET)
-    ]
-    scan_needed = (bool(hash_only_indices) and hash_only_scan) or duplicate_content_scan
-    hash_scan_results: dict[int, list[tuple[str, int]]] = {}
-    hash_scan_mode = "not-needed"
-    if scan_needed:
-        if duplicate_content_scan:
-            wanted = {page.page_hash for page in profile.pages}
-        else:
-            wanted = {profile.pages[index].page_hash for index in hash_only_indices}
-        hash_scan_results, hash_scan_mode = scan_fixture_page_hashes(
-            images, wanted, allow_native=native_hash_scan
         )
-        report["hashScan"] = {
-            "mode": hash_scan_mode,
-            "queries": len(wanted),
-            "pagesHashed": sum(image.size // PAGE_SIZE for image in images),
-            "candidateBytes": sum(image.size for image in images),
-            "duplicateContentScan": bool(duplicate_content_scan),
-        }
-    else:
-        if hash_only_indices and not hash_only_scan:
-            report["warnings"].append(
-                "hash-only false-positive scan disabled (--no-hash-only-scan): profile not deployable"
-            )
-        report["hashScan"] = {
-            "mode": "not-needed",
-            "queries": 0,
-            "pagesHashed": 0,
-            "candidateBytes": sum(image.size for image in images),
-            "duplicateContentScan": False,
-        }
-    scanned_hashes = set(hash_scan_results.keys())
 
-    images_by_path = {image.path: image for image in images}
-    resolved: list[Optional[tuple[FixtureImage, int, bytes]]] = []
-    for page_index, page in enumerate(profile.pages):
+    resolved: list[PageResolution] = []
+    for page_index in range(profile.page_count):
+        try:
+            resolution = catalog.resolve_page(page_index)
+        except NRPTCodecError as error:
+            report["result"] = "FAIL"
+            raise ValidationFailure(error.code, error.detail) from error
+        resolved.append(resolution)
+        page = profile.pages[page_index]
         page_report: dict = {
             "index": page_index,
+            "mode": MODE_NAMES[page.mode],
             "pageFileOffset": f"0x{page.page_file_offset:08X}",
+            "pageVmOffset": f"0x{page.page_vm_offset:08X}",
             "pageHash": f"0x{page.page_hash:016X}",
-            "matchFlags": f"0x{page.match_flags:04X}",
-            "requiresOffset": (page.match_flags & MATCH_REQUIRE_OFFSET) != 0,
-            "siteCount": len(page.sites),
-            "resolutionMatches": 0,
-            "image": None,
-            "resolvedOffset": None,
-            "cleanPageHash": None,
-            "offsetGate": "n/a",
-            "hashMatch": False,
-            "matchedRecordIndex": None,
-            "siteFindMismatches": 0,
-            "applied": False,
+            "imageIndex": page.image_index,
+            "imageKind": IMAGE_KIND_NAMES[resolution.image_kind],
+            "imagePath": resolution.image_path,
+            "pageStart": f"0x{resolution.page_start:X}",
+            "resolvedFile": os.path.basename(resolution.resolved_file),
+            "resolvedOffset": f"0x{resolution.resolved_offset:08X}",
+            "evidenceConsistent": resolution.evidence_consistent,
+            "segment": resolution.segment,
+            "section": resolution.section,
+            "vnodeName": vnode_name_for(page, profile, resolution),
             "sites": [],
+            "applied": False,
         }
-        if catalog is not None:
-            # NRPT v2: metadata re-resolution is mandatory and authoritative for the fixture location.
-            metadata = catalog.resolve_page(profile, page_index)
-            resolved_path = os.path.realpath(metadata.file)
-            image = FixtureImage(
-                path=resolved_path, name=os.path.basename(resolved_path), size=os.path.getsize(resolved_path)
+        if not resolution.evidence_consistent:
+            report["warnings"].append(
+                f"page[{page_index}] pageFileOffset evidence 0x{page.page_file_offset:X} != resolved "
+                f"offset 0x{resolution.resolved_offset:X} (diagnostic only; identity is content)"
             )
-            resolved_offset = metadata.file_offset
-            clean = metadata.page
-            page_report["metadata"] = {
-                "imageIndex": metadata.image_index,
-                "imageKind": "standalone-file" if metadata.image_kind == IMAGE_KIND_STANDALONE
-                else "dyld-shared-cache",
-                "imagePath": metadata.image_path,
-                "imageUnslidVmaddr": f"0x{metadata.image_unslid_vmaddr:X}",
-                "imageVmSize": f"0x{metadata.image_vm_size:X}",
-                "pageVmOffset": f"0x{metadata.page_vm_offset:X}",
-                "pageStart": f"0x{metadata.page_start:X}",
-                "segment": metadata.segment,
-                "section": metadata.section,
-                "file": os.path.basename(metadata.file),
-                "fileOffset": f"0x{metadata.file_offset:X}",
-                "namespace": metadata.namespace,
-                "verified": True,
-            }
-            page_report["resolutionMatches"] = 1
-            page_report["offsetGate"] = "pass"
-            page_report["hashMatch"] = True
-            page_report["image"] = image.name
-            page_report["resolvedOffset"] = f"0x{resolved_offset:08X}"
-            page_report["cleanPageHash"] = f"0x{fnv1a64(clean):016X}"
-            page_report["cleanPageSha256"] = hashlib.sha256(clean).hexdigest()
-            resolved.append((image, resolved_offset, clean))
-            report["pages"].append(page_report)
-            continue
-
-        if page.match_flags & MATCH_REQUIRE_OFFSET:
-            matches = resolve_page(page, images)
-            page_report["resolutionMatches"] = len(matches)
-            if not matches:
-                page_report["status"] = "unresolved"
-                report["pages"].append(page_report)
-                report["result"] = "FAIL"
-                raise ValidationFailure(
-                    "E030",
-                    f"page[{page_index}] identity not found in clean fixture "
-                    f"(offset=0x{page.page_file_offset:X} hash=0x{page.page_hash:016X})",
-                )
-            image, resolved_offset, clean = matches[0]
-            page_report["offsetGate"] = "pass"
-            if len(matches) > 1:
-                report["warnings"].append(
-                    f"page[{page_index}] identity also present in {len(matches) - 1} other fixture "
-                    "image(s) at the same offset (identical content; runtime offset+hash gate cannot "
-                    "distinguish them, but the writes are identical)"
-                )
-        else:
-            # Prefer the generator-recorded offset when it resolves in the fixture; otherwise fall
-            # back to the full-fixture hash scan. Content identity is authoritative either way.
-            offset_matches: list[tuple[FixtureImage, int, bytes]] = []
-            for candidate in images:
-                if page.page_file_offset + PAGE_SIZE > candidate.size:
-                    continue
-                chunk = read_chunk(candidate.path, page.page_file_offset)
-                if len(chunk) == PAGE_SIZE and fnv1a64(chunk) == page.page_hash:
-                    offset_matches.append((candidate, page.page_file_offset, chunk))
-            scan_matches = hash_scan_results.get(page.page_hash, [])
-            page_report["resolutionMatches"] = max(len(scan_matches), len(offset_matches))
-            page_report["offsetGate"] = "not-required"
-            if offset_matches:
-                image, resolved_offset, clean = offset_matches[0]
-            elif len(scan_matches) == 1:
-                image_path, offset = scan_matches[0]
-                image = images_by_path[image_path]
-                clean = read_chunk(image_path, offset)
-                resolved_offset = offset
-            elif not scan_matches:
-                page_report["status"] = "unresolved"
-                report["pages"].append(page_report)
-                report["result"] = "FAIL"
-                raise ValidationFailure(
-                    "E030",
-                    f"page[{page_index}] hash-only identity not found in clean fixture "
-                    f"(hash=0x{page.page_hash:016X})",
-                )
-            else:
-                page_report["status"] = "ambiguous"
-                report["pages"].append(page_report)
-                report["result"] = "FAIL"
-                raise ValidationFailure(
-                    "E031",
-                    f"page[{page_index}] hash-only identity matches {len(scan_matches)} fixture pages "
-                    f"(ambiguous, false-positive risk)",
-                )
-        page_report["image"] = image.name
-        page_report["resolvedOffset"] = f"0x{resolved_offset:08X}"
-        page_report["cleanPageHash"] = f"0x{fnv1a64(clean):016X}"
-        page_report["cleanPageSha256"] = hashlib.sha256(clean).hexdigest()
-        page_report["hashMatch"] = True
-        resolved.append((image, resolved_offset, clean))
         report["pages"].append(page_report)
 
-    # --- simulate per-page delivery through the full engine --------------------
+    # --- hook-domain application: PAGE mode via page hook, DYLD via range ---
     applied: set[int] = set()
-    for page_index, (image, resolved_offset, clean) in enumerate(resolved):
+    already_patched: set[int] = set()
+    for page_index, page in enumerate(profile.pages):
+        resolution = resolved[page_index]
+        vnode_name = vnode_name_for(page, profile, resolution)
+        result = apply_chunk(
+            profile,
+            resolution.page,
+            page.mode,
+            vnode_name=vnode_name,
+            applied=applied,
+            already_patched=already_patched,
+        )
         page_report = report["pages"][page_index]
-        result = apply_chunk(profile, clean, profile.pages[page_index].page_file_offset, applied)
         if result.status != "applied" or result.page_index != page_index:
             page_report["status"] = result.status
             report["result"] = "FAIL"
             raise ValidationFailure(
-                "E030",
-                f"page[{page_index}] did not apply through the kext algorithm: "
-                f"status={result.status} matchedRecord={result.page_index} "
-                f"site={result.site_index}",
+                "E020",
+                f"page[{page_index}] did not apply through the {MODE_NAMES[page.mode]} domain: "
+                f"status={result.status} matchedRecord={result.page_index} site={result.site_index}",
             )
-        page_report["matchedRecordIndex"] = result.page_index
-        page_report["applied"] = True
-        page_report["bytesChanged"] = sum(
-            1
-            for before, after in zip(clean, result.data)
-            if before != after
-        )
-        page_report["patchedPageHash"] = f"0x{fnv1a64(result.data):016X}"
-        page_report["patchedPageSha256"] = hashlib.sha256(result.data).hexdigest()
         page_report["status"] = "applied"
-
-        site_reports: list[dict] = []
+        page_report["applied"] = True
+        page_report["matchedRecordIndex"] = result.page_index
+        page_report["bytesChanged"] = sum(1 for before, after in zip(resolution.page, result.data) if before != after)
+        page_report["patchedPageHash"] = f"0x{fnv1a64(result.data):016X}"
         write_by_site = {write["siteInPage"]: write for write in result.writes}
-        for site_index, site in enumerate(profile.pages[page_index].sites):
+        for site_index, site in enumerate(page.sites):
             start = site.site_in_page
-            end = start + site.replace_size
-            site_reports.append(
+            end = start + site.size
+            page_report["sites"].append(
                 {
                     "index": site_index,
                     "siteInPage": f"0x{start:04X}",
-                    "findSize": site.find_size,
                     "findHex": site.find.hex(),
                     "replaceHex": site.replace.hex(),
                     "findMatched": True,
                     "written": result.data[start:end] == site.replace,
-                    "originalHex": clean[start:end].hex(),
-                    "patchedHex": result.data[start:end].hex(),
                     "write": write_by_site.get(start),
                 }
             )
-        page_report["sites"] = site_reports
-
-        # Applied-once semantics: a second delivery of the clean page must not re-write.
-        repeat = apply_chunk(profile, clean, profile.pages[page_index].page_file_offset, applied)
+        repeat = apply_chunk(
+            profile,
+            resolution.page,
+            page.mode,
+            vnode_name=vnode_name,
+            applied=applied,
+            already_patched=already_patched,
+        )
         page_report["secondDelivery"] = repeat.status
         if repeat.status != "alreadyApplied":
             report["result"] = "FAIL"
             raise ValidationFailure(
-                "E030",
-                f"page[{page_index}] applied-once bit not honoured on repeat delivery "
-                f"(status={repeat.status})",
+                "E031", f"page[{page_index}] applied-once bit not honoured on repeat delivery"
             )
 
-    # --- false-positive checks --------------------------------------------------
+    # --- already-patched pass (no write) -----------------------------------
     for page_index, page in enumerate(profile.pages):
-        image, resolved_offset, _clean = resolved[page_index]
-        unintended: list[dict] = []
-        if page.match_flags & MATCH_REQUIRE_OFFSET:
-            for other in images:
-                if other.path == image.path:
-                    continue
-                if page.page_file_offset + PAGE_SIZE > other.size:
-                    continue
-                chunk = read_chunk(other.path, page.page_file_offset)
-                if len(chunk) == PAGE_SIZE and fnv1a64(chunk) == page.page_hash:
-                    unintended.append(
-                        {
-                            "image": other.name,
-                            "offset": f"0x{page.page_file_offset:08X}",
-                            "reason": "same offset and same full-page hash",
-                        }
-                    )
-            check_status_skip = False
-        elif page.page_hash in scanned_hashes:
-            for match_path, match_offset in hash_scan_results.get(page.page_hash, []):
-                if match_path == image.path and match_offset == resolved_offset:
-                    continue
-                unintended.append(
-                    {
-                        "image": images_by_path[match_path].name,
-                        "offset": f"0x{match_offset:08X}",
-                        "reason": "hash-only identity matches another fixture page",
-                    }
-                )
-            check_status_skip = False
+        resolution = resolved[page_index]
+        patched_page = bytearray(resolution.page)
+        for site in page.sites:
+            patched_page[site.site_in_page : site.site_in_page + site.size] = site.replace
+        patched_applied: set[int] = set()
+        patched_already: set[int] = set()
+        result = apply_chunk(
+            profile,
+            bytes(patched_page),
+            page.mode,
+            vnode_name=vnode_name_for(page, profile, resolution),
+            applied=patched_applied,
+            already_patched=patched_already,
+        )
+        ok = result.status == "alreadyPatched" and result.page_index == page_index and not result.data
+        report["pages"][page_index]["alreadyPatchedDelivery"] = result.status
+        if not ok:
+            report["result"] = "FAIL"
+            raise ValidationFailure(
+                "E031", f"page[{page_index}] already-patched delivery not recognised (status={result.status})"
+            )
+
+    # --- false positives / duplicate content -------------------------------
+    # Candidate space is mode+vnode-domain scoped: PAGE scans only the target standalone file
+    # (the vnode gate accepts that basename), DYLD scans the dyld cache files (any dyld vnode).
+    # Byte-identical duplicates are therefore same-domain identity ambiguity, not route confusion;
+    # they are a warning by default and a failure only with --strict-false-positives.
+    scan_files: set[str] = set()
+    for page_index, page in enumerate(profile.pages):
+        if page.mode == MODE_PAGE:
+            scan_files.add(resolved[page_index].resolved_file)
         else:
-            check_status_skip = True
-        check: dict = {
+            scan_files.update(cache.path for cache in catalog.cache_files)
+    page_files = sorted(scan_files)
+    page_hashes = {page.page_hash for page in profile.pages}
+    hash_matches, scan_mode = scan_fixture_page_hashes(
+        page_files, sorted(page_hashes), allow_native=native_hash_scan
+    )
+    report["falsePositiveChecks"] = []
+    for page_index, page in enumerate(profile.pages):
+        resolution = resolved[page_index]
+        unintended: list[dict] = []
+        for file_path, offset in hash_matches.get(page.page_hash, []):
+            if file_path == resolution.resolved_file and offset == resolution.resolved_offset:
+                continue
+            chunk = read_chunk(file_path, offset)
+            if len(chunk) != PAGE_SIZE:
+                continue
+            matched, _bad = sites_identity_matches(page, chunk)
+            if not matched:
+                continue  # same content hash implies same bytes; a site mismatch is impossible unless profile sites disagree
+            unintended.append(
+                {
+                    "file": os.path.basename(file_path),
+                    "offset": f"0x{offset:08X}",
+                    "mode": MODE_NAMES[page.mode],
+                }
+            )
+        entry: dict = {
             "record": page_index,
-            "intendedImage": image.name,
-            "intendedOffset": f"0x{resolved_offset:08X}",
+            "mode": MODE_NAMES[page.mode],
+            "intendedFile": os.path.basename(resolution.resolved_file),
+            "intendedOffset": f"0x{resolution.resolved_offset:08X}",
+            "contentIdentityMatches": len(hash_matches.get(page.page_hash, [])),
             "unintendedMatches": unintended,
         }
-        if check_status_skip:
-            check["status"] = "skipped"
-        elif unintended:
-            if page.match_flags & MATCH_REQUIRE_OFFSET:
-                check["status"] = "warning"
-                report["warnings"].append(
-                    f"page[{page_index}] identity matches {len(unintended)} additional fixture "
-                    "page(s) (identical content); offset+hash gate cannot distinguish them"
-                )
-            else:
-                check["status"] = "fail"
+        if unintended:
+            report["duplicateContent"].append(entry)
+            report["warnings"].append(
+                f"page[{page_index}] content identity also matches {len(unintended)} other fixture page(s) "
+                f"in the {MODE_NAMES[page.mode]} domain (byte-identical content; the patch writes are identical)"
+            )
+            entry["status"] = "warning"
+        else:
+            entry["status"] = "pass"
+        report["falsePositiveChecks"].append(entry)
+    if report["duplicateContent"] and strict_false_positives:
+        report["result"] = "FAIL"
+        raise ValidationFailure(
+            "E031",
+            f"{len(report['duplicateContent'])} record(s) match unintended fixture content in their mode domain",
+        )
+
+    # --- route simulation (mode-domain separation) -------------------------
+    if route_simulation:
+        route: dict = {"pageMode": [], "dyldMode": [], "modeSeparation": []}
+        for page_index, page in enumerate(profile.pages):
+            if page.mode != MODE_PAGE:
+                continue
+            resolution = resolved[page_index]
+            page_route_applied: set[int] = set()
+            result = apply_chunk(
+                profile,
+                resolution.page,
+                MODE_PAGE,
+                vnode_name=profile.images[page.image_index].basename,
+                applied=page_route_applied,
+            )
+            other_mode = apply_chunk(
+                profile,
+                resolution.page,
+                MODE_DYLD,
+                vnode_name=os.path.basename(resolution.resolved_file),
+                applied=set(),
+            )
+            wrong_vnode = apply_chunk(
+                profile,
+                resolution.page,
+                MODE_PAGE,
+                vnode_name="unrelated-binary",
+                applied=set(),
+            )
+            entry = {
+                "record": page_index,
+                "mode": MODE_NAMES[page.mode],
+                "pageRoute": result.status,
+                "wrongMode": other_mode.status,
+                "wrongVnode": wrong_vnode.status,
+            }
+            route["pageMode"].append(entry)
+            if result.status != "applied" or other_mode.status != "noMatch" or wrong_vnode.status != "noMatch":
                 report["result"] = "FAIL"
                 raise ValidationFailure(
-                    "E031",
-                    f"page[{page_index}] hash-only identity matches unintended fixture content "
-                    f"({len(unintended)} page(s))",
+                    "E019",
+                    f"page[{page_index}] PAGE route simulation failed: {entry}",
                 )
-        else:
-            check["status"] = "pass"
-        report["falsePositiveChecks"].append(check)
-
-    # --- content-duplicate analysis (informational for offset-gated identities) --
-    if duplicate_content_scan and hash_scan_mode not in ("not-needed", "disabled"):
-        duplicate_records: list[dict] = []
+        # DYLD: contiguous range containing each intended page, delivered through the range hook.
+        dyld_groups: dict[str, list[int]] = {}
         for page_index, page in enumerate(profile.pages):
-            image, resolved_offset, _clean = resolved[page_index]
-            occurrences = [
-                {
-                    "image": images_by_path[match_path].name,
-                    "offset": f"0x{match_offset:08X}",
-                }
-                for match_path, match_offset in hash_scan_results.get(page.page_hash, [])
-            ]
-            unintended_identical = [
-                occurrence
-                for occurrence in occurrences
-                if not (
-                    occurrence["image"] == image.name
-                    and occurrence["offset"] == f"0x{resolved_offset:08X}"
+            if page.mode == MODE_DYLD:
+                dyld_groups.setdefault(resolved[page_index].resolved_file, []).append(page_index)
+        max_range_bytes = 4 * 1024 * 1024
+        for file_path, page_indices in dyld_groups.items():
+            offsets = sorted((resolved[index].resolved_offset, index) for index in page_indices)
+            clusters: list[list[tuple[int, int]]] = []
+            current: list[tuple[int, int]] = []
+            for offset, index in offsets:
+                if current and offset + PAGE_SIZE - current[0][0] > max_range_bytes:
+                    clusters.append(current)
+                    current = []
+                current.append((offset, index))
+            if current:
+                clusters.append(current)
+            for cluster in clusters:
+                base = cluster[0][0]
+                end = cluster[-1][0] + PAGE_SIZE
+                size = end - base
+                expected = {index for _offset, index in cluster}
+                range_data = read_chunk(file_path, base, size)
+                if len(range_data) != size:
+                    report["result"] = "FAIL"
+                    raise ValidationFailure(
+                        "E040",
+                        f"DYLD route simulation cannot read 0x{size:X} bytes at 0x{base:X} from "
+                        f"{os.path.basename(file_path)}",
+                    )
+                range_applied: set[int] = set()
+                results = apply_range(
+                    profile,
+                    range_data,
+                    base,
+                    MODE_DYLD,
+                    vnode_name=os.path.basename(file_path),
+                    applied=range_applied,
                 )
-            ]
-            if not unintended_identical:
-                continue
-            requires_offset = (page.match_flags & MATCH_REQUIRE_OFFSET) != 0
-            duplicate_records.append(
+                got = {result.page_index for result in results if result.status == "applied"}
+                entry = {
+                    "file": os.path.basename(file_path),
+                    "rangeBase": f"0x{base:08X}",
+                    "chunks": len(results),
+                    "expectedRecords": sorted(expected),
+                    "appliedRecords": sorted(got),
+                    "modeSeparation": "pass" if got == expected else "fail",
+                }
+                route["dyldMode"].append(entry)
+                if got != expected:
+                    report["result"] = "FAIL"
+                    raise ValidationFailure(
+                        "E019",
+                        f"DYLD route simulation for {os.path.basename(file_path)} applied {sorted(got)} "
+                        f"expected {sorted(expected)}",
+                    )
+        report["routeSimulation"] = route
+
+    # --- mutation rejection ------------------------------------------------
+    if mutation_sweep:
+        for page_index, page in enumerate(profile.pages):
+            resolution = resolved[page_index]
+            mutated = bytearray(resolution.page)
+            mutated[(page_index * 97 + 13) % PAGE_SIZE] ^= 0xFF
+            result = apply_chunk(
+                profile,
+                bytes(mutated),
+                page.mode,
+                vnode_name=vnode_name_for(page, profile, resolution),
+                applied=set(),
+            )
+            report["mutationSweep"].append(
                 {
                     "record": page_index,
-                    "pageHash": f"0x{page.page_hash:016X}",
-                    "requiresOffset": requires_offset,
-                    "intendedImage": image.name,
-                    "intendedOffset": f"0x{resolved_offset:08X}",
-                    "occurrences": occurrences,
-                    "unintendedIdenticalContent": unintended_identical,
-                    "identityAmbiguous": not requires_offset,
+                    "mode": MODE_NAMES[page.mode],
+                    "mutatedByte": (page_index * 97 + 13) % PAGE_SIZE,
+                    "status": result.status,
                 }
             )
-            if requires_offset:
-                report["warnings"].append(
-                    f"page[{page_index}] has byte-identical content at "
-                    f"{len(unintended_identical)} other fixture offset(s); identity is offset-gated "
-                    "so this is not a false positive, but the duplicate is recorded in the report"
-                )
-        report["duplicateContent"] = duplicate_records
-
-    # --- mutation sweep (false-positive rejection) ------------------------------
-    if mutation_sweep:
-        for page_index, (_image, _offset, clean) in enumerate(resolved):
-            mutated = bytearray(clean)
-            mutated[(page_index * 97 + 13) % PAGE_SIZE] ^= 0xFF
-            mutated_applied: set[int] = set(applied)
-            # The applied bit of this record is set; a mutated page must not even be considered
-            # as a write candidate, so use a fresh applied set (clean boot simulation).
-            mutated_applied = set()
-            result = apply_chunk(profile, bytes(mutated), profile.pages[page_index].page_file_offset,
-                                 mutated_applied)
-            sweep: dict = {
-                "record": page_index,
-                "mutatedByte": (page_index * 97 + 13) % PAGE_SIZE,
-                "status": result.status,
-                "wrote": result.status == "applied",
-            }
             if result.status == "applied":
                 report["result"] = "FAIL"
-                raise ValidationFailure(
-                    "E031",
-                    f"page[{page_index}] mutated content was still applied (hash gate failed)",
-                )
-            report["mutationSweep"].append(sweep)
+                raise ValidationFailure("E031", f"page[{page_index}] mutated content was still applied")
 
-    # --- range simulation -------------------------------------------------------
-    if range_simulation:
-        by_image: dict[str, list[tuple[int, int]]] = {}
-        for page_index, (image, offset, _clean) in enumerate(resolved):
-            by_image.setdefault(image.path, []).append((offset, page_index))
-        for image in images:
-            entries = sorted(by_image.get(image.path, []))
-            if len(entries) < 2:
-                continue
-            base = entries[0][0]
-            last = entries[-1][0]
-            size = last + PAGE_SIZE - base
-            if size > 4 * 1024 * 1024:
-                report["rangeSimulation"].append(
-                    {
-                        "image": image.name,
-                        "status": "skipped",
-                        "reason": "range span larger than 4 MiB",
-                        "records": [index for _offset, index in entries],
-                    }
-                )
-                continue
-            range_data = read_chunk(image.path, base, size)
-            if len(range_data) != size:
-                continue
-            range_applied: set[int] = set()
-            results = apply_range(profile, range_data, base, range_applied)
-            expected = {index for _offset, index in entries}
-            applied_indices = {
-                result.page_index for result in results if result.status == "applied"
-            }
-            simulation: dict = {
-                "image": image.name,
-                "rangeBase": f"0x{base:08X}",
-                "chunks": len(results),
-                "expectedRecords": sorted(expected),
-                "appliedRecords": sorted(applied_indices),
-                "status": "pass" if applied_indices == expected else "fail",
-            }
-            if applied_indices != expected:
-                report["result"] = "FAIL"
-                raise ValidationFailure(
-                    "E030",
-                    f"range simulation for {image.name} applied records "
-                    f"{sorted(applied_indices)} expected {sorted(expected)}",
-                )
-            report["rangeSimulation"].append(simulation)
-
-    # --- summary ----------------------------------------------------------------
     total_sites = sum(len(page["sites"]) for page in report["pages"])
+    report["hashScan"] = {"mode": scan_mode, "files": len(page_files), "queries": len(page_hashes)}
     report["summary"] = {
         "intendedPages": profile.page_count,
         "resolvedPages": len(resolved),
         "appliedPages": sum(1 for page in report["pages"] if page["applied"]),
         "intendedSites": profile.site_count,
         "reportedSites": total_sites,
-        "siteFindMismatches": 0,
-        "falsePositives": sum(
-            1
-            for check in report["falsePositiveChecks"]
-            if check["status"] == "fail" and check["unintendedMatches"]
-        ),
-        "identityWarnings": sum(
-            1
-            for check in report["falsePositiveChecks"]
-            if check["status"] == "warning" and check["unintendedMatches"]
-        ),
-        "identityChecks": {
-            key: value["status"] for key, value in report["identity"].items()
-        },
-        "hashScanMode": report["hashScan"]["mode"],
-        "contentDuplicates": len(report["duplicateContent"]),
+        "modePageCount": report["profile"]["modePageCount"],
+        "modeDyldCount": report["profile"]["modeDyldCount"],
+        "falsePositives": 0,
+        "identityWarnings": len(report["duplicateContent"]),
+        "mutationRejects": len([entry for entry in report["mutationSweep"] if entry["status"] != "applied"]),
         "warnings": len(report["warnings"]),
+        "hashScanMode": scan_mode,
+        "result": "PASS",
     }
-    report["summary"]["result"] = "PASS" if report["result"] == "PASS" else "FAIL"
     return report
 
 
@@ -2449,83 +2130,57 @@ def validate_profile_against_fixture(
 # ---------------------------------------------------------------------------
 
 
-def _print_human_report(report: dict) -> None:
+def print_human_report(report: dict) -> None:
     profile = report["profile"]
+    print(f"NRPT profile: {profile['path']} ({profile['size']} bytes, sha256 {profile['sha256']})")
     print(
-        f"NRPT profile: {profile['path']} ({profile['size']} bytes, "
-        f"sha256 {profile['sha256']})"
-    )
-    print(
-        f"  format={profile['format']} build={profile['build']} apuMask={profile['apuMask']} "
+        f"  format=v{profile['version']} build={profile['build']} apuMask={profile['apuMask']} "
         f"deviceID={profile['deviceID']} pages={profile['pageCount']} sites={profile['siteCount']} "
+        f"PAGE={profile['modePageCount']} DYLD={profile['modeDyldCount']} "
         f"checksum={profile['payloadChecksum']} (OK)"
     )
-    for image in report.get("images", []):
-        print(
-            f"  image {image['index']}: {image['kind']} {image['path']} "
-            f"unslid={image['unslidVmaddr']} vmSize={image['vmSize']} "
-            f"segments={image['segments']} sections={image['sections']} verified={image['verified']}"
-        )
     fixture = report["fixture"]
-    print(
-        f"fixture: {fixture['root']} build={fixture['build']} "
-        f"candidateImages={fixture['imageCount']}"
-    )
+    print(f"fixture: {fixture['root']} build={fixture['build']} images={fixture['imageCount']}")
     for name, check in report["identity"].items():
         print(f"identity {name}: {check['status']}")
+    if report.get("selection"):
+        print(f"bundle selection: {report['selection']}")
+    for image in report["images"]:
+        print(
+            f"image[{image['index']}]: {image['kind']} {image['path']} unslid={image['unslidVmaddr']} "
+            f"vmSize={image['vmSize']} verified={image['verified']}"
+        )
     print("pages:")
-    print("  idx  pageFileOffset    pageHash            image                          sites  bytes  status")
     for page in report["pages"]:
         print(
-            f"  {page['index']:>3}  {page['pageFileOffset']:>16}  {page['pageHash']:>18}  "
-            f"{(page['image'] or '-'):30.30}  {page['siteCount']:>5}  "
-            f"{page.get('bytesChanged', '-'):>5}  {page['status']}"
+            f"  [{page['index']:>2}] {page['mode']:<4} vmOff={page['pageVmOffset']} "
+            f"hash={page['pageHash']} image={page['imageKind']} "
+            f"{page['resolvedFile']}@{page['resolvedOffset']} "
+            f"seg={page['segment']}/{page['section']} vnode={page['vnodeName']} status={page['status']}"
         )
-        metadata = page.get("metadata")
-        if metadata:
-            print(
-                f"        metadata: image[{metadata['imageIndex']}] {metadata['imageKind']} "
-                f"pageStart={metadata['pageStart']} segment={metadata['segment']} "
-                f"section={metadata['section']} file={metadata['file']}@"
-                f"{metadata['fileOffset']} ({metadata['namespace']}) verified={metadata['verified']}"
-            )
         for site in page["sites"]:
             print(
-                f"        site {site['index']}: @{site['siteInPage']} "
-                f"{site['findHex']} -> {site['replaceHex']} "
-                f"find={site['findMatched']} written={site['written']}"
+                f"        site {site['index']}: @{site['siteInPage']} {site['findHex']} -> "
+                f"{site['replaceHex']} find={site['findMatched']} written={site['written']}"
             )
     for check in report["falsePositiveChecks"]:
         if check["unintendedMatches"]:
             print(
-                f"false-positive check record {check['record']}: "
-                f"{len(check['unintendedMatches'])} unintended match(es) [{check['status']}]"
+                f"duplicate-content record {check['record']} ({check['mode']}): "
+                f"{len(check['unintendedMatches'])} unintended identical-content match(es) [{check['status']}]"
             )
-    for duplicate in report["duplicateContent"]:
-        print(
-            f"content duplicate record {duplicate['record']}: {duplicate['pageHash']} at "
-            f"{len(duplicate['occurrences'])} offset(s), "
-            f"unintended identical content={len(duplicate['unintendedIdenticalContent'])}, "
-            f"offset-gated={duplicate['requiresOffset']}"
-        )
-    hash_scan = report.get("hashScan", {})
-    if hash_scan.get("mode") not in (None, "not-needed"):
-        print(
-            f"hash scan: mode={hash_scan['mode']} queries={hash_scan['queries']} "
-            f"pagesHashed={hash_scan['pagesHashed']}"
-        )
+    if report.get("routeSimulation"):
+        for entry in report["routeSimulation"].get("pageMode", []):
+            print(f"route PAGE record {entry['record']}: {entry['pageRoute']} (wrongMode={entry['wrongMode']}, wrongVnode={entry['wrongVnode']})")
+        for entry in report["routeSimulation"].get("dyldMode", []):
+            print(f"route DYLD {entry['file']}: {entry['modeSeparation']} ({entry['chunks']} chunks)")
     if report["mutationSweep"]:
         print(f"mutation sweep: {len(report['mutationSweep'])} page(s) rejected as expected")
-    for simulation in report["rangeSimulation"]:
-        print(
-            f"range simulation {simulation['image']}: {simulation['status']} "
-            f"({simulation.get('chunks', '?')} chunks)"
-        )
     summary = report["summary"]
     print(
-        f"summary: intended={summary['intendedPages']} resolved={summary['resolvedPages']} "
-        f"applied={summary['appliedPages']} sites={summary['reportedSites']}/"
-        f"{summary['intendedSites']} findMismatches={summary['siteFindMismatches']} "
+        f"summary: pages={summary['appliedPages']}/{summary['intendedPages']} "
+        f"sites={summary['reportedSites']}/{summary['intendedSites']} "
+        f"PAGE={summary['modePageCount']} DYLD={summary['modeDyldCount']} "
         f"falsePositives={summary['falsePositives']} warnings={summary['warnings']}"
     )
     for warning in report["warnings"]:
@@ -2539,89 +2194,97 @@ def _parse_int(value: str) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="NRPT v1 offline validator: apply a profile to a clean fixture exactly "
-        "like NootedRedUserPatch (offset gate + full 4 KiB FNV-1a-64 + all site finds + replace).",
+        description="NRPT v3 offline validator: bundle selection + exact hook-domain simulation "
+        "(PAGE/DYLD modes, vnode gate, full-page hash identity, no offset identity)."
     )
-    parser.add_argument("--profile", required=True, help="NRPT v1 profile file")
-    parser.add_argument(
-        "--fixtures",
-        default="/",
-        help="fixture root containing System/Library/Extensions and dyld cache (default: /)",
-    )
-    parser.add_argument("--image", action="append", default=[], help="extra candidate image path")
-    parser.add_argument("--report", help="write machine-readable JSON report to this path")
-    parser.add_argument("--expected-build", help="expected build string (e.g. 24H232)")
-    parser.add_argument(
-        "--device-id", type=_parse_int, help="running iGPU PCI device ID (e.g. 0x1638)"
-    )
-    parser.add_argument(
-        "--mutation-sweep",
-        action="store_true",
-        help="flip one byte per intended page and require hash-gate rejection",
-    )
-    parser.add_argument(
-        "--no-range-simulation", action="store_true", help="skip _cs_validate_range simulation"
-    )
-    parser.add_argument(
-        "--no-hash-only-scan",
-        action="store_true",
-        help="skip full-fixture scan for records without REQUIRE_OFFSET (not deployable)",
-    )
-    parser.add_argument(
-        "--no-native-hash-scan",
-        action="store_true",
-        help="force the pure-Python page hash scan (very slow on a multi-GB fixture)",
-    )
-    parser.add_argument(
-        "--no-duplicate-content-scan",
-        action="store_true",
-        help="skip the content-duplicate analysis (identical 4 KiB pages elsewhere in the fixture)",
-    )
-    parser.add_argument("--quiet", action="store_true", help="suppress human-readable output")
+    source = parser.add_argument_group("profile source")
+    source.add_argument("--profile", help="NRPT v3 profile file")
+    source.add_argument("--bundle-plist", help="NRedProfiles bundle plist to validate and select from")
+    parser.add_argument("--fixtures", default="/", help="clean fixture root (default: /)")
+    parser.add_argument("--report", help="write a machine-readable JSON report")
+    parser.add_argument("--expected-build", help="expected running build string (e.g. 24H232)")
+    parser.add_argument("--device-id", type=_parse_int, help="running iGPU PCI device ID (e.g. 0x1638)")
+    parser.add_argument("--expected-apumask", type=_parse_int, help="override the running APU family mask")
+    parser.add_argument("--mutation-sweep", action="store_true", help="reject one mutated byte per page")
+    parser.add_argument("--strict-false-positives", action="store_true",
+                        help="treat byte-identical duplicate content in the same mode as a failure")
+    parser.add_argument("--no-route-simulation", action="store_true", help="skip route/mode simulation")
+    parser.add_argument("--no-native-hash-scan", action="store_true", help="force pure-Python hash scanning")
+    parser.add_argument("--quiet", action="store_true", help="suppress human output")
     args = parser.parse_args(argv)
 
-    try:
-        with open(args.profile, "rb") as handle:
-            profile_bytes = handle.read()
-    except OSError as error:
-        print(f"error: cannot read profile: {error}", file=sys.stderr)
+    if bool(args.profile) == bool(args.bundle_plist):
+        print("error: exactly one of --profile or --bundle-plist is required", file=sys.stderr)
         return 2
 
-    try:
-        profile = decode(profile_bytes)
-    except NRPTCodecError as error:
-        print(f"NRPT PROFILE REJECTED: {error}", file=sys.stderr)
-        return 1
+    bundle: Optional[Bundle] = None
+    selection: Optional[Selection] = None
+    if args.bundle_plist:
+        try:
+            with open(args.bundle_plist, "rb") as handle:
+                bundle = decode_bundle_plist(handle.read())
+        except OSError as error:
+            print(f"error: cannot read bundle: {error}", file=sys.stderr)
+            return 2
+        except NRPTCodecError as error:
+            print(f"BUNDLE REJECTED: {error}", file=sys.stderr)
+            return 1
+        if args.expected_build is None:
+            print("error: --bundle-plist requires --expected-build for selection", file=sys.stderr)
+            return 2
+        running_mask = args.expected_apumask
+        if running_mask is None and args.device_id is not None:
+            running_mask = candidate_apu_mask(args.device_id)
+        if running_mask is None:
+            print("error: bundle selection needs --device-id or --expected-apumask", file=sys.stderr)
+            return 2
+        selection = select_profile(bundle, args.expected_build, running_mask, args.device_id or 0)
+        if not selection.selected:
+            print(f"SELECTION FAILED: {selection.status}", file=sys.stderr)
+            return 1
+        profile_bytes = bundle.entries[selection.index].profile_data
+        profile = selection.profile
+        profile_path = f"{args.bundle_plist}#{selection.index}"
+    else:
+        try:
+            with open(args.profile, "rb") as handle:
+                profile_bytes = handle.read()
+        except OSError as error:
+            print(f"error: cannot read profile: {error}", file=sys.stderr)
+            return 2
+        profile_path = args.profile
+        try:
+            profile = decode(profile_bytes)
+        except NRPTCodecError as error:
+            print(f"NRPT PROFILE REJECTED: {error}", file=sys.stderr)
+            return 1
 
     if not os.path.isdir(args.fixtures):
         print(f"error: fixture root is not a directory: {args.fixtures}", file=sys.stderr)
-        return 2
-    images = discover_images(args.fixtures, args.image)
-    if not images:
-        print(f"error: no candidate fixture images found under {args.fixtures}", file=sys.stderr)
         return 2
 
     try:
         report = validate_profile_against_fixture(
             profile,
-            images,
-            profile_path=args.profile,
+            profile_path=profile_path,
             profile_bytes=profile_bytes,
             fixture_root=args.fixtures,
             expected_build=args.expected_build,
             device_id=args.device_id,
+            expected_apu_mask=args.expected_apumask,
+            bundle=bundle,
+            selection=selection,
             mutation_sweep=args.mutation_sweep,
-            range_simulation=not args.no_range_simulation,
-            hash_only_scan=not args.no_hash_only_scan,
+            route_simulation=not args.no_route_simulation,
             native_hash_scan=not args.no_native_hash_scan,
-            duplicate_content_scan=not args.no_duplicate_content_scan,
+            strict_false_positives=args.strict_false_positives,
         )
     except ValidationFailure as failure:
         print(f"VALIDATION FAILED: {failure}", file=sys.stderr)
         return 1
 
     if not args.quiet:
-        _print_human_report(report)
+        print_human_report(report)
     if args.report:
         directory = os.path.dirname(os.path.abspath(args.report))
         if directory:

@@ -217,6 +217,10 @@ final class AnalyzerImageSet {
         return images
     }
 
+    func kind(for driver: DriverImage) -> NRPTImageKind {
+        driver.isStandaloneFile ? .standaloneFile : .dyldSharedCache
+    }
+
     /// Canonical, install-path-independent image path for the profile image table.
     ///
     /// Cache images already carry the dyld-cache image path (absolute). The standalone
@@ -238,14 +242,7 @@ final class AnalyzerImageSet {
         guard path.hasPrefix("/") else { return "/" + path }
         return path
     }
-
-    func kind(for driver: DriverImage) -> DriverImageKind {
-        driver.isStandaloneFile ? .standaloneFile : .dyldSharedCache
-    }
 }
-
-/// Profile image kind for a driver image.
-typealias DriverImageKind = NRPTImageKind
 
 // MARK: - Generated site / page model
 
@@ -258,11 +255,12 @@ struct GeneratedSite {
     let pageStart: UInt64
     let pageFileOffset: UInt64
     let pageHash: UInt64
-    let matchFlags: NRPTMatchFlags
-    let pageBytes: Data
-    /// Target-image metadata (NRPT v2), all derived from the parsed image.
+    /// v3 patch mode, derived from the parsed image kind (standalone file → PAGE,
+    /// dyld shared cache image → DYLD). Never guessed from addresses.
+    let mode: NRPTPageMode
     let imageIndex: UInt16
     let pageVmOffset: UInt32
+    /// Evidence-only parsed geometry (not part of the wire profile in v3).
     let pageIndex: UInt32
     let segmentName: String
     let sectionName: String
@@ -271,7 +269,7 @@ struct GeneratedSite {
 // MARK: - Generator
 
 enum ProfileGenerator {
-    static let generatorVersion = "PatchAnalyzer/2.0"
+    static let generatorVersion = "PatchAnalyzer/3.0"
 
     struct Output {
         let profile: NRPTProfile
@@ -285,7 +283,7 @@ enum ProfileGenerator {
         let decoder = images.decoder
         var sites: [GeneratedSite] = []
 
-        // Target image table (NRPT v2), in deterministic first-discovery order.
+        // Target image table (NRPT v3), in deterministic first-discovery order.
         var imageTable: [NRPTImage] = []
         func imageRecord(for driver: DriverImage) throws -> UInt16 {
             let path = try images.canonicalPath(for: driver)
@@ -301,37 +299,12 @@ enum ProfileGenerator {
             guard image.text.vmsize > 0, image.text.vmsize <= 0xFFFF_F000 else {
                 throw AnalyzerError.malformed("\(driver.rawValue): __TEXT vmsize out of range")
             }
-            // Fixed 16-byte NUL-padded name fields: only names shorter than the field
-            // capacity are representable on the wire (the runtime does not depend on
-            // names; the generator still verifies the patched segment/section is listed).
-            var segmentNames: [String] = []
-            for segment in image.segments
-                where !segmentNames.contains(segment.name)
-                    && segment.name.utf8.count < NRPTFormat.segmentNameSize {
-                segmentNames.append(segment.name)
-            }
-            var sectionNames: [String] = []
-            for section in image.sections
-                where !sectionNames.contains(section.sectname)
-                    && section.sectname.utf8.count < NRPTFormat.sectionNameSize {
-                sectionNames.append(section.sectname)
-            }
-            guard segmentNames.count >= 1,
-                  segmentNames.count <= NRPTFormat.maxSegmentsPerImage else {
-                throw AnalyzerError.unsupported(
-                    "\(driver.rawValue): \(segmentNames.count) segments exceed the NT v2 image table")
-            }
-            if sectionNames.count > NRPTFormat.maxSectionsPerImage {
-                // Deterministic prefix: first-seen sections cover the patched __text section.
-                sectionNames = Array(sectionNames.prefix(NRPTFormat.maxSectionsPerImage))
-            }
             imageTable.append(NRPTImage(kind: kind, path: path,
                                         unslidVMAddress: image.loadAddress,
-                                        vmSize: UInt32(image.text.vmsize),
-                                        segmentNames: segmentNames,
-                                        sectionNames: sectionNames))
+                                        vmSize: UInt32(image.text.vmsize)))
             return UInt16(imageTable.count - 1)
         }
+
         var ruleEvidence: [[String: Any]] = []
         var usedAddresses: Set<UInt64> = []
 
@@ -383,20 +356,13 @@ enum ProfileGenerator {
                             throw AnalyzerError.validation(
                                 "\(rule.id): derived page file offset \(Hex.value(pageFileOffset)) is not 4 KiB aligned")
                         }
-                        // The offset gate is required on every page: standalone bundles
-                        // are paged with their file offset, and for split caches the pager
-                        // offset is the subcache file offset derived here (validated
-                        // against the fixture by the offline validator). The offset also
-                        // disambiguates identical 4 KiB content in different subcache
-                        // files / driver images (e.g. VADriver2 .03 0x867D000 vs the
-                        // legacy VADriver 0x85C4000 page).
-                        let matchFlags: NRPTMatchFlags = .defaultV1
                         let pageHash = try ProfileCodec.pageHash(page.bytes)
+                        let mode: NRPTPageMode = rule.driver.isStandaloneFile ? .page : .dyld
                         let targetImageIndex = try imageRecord(for: rule.driver)
-                        let targetImageRecord = imageTable[Int(targetImageIndex)]
+                        let targetImage = imageTable[Int(targetImageIndex)]
                         guard let segment = image.segments.first(where: {
                             page.pageStart >= $0.vmaddr
-                                && page.pageStart < $0.vmaddr + $0.vmsize
+                                && page.pageStart < $0.vmaddr &+ $0.vmsize
                                 && $0.filesize > 0
                         }) else {
                             throw AnalyzerError.validation(
@@ -409,16 +375,10 @@ enum ProfileGenerator {
                         }
                         let pageIndexOfSegment = UInt32((page.pageStart - segment.vmaddr) / 0x1000)
                         guard let section = image.sections.first(where: {
-                            siteAddress >= $0.addr && siteAddress < $0.addr + $0.size
+                            siteAddress >= $0.addr && siteAddress < $0.addr &+ $0.size
                         }) else {
                             throw AnalyzerError.validation(
                                 "\(rule.id): no section contains site \(Hex.value(siteAddress))")
-                        }
-                        guard targetImageRecord.segmentNames.contains(segment.name),
-                              targetImageRecord.sectionNames.contains(section.sectname) else {
-                            throw AnalyzerError.validation(
-                                "\(rule.id): parsed segment/section names are not represented in the "
-                                    + "image metadata table")
                         }
                         guard page.pageStart >= image.loadAddress else {
                             throw AnalyzerError.validation(
@@ -427,15 +387,14 @@ enum ProfileGenerator {
                         let vmOffset = page.pageStart - image.loadAddress
                         guard vmOffset % 0x1000 == 0,
                               vmOffset <= UInt64(UInt32.max),
-                              vmOffset + 0x1000 <= UInt64(targetImageRecord.vmSize) else {
+                              vmOffset &+ 0x1000 <= UInt64(targetImage.vmSize) else {
                             throw AnalyzerError.validation(
                                 "\(rule.id): derived pageVmOffset \(Hex.value(vmOffset)) is invalid")
                         }
                         sites.append(GeneratedSite(ruleID: rule.id, driver: rule.driver, match: match,
                                                    siteAddress: siteAddress, siteInPage: UInt16(inPage),
                                                    pageStart: page.pageStart, pageFileOffset: pageFileOffset,
-                                                   pageHash: pageHash, matchFlags: matchFlags,
-                                                   pageBytes: page.bytes,
+                                                   pageHash: pageHash, mode: mode,
                                                    imageIndex: targetImageIndex,
                                                    pageVmOffset: UInt32(vmOffset),
                                                    pageIndex: pageIndexOfSegment,
@@ -453,7 +412,10 @@ enum ProfileGenerator {
                             "find": Hex.spaced(match.find),
                             "replace": Hex.spaced(match.replace),
                             "cfgBlocks": analysis.blocks.count,
-                            "reachable": analysis.isReachable(siteAddress)
+                            "reachable": analysis.isReachable(siteAddress),
+                            "mode": mode == .page ? "PAGE" : "DYLD",
+                            "targetKind": images.kind(for: rule.driver) == .standaloneFile
+                                ? "standalone-file" : "dyld-shared-cache"
                         ]
                         for (key, value) in match.details {
                             siteEvidence[key] = value
@@ -506,53 +468,45 @@ enum ProfileGenerator {
             }
             for site in group {
                 guard site.imageIndex == first.imageIndex,
-                      site.pageVmOffset == first.pageVmOffset,
-                      site.pageIndex == first.pageIndex,
-                      site.segmentName == first.segmentName,
-                      site.sectionName == first.sectionName else {
+                      site.mode == first.mode,
+                      site.pageVmOffset == first.pageVmOffset else {
                     throw AnalyzerError.validation(
                         "inconsistent target-image metadata for page \(Hex.value(first.pageStart))")
                 }
             }
-            pages.append(NRPTPage(pageFileOffset: first.pageFileOffset, pageHash: first.pageHash,
-                                  matchFlags: first.matchFlags, sites: records,
-                                  imageIndex: first.imageIndex,
-                                  pageVmOffset: first.pageVmOffset))
             let targetImage = imageTable[Int(first.imageIndex)]
+            pages.append(NRPTPage(pageFileOffset: first.pageFileOffset, pageHash: first.pageHash,
+                                  mode: first.mode, imageIndex: first.imageIndex,
+                                  pageVmOffset: first.pageVmOffset, sites: records))
             pageEvidence.append([
                 "driver": first.driver.rawValue,
                 "pageStart": Hex.value(first.pageStart),
                 "pageFileOffset": Hex.value(first.pageFileOffset),
                 "pageHash": Hex.value(first.pageHash),
-                "matchFlags": Hex.value(UInt64(first.matchFlags.rawValue)),
-                "offsetNamespaceProven": true,
-                "offsetNamespace": first.driver.isStandaloneFile
-                    ? "standalone-file-offset" : "subcache-file-offset",
+                "mode": first.mode == .page ? "PAGE" : "DYLD",
+                "targetKind": first.mode == .page ? "standalone-file" : "dyld-shared-cache",
+                "route": first.mode == .page ? "_cs_validate_page" : "_cs_validate_range",
                 "imageIndex": Int(first.imageIndex),
                 "imagePath": targetImage.path,
-                "imageKind": targetImage.kind == .standaloneFile ? "standalone-file" : "dyld-shared-cache",
+                "imageUnslidVmaddr": Hex.value(targetImage.unslidVMAddress),
+                "imageVmSize": Hex.value(UInt64(targetImage.vmSize)),
                 "segment": first.segmentName,
                 "section": first.sectionName,
                 "pageIndexInSegment": Int(first.pageIndex),
                 "pageVmOffset": Hex.value(UInt64(first.pageVmOffset)),
                 "pageVA": Hex.value(first.pageStart),
-                "imageUnslidVmaddr": Hex.value(targetImage.unslidVMAddress),
-                "imageVmSize": Hex.value(UInt64(targetImage.vmSize)),
                 "sites": records.count
             ])
         }
 
         let deviceID = environment.deviceID
         let header = NRPTHeader(build: environment.build, apuMask: environment.apuMask,
-                                deviceID: deviceID ?? 0,
-                                flags: deviceID != nil ? .requireDeviceID : [])
+                                deviceID: deviceID ?? 0)
         let imageEvidence = imageTable.map { image -> [String: Any] in
             ["kind": image.kind == .standaloneFile ? "standalone-file" : "dyld-shared-cache",
              "path": image.path,
              "unslidVmaddr": Hex.value(image.unslidVMAddress),
              "vmSize": Hex.value(UInt64(image.vmSize)),
-             "segments": image.segmentNames,
-             "sections": image.sectionNames,
              "entrySize": image.entrySize]
         }
         let profile = NRPTProfile(header: header, images: imageTable, pages: pages)
@@ -563,16 +517,18 @@ enum ProfileGenerator {
             throw AnalyzerError.validation("profile encode failed: \(error)")
         }
 
-        // Producer obligation: no other page of any target image may match a
-        // record identity. Cache pages are hash-identified, so scan all __TEXT
-        // pages of all target images for hash collisions.
+        // Producer obligation: no unintended page of any target image may match a
+        // record identity. v3 identity is content-defined (full-page hash + all site
+        // finds) and mode-scoped, so pages are compared by hash in their delivery mode.
         let collisionScan = try scanForIdentityCollisions(sites: sites, images: images)
-        // Offline validation with the exact kext algorithm.
+        // Offline validation with the exact kext algorithm and mode routing.
         let validation = try OfflineValidator.validate(profileData: profileData,
                                                        environment: environment, images: images)
 
+        let modePageCount = pages.filter { $0.mode == .page }.count
+        let modeDyldCount = pages.filter { $0.mode == .dyld }.count
         var evidence: [String: Any] = [
-            "schema": 2,
+            "schema": 3,
             "profileVersion": Int(NRPTFormat.version),
             "generator": generatorVersion,
             "decoder": X86Decoder.shared.libraryPath ?? "unavailable",
@@ -581,11 +537,13 @@ enum ProfileGenerator {
             "build": environment.build,
             "apuMask": Hex.value(UInt64(environment.apuMask)),
             "deviceID": deviceID.map { Hex.value(UInt64($0)) } ?? "unavailable",
-            "requireDeviceID": deviceID != nil,
             "profile": [
                 "size": profileData.count,
                 "pageCount": pages.count,
                 "siteCount": sites.count,
+                "imageCount": imageTable.count,
+                "modePageCount": modePageCount,
+                "modeDyldCount": modeDyldCount,
                 "checksum": Hex.value(UInt64(ProfileCodec.fnv1a32(profileData.subdata(in: 64..<profileData.count)))),
                 "sha256": sha256(profileData)
             ],
@@ -608,64 +566,81 @@ enum ProfileGenerator {
 
     private static func scanForIdentityCollisions(sites: [GeneratedSite],
                                                   images: AnalyzerImageSet) throws -> [String: Any] {
-        var pagesByHash: [UInt64: GeneratedSite] = [:]
-        for site in sites {
-            pagesByHash[site.pageHash] = site
+        // Profile identity: one record per (mode, full-page hash). The codec enforces
+        // E031 for duplicates; this map catches unintended page matches.
+        struct Identity: Hashable {
+            let mode: UInt8
+            let hash: UInt64
         }
-        var collisions: [[String: Any]] = []
-        var offsetDisambiguated: [[String: Any]] = []
+        var identities: [Identity: GeneratedSite] = [:]
+        for site in sites {
+            let identity = Identity(mode: site.mode.rawValue, hash: site.pageHash)
+            if let other = identities[identity] {
+                // Several sites of the same page share the page identity.
+                if other.driver == site.driver, other.pageStart == site.pageStart { continue }
+                throw AnalyzerError.ambiguous(
+                    "duplicate \(site.mode == .page ? "PAGE" : "DYLD") identity "
+                        + "\(Hex.value(site.pageHash)) on \(other.driver.rawValue) page "
+                        + "\(Hex.value(other.pageStart)) and \(site.driver.rawValue) page "
+                        + "\(Hex.value(site.pageStart))")
+            }
+            identities[identity] = site
+        }
+
         var scanned = 0
+        var contentIdentical: [[String: Any]] = []
         let allImages = try images.allImages()
         for driver in DriverImage.allCases {
             guard let image = allImages[driver], let text = image.segments.first(where: { $0.name == "__TEXT" }) else {
                 continue
             }
+            let deliveryMode: NRPTPageMode = driver.isStandaloneFile ? .page : .dyld
             var address = text.vmaddr & ~UInt64(0xfff)
-            let end = text.vmaddr + min(text.filesize, text.vmsize)
-            while address < end {
-                guard address + 0x1000 <= end else { break }
-                if let intended = pagesByHash.values.first(where: { $0.driver == driver && $0.pageStart == address }) {
-                    // The intended page is the one the site was found on.
-                    _ = intended
-                    address &+= 0x1000
-                    continue
-                }
-                let pageBytes = [UInt8](try image.read(address: address, size: 0x1000))
-                let hash = ProfileCodec.fnv1a64(Data(pageBytes))
-                scanned += 1
-                if let conflicting = pagesByHash[hash] {
-                    let conflictingOffset = conflicting.pageFileOffset
-                    let candidateOffset = try image.fileOffset(address: address)
-                    if conflictingOffset == candidateOffset {
-                        throw AnalyzerError.ambiguous(
-                            "identical page identity (offset \(Hex.value(candidateOffset)), hash \(Hex.value(hash))) "
-                                + "on \(driver.rawValue) page \(Hex.value(address))")
+            let end = text.vmaddr &+ min(text.filesize, text.vmsize)
+            while address &+ 0x1000 <= end {
+                let pageBytes = try image.read(address: address, size: 0x1000)
+                let hash = ProfileCodec.fnv1a64(pageBytes)
+                let identity = Identity(mode: deliveryMode.rawValue, hash: hash)
+                if let unintended = identities[identity] {
+                    let isIntendedPage = unintended.driver == driver && unintended.pageStart == address
+                    if !isIntendedPage {
+                        // Identity is hash + every site find; check the record's finds at
+                        // their in-page offsets directly against this candidate page.
+                        let recordSites = sites.filter {
+                            $0.driver == unintended.driver && $0.pageStart == unintended.pageStart
+                        }
+                        let pageBuffer = ByteBuffer(pageBytes)
+                        let allFindsMatch = recordSites.allSatisfy { recordSite in
+                            let start = Int(recordSite.siteInPage)
+                            guard start >= 0, start + recordSite.match.find.count <= pageBuffer.count else {
+                                return false
+                            }
+                            return (try? pageBuffer.slice(start, recordSite.match.find.count))
+                                == recordSite.match.find
+                        }
+                        if allFindsMatch {
+                            throw AnalyzerError.ambiguous(
+                                "unintended \(deliveryMode == .page ? "PAGE" : "DYLD") page "
+                                    + "\(driver.rawValue)@\(Hex.value(address)) matches the identity of "
+                                    + "\(unintended.driver.rawValue) page \(Hex.value(unintended.pageStart))")
+                        }
+                        contentIdentical.append([
+                            "driver": driver.rawValue,
+                            "pageStart": Hex.value(address),
+                            "mode": deliveryMode == .page ? "PAGE" : "DYLD",
+                            "pageHash": Hex.value(hash),
+                            "note": "content-identical page; the record's site finds do not match, "
+                                + "so the identity cannot match"
+                        ])
                     }
-                    // Identical content in a different offset namespace is legal:
-                    // every record sets REQUIRE_OFFSET, so the offset distinguishes it.
-                    offsetDisambiguated.append([
-                        "recordDriver": conflicting.driver.rawValue,
-                        "recordPageFileOffset": Hex.value(conflictingOffset),
-                        "collisionDriver": driver.rawValue,
-                        "collisionPageStart": Hex.value(address),
-                        "collisionPageFileOffset": Hex.value(candidateOffset),
-                        "pageHash": Hex.value(hash)
-                    ])
                 }
+                scanned += 1
                 address &+= 0x1000
             }
         }
-        if !collisions.isEmpty {
-            throw AnalyzerError.ambiguous(
-                "\(collisions.count) unintended image pages match a profile page identity")
-        }
         return ["pagesScanned": scanned,
-                "sameIdentityCollisions": collisions.count,
-                "offsetDisambiguatedContentMatches": offsetDisambiguated,
-                "allRecordsRequireOffset": true,
-                "offsetGateNote": "every page record sets REQUIRE_OFFSET, so identical 4 KiB content "
-                    + "delivered through another image/pager offset (e.g. VADriver2 .03 0x867D000 vs "
-                    + "legacy VADriver 0x85C4000) is rejected by the offset gate before hashing",
+                "contentIdenticalNonMatchingPages": contentIdentical,
+                "identityRules": "one record per (mode, full-page FNV-1a-64 hash); no offset gates",
                 "result": "PASS"]
     }
 
@@ -674,7 +649,7 @@ enum ProfileGenerator {
     }
 }
 
-// MARK: - Offline validator (same algorithm as the kext)
+// MARK: - Offline validator (same algorithm and mode routing as the kext)
 
 enum OfflineValidator {
     static func validate(profileData: Data,
@@ -693,67 +668,62 @@ enum OfflineValidator {
         guard profile.header.apuMask & environment.apuMask != 0 else {
             throw AnalyzerError.validation("profile apuMask does not intersect the running APU family")
         }
-        if profile.header.flags.contains(.requireDeviceID) {
+        if profile.header.deviceID != 0 {
             guard let deviceID = environment.deviceID, profile.header.deviceID == deviceID else {
                 throw AnalyzerError.validation("profile deviceID does not match the fixture device ID")
             }
         }
 
+        // Simulate the exact bundle selector against a one-entry bundle.
+        let bundle = NRedProfilesBundle(entries: [
+            NRedProfilesEntry(build: profile.header.build, apuMask: profile.header.apuMask,
+                              deviceID: profile.header.deviceID, profile: profile)
+        ])
+        try ProfileCodec.validateBundle(bundle)
+        let runningDeviceID = UInt16(environment.deviceID ?? 0)
+        let selection = try ProfileCodec.select(from: bundle, build: environment.build,
+                                                runningApuMask: environment.apuMask,
+                                                runningDeviceID: runningDeviceID)
+        guard case let .selected(index, selectedProfile) = selection, index == 0,
+              selectedProfile.pageCount == profile.pageCount else {
+            throw AnalyzerError.validation("bundle selector did not select the generated profile")
+        }
+
         let allImages = try images.allImages()
-        // Known fixture images keyed by the same canonical path the profile stores, so the
-        // v2 target-image metadata can be re-resolved against the parsed images.
         var knownImages: [String: (driver: DriverImage, image: AnalyzedImage, kind: NRPTImageKind)] = [:]
         for driver in DriverImage.allCases {
             guard let image = allImages[driver] else { continue }
-            let path = try images.canonicalPath(for: driver)
-            knownImages[path] = (driver, image, images.kind(for: driver))
+            knownImages[try images.canonicalPath(for: driver)] = (driver, image, images.kind(for: driver))
         }
-        var metadataPageReports: [[String: Any]] = []
-        var matchedPages: [Int: [(driver: DriverImage, pageFileOffset: UInt64, pageStart: UInt64, data: Data)]] = [:]
-        var pageReports: [[String: Any]] = []
-        var totalPagesScanned = 0
+
+        // All fixture pages grouped by delivery mode, with their parsed addresses.
+        struct FixturePage {
+            let driver: DriverImage
+            let image: AnalyzedImage
+            let address: UInt64
+            let bytes: Data
+            let mode: NRPTPageMode
+        }
+        var fixturePages: [FixturePage] = []
         for driver in DriverImage.allCases {
             guard let image = allImages[driver], let text = image.segments.first(where: { $0.name == "__TEXT" }) else {
                 continue
             }
+            let deliveryMode: NRPTPageMode = driver.isStandaloneFile ? .page : .dyld
             var address = text.vmaddr & ~UInt64(0xfff)
-            let end = text.vmaddr + min(text.filesize, text.vmsize)
-            while address < end {
-                guard address + 0x1000 <= end else { break }
-                let pageBytes = try image.read(address: address, size: 0x1000)
-                let fileOffset = try image.fileOffset(address: address)
-                totalPagesScanned += 1
-                for (index, record) in profile.pages.enumerated() {
-                    let offsetGate = !record.matchFlags.contains(.requireOffset) || record.pageFileOffset == fileOffset
-                    guard offsetGate else { continue }
-                    guard ProfileCodec.fnv1a64(pageBytes) == record.pageHash else { continue }
-                    let application = ProfileCodec.applyPage(profile, data: pageBytes, pageOffset: fileOffset)
-                    switch application {
-                    case .noMatch:
-                        continue
-                    case let .siteFindMismatch(pageIndex, siteIndex):
-                        throw AnalyzerError.validation(
-                            "page \(Hex.value(fileOffset)) in \(driver.rawValue) matched record \(pageIndex) "
-                                + "but site \(siteIndex) find did not match")
-                    case let .applied(appliedIndex, patched):
-                        guard appliedIndex == index else {
-                            throw AnalyzerError.validation("first-matching-record invariant broken")
-                        }
-                        matchedPages[index, default: []].append(
-                            (driver, fileOffset, address, patched))
-                    }
-                }
+            let end = text.vmaddr &+ min(text.filesize, text.vmsize)
+            while address &+ 0x1000 <= end {
+                fixturePages.append(FixturePage(driver: driver, image: image, address: address,
+                                                bytes: try image.read(address: address, size: 0x1000),
+                                                mode: deliveryMode))
                 address &+= 0x1000
             }
         }
 
+        // Resolve the intended fixture page of every record from target image metadata.
+        var intendedPage: [Int: FixturePage] = [:]
+        var metadataReports: [[String: Any]] = []
         for (index, record) in profile.pages.enumerated() {
-            let matches = matchedPages[index] ?? []
-            guard matches.count == 1, let match = matches.first else {
-                throw AnalyzerError.validation(
-                    "page record \(index) matched \(matches.count) fixture pages; expected exactly one")
-            }
-            // Verify the v2 target-image metadata re-resolves to exactly this page.
             guard Int(record.imageIndex) < profile.images.count else {
                 throw AnalyzerError.validation("page record \(index) imageIndex out of range")
             }
@@ -762,117 +732,158 @@ enum OfflineValidator {
                 throw AnalyzerError.validation(
                     "page record \(index) target image \(targetImage.path) does not resolve in the fixture")
             }
-            guard known.driver == match.driver else {
+            let expectedMode: NRPTPageMode = known.kind == .standaloneFile ? .page : .dyld
+            guard record.mode == expectedMode else {
                 throw AnalyzerError.validation(
-                    "page record \(index) metadata image \(targetImage.path) does not match the "
-                        + "fixture image \(match.driver.rawValue) the page was found in")
+                    "page record \(index) mode \(record.mode) disagrees with image kind "
+                        + "\(known.kind == .standaloneFile ? "standalone" : "dyld-cache")")
             }
             guard targetImage.unslidVMAddress == known.image.loadAddress,
                   targetImage.vmSize == UInt32(known.image.text.vmsize) else {
                 throw AnalyzerError.validation(
-                    "page record \(index) image geometry \(Hex.value(targetImage.unslidVMAddress))/"
-                        + "\(Hex.value(UInt64(targetImage.vmSize))) disagrees with the parsed image "
-                        + "\(Hex.value(known.image.loadAddress))/\(Hex.value(known.image.text.vmsize))")
+                    "page record \(index) image geometry disagrees with the parsed image")
             }
-            guard match.pageStart >= targetImage.unslidVMAddress else {
-                throw AnalyzerError.validation("page record \(index) page precedes the image base")
+            let intendedStart = targetImage.unslidVMAddress &+ UInt64(record.pageVmOffset)
+            guard intendedStart >= targetImage.unslidVMAddress,
+                  UInt64(record.pageVmOffset) &+ 0x1000 <= UInt64(targetImage.vmSize) else {
+                throw AnalyzerError.validation("page record \(index) pageVmOffset is invalid")
             }
-            let expectedVmOffset = match.pageStart - targetImage.unslidVMAddress
-            guard UInt64(record.pageVmOffset) == expectedVmOffset,
-                  record.pageVmOffset & 0x0FFF == 0,
-                  UInt64(record.pageVmOffset) + 0x1000 <= UInt64(targetImage.vmSize) else {
+            guard record.pageFileOffset == (try known.image.fileOffset(address: intendedStart)) else {
                 throw AnalyzerError.validation(
-                    "page record \(index) pageVmOffset \(Hex.value(UInt64(record.pageVmOffset))) "
-                        + "does not resolve to fixture page \(Hex.value(match.pageStart))")
+                    "page record \(index) diagnostic pageFileOffset disagrees with the parsed image")
             }
-            guard let segment = known.image.segments.first(where: {
-                match.pageStart >= $0.vmaddr && match.pageStart < $0.vmaddr &+ $0.vmsize
-            }), targetImage.segmentNames.contains(segment.name) else {
+            guard let page = fixturePages.first(where: {
+                $0.driver == known.driver && $0.address == intendedStart
+            }) else {
+                throw AnalyzerError.notFound(
+                    "page record \(index) intended fixture page \(Hex.value(intendedStart)) is not in the target image")
+            }
+            guard page.mode == record.mode else {
+                throw AnalyzerError.validation("page record \(index) mode does not match its fixture delivery domain")
+            }
+            let pageHash = ProfileCodec.fnv1a64(page.bytes)
+            guard pageHash == record.pageHash else {
                 throw AnalyzerError.validation(
-                    "page record \(index) page is not covered by a stored segment name")
+                    "page record \(index) pageHash \(Hex.value(record.pageHash)) differs from fixture page "
+                        + "\(Hex.value(pageHash)) in \(known.driver.rawValue)@\(Hex.value(intendedStart))")
             }
-            var sectionNamesUsed: Set<String> = []
-            for site in record.sites {
-                let siteAddress = match.pageStart &+ UInt64(site.siteInPage)
-                guard let section = known.image.sections.first(where: {
-                    siteAddress >= $0.addr && siteAddress < $0.addr &+ $0.size
-                }), targetImage.sectionNames.contains(section.sectname) else {
-                    throw AnalyzerError.validation(
-                        "page record \(index) site \(site.siteInPage) is not covered by a stored "
-                            + "section name")
-                }
-                sectionNamesUsed.insert(section.sectname)
-            }
-            let metadataFileOffset = try known.image.fileOffset(address: match.pageStart)
-            guard metadataFileOffset == record.pageFileOffset,
-                  metadataFileOffset == match.pageFileOffset else {
+            guard ProfileCodec.pageMatches(record, data: page.bytes) else {
                 throw AnalyzerError.validation(
-                    "page record \(index) pageFileOffset disagrees with the target-image translation")
+                    "page record \(index) site finds do not match the fixture page")
             }
-            metadataPageReports.append([
+            intendedPage[index] = page
+            metadataReports.append([
                 "pageIndex": index,
+                "mode": record.mode == .page ? "PAGE" : "DYLD",
+                "route": record.mode == .page ? "_cs_validate_page" : "_cs_validate_range",
+                "imageIndex": Int(record.imageIndex),
                 "imagePath": targetImage.path,
                 "imageKind": targetImage.kind == .standaloneFile ? "standalone-file" : "dyld-shared-cache",
                 "imageUnslidVmaddr": Hex.value(targetImage.unslidVMAddress),
                 "imageVmSize": Hex.value(UInt64(targetImage.vmSize)),
-                "segment": segment.name,
-                "sectionNames": sectionNamesUsed.sorted(),
                 "pageVmOffset": Hex.value(UInt64(record.pageVmOffset)),
-                "pageStart": Hex.value(match.pageStart),
+                "pageStart": Hex.value(intendedStart),
                 "pageFileOffset": Hex.value(record.pageFileOffset),
+                "pageHash": Hex.value(record.pageHash),
                 "result": "PASS"
             ])
-            let original = try allImages[match.driver]!.read(address: match.pageStart, size: 0x1000)
-            let resultingHash = ProfileCodec.fnv1a64(match.data)
-            pageReports.append([
-                "pageIndex": index,
-                "driver": match.driver.rawValue,
-                "pageFileOffset": Hex.value(match.pageFileOffset),
-                "pageStart": Hex.value(match.pageStart),
-                "imagePath": targetImage.path,
-                "imageKind": targetImage.kind == .standaloneFile ? "standalone-file" : "dyld-shared-cache",
-                "imageUnslidVmaddr": Hex.value(targetImage.unslidVMAddress),
-                "pageVmOffset": Hex.value(UInt64(record.pageVmOffset)),
-                "segments": targetImage.segmentNames.count,
-                "sections": targetImage.sectionNames.count,
-                "metadataVerified": true,
-                "offsetGate": record.matchFlags.contains(.requireOffset) ? "required" : "cleared",
-                "hashMatch": true,
-                "sitesMatched": record.sites.count,
-                "originalPageHash": Hex.value(ProfileCodec.fnv1a64(original)),
-                "recordPageHash": Hex.value(record.pageHash),
-                "resultingPageHash": Hex.value(resultingHash),
-                "sites": record.sites.map { [
-                    "siteInPage": Int($0.siteInPage),
-                    "find": Hex.spaced($0.find),
-                    "replace": Hex.spaced($0.replace)
-                ] }
-            ])
         }
-        let matchedPageCount = matchedPages.keys.count
-        guard matchedPageCount == profile.pages.count else {
-            throw AnalyzerError.validation(
-                "only \(matchedPageCount) of \(profile.pages.count) page records matched fixture pages")
+
+        // Delivery simulation: every fixture chunk through the mode-routed matcher.
+        var appliedByRecord: [Int: [FixturePage]] = [:]
+        var pageReports: [[String: Any]] = []
+        for page in fixturePages {
+            let application = ProfileCodec.applyPage(profile, data: page.bytes, mode: page.mode)
+            switch application {
+            case .noMatch:
+                continue
+            case let .siteFindMismatch(pageIndex, _):
+                throw AnalyzerError.validation(
+                    "fixture page \(page.driver.rawValue)@\(Hex.value(page.address)) matched record "
+                        + "\(pageIndex) but a site find did not match")
+            case let .applied(pageIndex, patched):
+                appliedByRecord[pageIndex, default: []].append(page)
+                let record = profile.pages[pageIndex]
+                let originalHash = ProfileCodec.fnv1a64(page.bytes)
+                let resultingHash = ProfileCodec.fnv1a64(patched)
+                pageReports.append([
+                    "recordIndex": pageIndex,
+                    "mode": record.mode == .page ? "PAGE" : "DYLD",
+                    "driver": page.driver.rawValue,
+                    "pageStart": Hex.value(page.address),
+                    "originalPageHash": Hex.value(originalHash),
+                    "resultingPageHash": Hex.value(resultingHash),
+                    "sitesMatched": record.sites.count,
+                    "sites": record.sites.map { [
+                        "siteInPage": Int($0.siteInPage),
+                        "find": Hex.spaced($0.find),
+                        "replace": Hex.spaced($0.replace)
+                    ] }
+                ])
+            case let .alreadyPatched(pageIndex):
+                throw AnalyzerError.validation(
+                    "clean fixture page unexpectedly reported already patched for record \(pageIndex)")
+            }
         }
-        for (index, matches) in matchedPages where matches.count > 1 {
-            throw AnalyzerError.validation(
-                "page record \(index) matched \(matches.count) different fixture pages")
+
+        // Every record must match exactly its intended fixture page, and no other page
+        // may match a record identity in its mode.
+        var alreadyPatchedChecks: [[String: Any]] = []
+        for (index, record) in profile.pages.enumerated() {
+            let matches = appliedByRecord[index] ?? []
+            guard matches.count == 1, let match = matches.first, let intended = intendedPage[index],
+                  match.driver == intended.driver, match.address == intended.address else {
+                let matchList = matches.map { "\($0.driver.rawValue)@\(Hex.value($0.address))" }
+                throw AnalyzerError.validation(
+                    "page record \(index) matched \(matches.count) fixture pages \(matchList); "
+                        + "expected exactly the intended page")
+            }
+            let patched = ProfileCodec.applySites(record, to: match.bytes)
+            let secondPass = ProfileCodec.applyPage(profile, data: patched, mode: record.mode)
+            guard case let .alreadyPatched(pageIndex) = secondPass, pageIndex == index else {
+                throw AnalyzerError.validation(
+                    "already-patched pass did not recognise record \(index) on its patched page")
+            }
+            alreadyPatchedChecks.append(["pageIndex": index,
+                                         "mode": record.mode == .page ? "PAGE" : "DYLD",
+                                         "result": "alreadyPatched"])
         }
+
+        let modePageRecords = profile.pages.filter { $0.mode == .page }.count
+        let modeDyldRecords = profile.pages.filter { $0.mode == .dyld }.count
         return [
             "result": "PASS",
             "profileVersion": Int(NRPTFormat.version),
-            "pagesScanned": totalPagesScanned,
-            "pagesMatched": matchedPageCount,
+            "pagesScanned": fixturePages.count,
+            "pagesMatched": appliedByRecord.keys.count,
+            "modePageRecords": modePageRecords,
+            "modeDyldRecords": modeDyldRecords,
+            "selector": [
+                "selectedIndex": 0,
+                "build": profile.header.build,
+                "apuMask": Hex.value(UInt64(profile.header.apuMask)),
+                "deviceID": Hex.value(UInt64(profile.header.deviceID)),
+                "runningDeviceID": Hex.value(UInt64(runningDeviceID)),
+                "result": "selected"
+            ],
             "pages": pageReports,
             "targetImageMetadata": [
                 "images": profile.images.count,
-                "pagesVerified": metadataPageReports.count,
-                "pages": metadataPageReports,
+                "pagesVerified": metadataReports.count,
+                "pages": metadataReports,
                 "result": "PASS"
             ],
-            "appliedPages": matchedPageCount,
-            "findMismatches": 0,
-            "falsePositives": 0
+            "alreadyPatchedPass": [
+                "records": alreadyPatchedChecks.count,
+                "checks": alreadyPatchedChecks,
+                "result": "PASS"
+            ],
+            "falsePositiveScan": [
+                "pagesScanned": fixturePages.count,
+                "unintendedMatches": 0,
+                "result": "PASS"
+            ],
+            "findMismatches": 0
         ]
     }
 }
@@ -882,11 +893,12 @@ enum OfflineValidator {
 enum ProfileCLI {
     static let generateFlag = "--generate-profile"
     static let validateFlag = "--validate-profile"
+    static let bundleFlag = "--bundle-profiles"
     static let outFlag = "--out"
     static let fixtureFlag = "--fixture-root"
 
     static func isRequested(_ arguments: [String]) -> Bool {
-        arguments.contains(generateFlag) || arguments.contains(validateFlag)
+        arguments.contains(generateFlag) || arguments.contains(validateFlag) || arguments.contains(bundleFlag)
     }
 
     static func run(arguments: [String]) -> Int32 {
@@ -899,12 +911,21 @@ enum ProfileCLI {
                 }
                 return try runGenerate(fixtureRoot: fixtureRoot, outDirectory: outDirectory)
             }
+            if let index = arguments.firstIndex(of: bundleFlag) {
+                guard let manifest = valueAfter(index, in: arguments) else {
+                    throw AnalyzerError.validation("--bundle-profiles requires a manifest.json path")
+                }
+                guard let outDirectory = valueOf(outFlag, in: arguments) else {
+                    throw AnalyzerError.validation("--bundle-profiles requires --out <directory>")
+                }
+                return try runBundle(manifestPath: manifest, outDirectory: outDirectory)
+            }
             if let index = arguments.firstIndex(of: validateFlag) {
                 let profilePath = valueAfter(index, in: arguments)
                 guard let profilePath else {
                     throw AnalyzerError.validation("--validate-profile requires a profile path")
                 }
-                guard let fixtureRoot = valueOf(fixtureFlag, in: arguments) ?? valueAfter(index + 2, in: arguments) else {
+                guard let fixtureRoot = valueOf(fixtureFlag, in: arguments) else {
                     throw AnalyzerError.validation("--validate-profile requires --fixture-root <root>")
                 }
                 return try runValidate(profilePath: profilePath, fixtureRoot: fixtureRoot)
@@ -930,12 +951,7 @@ enum ProfileCLI {
     private static func runGenerate(fixtureRoot: String?, outDirectory: String) throws -> Int32 {
         let environment = try AnalyzerEnvironment.resolve(fixtureRoot: fixtureRoot)
         let output = try ProfileGenerator.generate(environment: environment)
-        let directory = URL(fileURLWithPath: outDirectory, isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        } catch {
-            throw AnalyzerError.io("cannot create output directory \(directory.path): \(error.localizedDescription)")
-        }
+        let directory = try prepareOutputDirectory(outDirectory)
         let profileURL = directory.appendingPathComponent("nred-\(environment.build).nrpt")
         let evidenceURL = directory.appendingPathComponent("nred-\(environment.build)-evidence.json")
         do {
@@ -944,12 +960,14 @@ enum ProfileCLI {
         } catch {
             throw AnalyzerError.io("cannot write output: \(error.localizedDescription)")
         }
+        let pageModes = modeCounts(profile: output.profile)
         let lines = [
             "PASS: generated NRPT v\(NRPTFormat.version) profile",
             "build: \(environment.build)",
             "device: \(environment.deviceID.map { Hex.value(UInt64($0)) } ?? "unknown") apuMask: \(Hex.value(UInt64(environment.apuMask)))",
             "images: \(output.profile.images.count) pages: \(output.profile.pageCount) "
                 + "sites: \(output.profile.siteCount) size: \(output.profileData.count)",
+            "modes: PAGE=\(pageModes.page) DYLD=\(pageModes.dyld)",
             "sha256: \(ProfileGenerator.sha256(output.profileData))",
             "profile: \(profileURL.path)",
             "evidence: \(evidenceURL.path)",
@@ -957,6 +975,110 @@ enum ProfileCLI {
         ]
         FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
         return 0
+    }
+
+    private static func runBundle(manifestPath: String, outDirectory: String) throws -> Int32 {
+        let manifestURL = URL(fileURLWithPath: manifestPath)
+        let manifest = try ProfileBundleManifest.load(at: manifestURL)
+        var entries: [NRedProfilesEntry] = []
+        var facts: [BundleProfileFacts] = []
+        for (index, entry) in manifest.entries.enumerated() {
+            if let profilePath = entry.profilePath {
+                let data: Data
+                do {
+                    data = try Data(contentsOf: URL(fileURLWithPath: profilePath))
+                } catch {
+                    throw AnalyzerError.io("bundle entry \(index): cannot read \(profilePath): \(error.localizedDescription)")
+                }
+                let profile = try ProfileCodec.decode(data)
+                var revalidated = false
+                if let fixtureRoot = entry.fixtureRoot {
+                    let environment = try AnalyzerEnvironment.resolve(fixtureRoot: fixtureRoot)
+                    let images = try AnalyzerImageSet(environment: environment)
+                    _ = try OfflineValidator.validate(profileData: data, environment: environment, images: images)
+                    revalidated = true
+                }
+                try checkOverrides(entry: entry, profile: profile, index: index)
+                entries.append(NRedProfilesEntry(build: profile.header.build,
+                                                 apuMask: profile.header.apuMask,
+                                                 deviceID: profile.header.deviceID,
+                                                 profile: profile))
+                facts.append(BundleProfileFacts(build: profile.header.build,
+                                                apuMask: profile.header.apuMask,
+                                                deviceID: profile.header.deviceID,
+                                                profileData: data,
+                                                source: ProfileBundleSupport.sourceLabel(for: profilePath),
+                                                revalidated: revalidated,
+                                                profile: profile))
+            } else if let fixtureRoot = entry.fixtureRoot {
+                let environment = try AnalyzerEnvironment.resolve(fixtureRoot: fixtureRoot)
+                let output = try ProfileGenerator.generate(environment: environment)
+                try checkOverrides(entry: entry, profile: output.profile, index: index)
+                entries.append(NRedProfilesEntry(build: output.profile.header.build,
+                                                 apuMask: output.profile.header.apuMask,
+                                                 deviceID: output.profile.header.deviceID,
+                                                 profile: output.profile))
+                facts.append(BundleProfileFacts(build: output.profile.header.build,
+                                                apuMask: output.profile.header.apuMask,
+                                                deviceID: output.profile.header.deviceID,
+                                                profileData: output.profileData,
+                                                source: ProfileBundleSupport.sourceLabel(for: fixtureRoot),
+                                                revalidated: true,
+                                                profile: output.profile))
+            } else {
+                throw AnalyzerError.malformed("bundle entry \(index) has neither fixtureRoot nor profile")
+            }
+        }
+        let bundle = NRedProfilesBundle(entries: entries)
+        do {
+            try ProfileCodec.validateBundle(bundle)
+        } catch {
+            throw AnalyzerError.validation("bundle validation failed: \(error)")
+        }
+        let plistData = try ProfileCodec.encodeBundlePlist(bundle)
+        let bundleEvidence = try ProfileBundleSupport.evidenceJSON(facts: facts)
+        let directory = try prepareOutputDirectory(outDirectory)
+        let plistURL = directory.appendingPathComponent("nred-profiles.plist")
+        let evidenceURL = directory.appendingPathComponent("nred-profiles-evidence.json")
+        do {
+            try plistData.write(to: plistURL, options: .atomic)
+            try bundleEvidence.write(to: evidenceURL, options: .atomic)
+        } catch {
+            throw AnalyzerError.io("cannot write bundle output: \(error.localizedDescription)")
+        }
+        var lines = [
+            "PASS: generated NRedProfiles bundle (NRPT v\(NRPTFormat.version))",
+            "profiles: \(entries.count)"
+        ]
+        for fact in facts {
+            lines.append("  build: \(fact.build) apuMask: \(Hex.value(UInt64(fact.apuMask))) "
+                + "device: \(Hex.value(UInt64(fact.deviceID))) modePAGE=\(fact.modePageCount) "
+                + "modeDYLD=\(fact.modeDyldCount) sha256: \(fact.sha256)")
+        }
+        lines.append("plist: \(plistURL.path)")
+        lines.append("plist sha256: \(ProfileGenerator.sha256(plistData))")
+        lines.append("evidence: \(evidenceURL.path)")
+        FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+        return 0
+    }
+
+    private static func checkOverrides(entry: ProfileBundleManifest.Entry,
+                                       profile: NRPTProfile,
+                                       index: Int) throws {
+        if let build = entry.buildOverride, build != profile.header.build {
+            throw AnalyzerError.validation(
+                "bundle entry \(index): build override \(build) differs from profile build \(profile.header.build)")
+        }
+        if let apuMask = entry.apuMaskOverride, apuMask != profile.header.apuMask {
+            throw AnalyzerError.validation(
+                "bundle entry \(index): apuMask override \(Hex.value(UInt64(apuMask))) differs from profile "
+                    + "apuMask \(Hex.value(UInt64(profile.header.apuMask)))")
+        }
+        if let deviceID = entry.deviceIDOverride, deviceID != profile.header.deviceID {
+            throw AnalyzerError.validation(
+                "bundle entry \(index): deviceID override \(Hex.value(UInt64(deviceID))) differs from profile "
+                    + "deviceID \(Hex.value(UInt64(profile.header.deviceID)))")
+        }
     }
 
     private static func runValidate(profilePath: String, fixtureRoot: String) throws -> Int32 {
@@ -970,27 +1092,49 @@ enum ProfileCLI {
         }
         let report = try OfflineValidator.validate(profileData: data, environment: environment, images: images)
         let profile = try ProfileCodec.decode(data)
+        let pageModes = modeCounts(profile: profile)
         var lines: [String] = []
         lines.append("PASS: profile validated offline")
         lines.append("build: \(profile.header.build) version: v\(NRPTFormat.version) "
             + "images: \(profile.images.count) pages: \(profile.pageCount) "
             + "sites: \(profile.siteCount) bytes: \(data.count)")
+        lines.append("modes: PAGE=\(pageModes.page) DYLD=\(pageModes.dyld)")
         lines.append("sha256: \(ProfileGenerator.sha256(data))")
         lines.append("pages scanned: \(report["pagesScanned"] ?? "?") matched: \(report["pagesMatched"] ?? "?")")
         if let metadata = report["targetImageMetadata"] as? [String: Any] {
-            lines.append("target image metadata: images="
-                + "\(metadata["images"] ?? "?") pagesVerified=\(metadata["pagesVerified"] ?? "?")")
+            lines.append("target image metadata: images=\(metadata["images"] ?? "?") "
+                + "pagesVerified=\(metadata["pagesVerified"] ?? "?")")
+        }
+        if let selector = report["selector"] as? [String: Any] {
+            lines.append("bundle selector: result=\(selector["result"] ?? "?") "
+                + "build=\(selector["build"] ?? "?")")
         }
         if let pages = report["pages"] as? [[String: Any]] {
             for page in pages {
-                let index = page["pageIndex"] as? Int ?? -1
+                let index = page["recordIndex"] as? Int ?? -1
+                let mode = page["mode"] as? String ?? "?"
                 let driver = page["driver"] as? String ?? "?"
-                let offset = page["pageFileOffset"] as? String ?? "?"
+                let start = page["pageStart"] as? String ?? "?"
                 let sites = page["sitesMatched"] as? Int ?? 0
-                lines.append("  page \(index): \(driver) @\(offset) sites=\(sites) offsetGate=\(page["offsetGate"] ?? "?")")
+                lines.append("  record \(index): \(mode) \(driver) @\(start) sites=\(sites)")
             }
         }
         FileHandle.standardOutput.write(Data((lines.joined(separator: "\n") + "\n").utf8))
         return 0
+    }
+
+    private static func prepareOutputDirectory(_ path: String) throws -> URL {
+        let directory = URL(fileURLWithPath: path, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            throw AnalyzerError.io("cannot create output directory \(directory.path): \(error.localizedDescription)")
+        }
+        return directory
+    }
+
+    private static func modeCounts(profile: NRPTProfile) -> (page: Int, dyld: Int) {
+        (profile.pages.filter { $0.mode == .page }.count,
+         profile.pages.filter { $0.mode == .dyld }.count)
     }
 }

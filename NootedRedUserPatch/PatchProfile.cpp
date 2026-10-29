@@ -46,22 +46,6 @@ namespace
         return static_cast<UInt64>(readLe32(ptr)) | (static_cast<UInt64>(readLe32(ptr + 4)) << 32);
     }
 
-    // A fixed-width NUL-padded printable-ASCII name (NRPT v2 segment/section names): 1...capacity-1
-    // bytes in 0x20..0x7E, then NUL padding to the full capacity.
-    bool isValidFixedName(const UInt8* const name, const UInt32 capacity)
-    {
-        UInt32 length = 0;
-        while (length < capacity && name[length] != 0) {
-            if (name[length] < 0x20 || name[length] > 0x7E) { return false; }
-            length++;
-        }
-        if (length == 0 || length >= capacity) { return false; }
-        for (UInt32 index = length; index < capacity; index++) {
-            if (name[index] != 0) { return false; }
-        }
-        return true;
-    }
-
     // FNV-1a-32 payload checksum (NRPT specification section 1.1).
     UInt32 fnv1a32(const UInt8* const data, const size_t size)
     {
@@ -83,18 +67,6 @@ namespace
         }
         return hash;
     }
-
-    // RAII wrapper for the vnode name returned by the backend-supplied resolver.
-    struct VnodeNameGuard
-    {
-        const char*            name{nullptr};
-        PatchProfile::tVnodePutName put{nullptr};
-
-        ~VnodeNameGuard()
-        {
-            if (this->name != nullptr && this->put != nullptr) { this->put(this->name); }
-        }
-    };
 
 }    // namespace
 
@@ -120,13 +92,12 @@ bool PatchProfile::loadFromData(const void* const data, const size_t size)
 
     UInt32 pageCount      = 0;
     UInt32 siteCount      = 0;
-    UInt32 headerFlags    = 0;
     UInt32 imageTableSize = 0;
     UInt32 pageRecordSize = kPageRecordSize;
     UInt16 version        = 0;
     UInt16 imageCount     = 0;
 
-    if (!this->loadHeader(bytes, size, pageCount, siteCount, headerFlags, version, imageCount, imageTableSize,
+    if (!this->loadHeader(bytes, size, pageCount, siteCount, version, imageCount, imageTableSize,
                           pageRecordSize)) {
         return false;
     }
@@ -138,23 +109,19 @@ bool PatchProfile::loadFromData(const void* const data, const size_t size)
     this->profileVersion_ = version;
     this->imageCount_     = imageCount;
 
-    // The image table follows the page and site tables (v2 only) and must be parsed before the page
-    // records so every page's imageIndex/pageVmOffset can be validated against it.
-    if (version == kVersionV2) {
-        const auto* const imageTable = bytes + kHeaderSize + pageTableSize + siteCount * kSiteRecordSize;
-        if (!this->loadImageTable(imageTable, imageCount, imageTableSize)) { return false; }
-    }
+    // The image table follows the page and site tables and must be parsed before the page records so
+    // every page's imageIndex/pageVmOffset/mode can be validated against it (NRPT v3 layout).
+    const auto* const imageTable = bytes + kHeaderSize + pageTableSize + siteCount * kSiteRecordSize;
+    if (!this->loadImageTable(imageTable, imageCount, imageTableSize)) { return false; }
 
-    if (!this->loadPageTable(bytes + kHeaderSize, pageCount, siteCount, version)) { return false; }
+    if (!this->loadPageTable(bytes + kHeaderSize, pageCount, siteCount)) { return false; }
     if (!this->loadSiteTable(bytes + kHeaderSize + pageTableSize, siteCount, pageCount)) { return false; }
 
-    this->headerFlags_    = headerFlags;
     this->pageCount_      = static_cast<UInt16>(pageCount);
     this->siteCount_      = static_cast<UInt16>(siteCount);
     this->profileVersion_ = version;
     this->imageCount_     = imageCount;
     this->profileParsed_  = true;
-    __atomic_store_n(&this->pendingObservationCount_, pageCount, __ATOMIC_RELAXED);
 
     SYSLOG("PatchEngine",
            "NRPT v%u profile parsed: build %s apuMask 0x%X device 0x%04X pages %u sites %u images %u", 
@@ -166,8 +133,8 @@ bool PatchProfile::loadFromData(const void* const data, const size_t size)
     return true;
 }
 
-bool PatchProfile::loadHeader(const UInt8* const data, const size_t size, UInt32& pageCount, UInt32& siteCount,
-                              UInt32& headerFlags, UInt16& version, UInt16& imageCount, UInt32& imageTableSize,
+bool PatchProfile::loadHeader(const UInt8* const data, const size_t size, UInt32& pageCount,
+                              UInt32& siteCount, UInt16& version, UInt16& imageCount, UInt32& imageTableSize,
                               UInt32& pageRecordSize)
 {
     if (size < kHeaderSize) { return this->fail(Reason::kProfileInvalid, "E001", "truncated profile"); }
@@ -175,8 +142,8 @@ bool PatchProfile::loadHeader(const UInt8* const data, const size_t size, UInt32
     if (memcmp(data, "NRPT", 4) != 0) { return this->fail(Reason::kProfileInvalid, "E002", "bad magic"); }
 
     version = readLe16(data + 4);
-    if (version != kVersionV1 && version != kVersionV2) {
-        return this->fail(Reason::kProfileInvalid, "E003", "unsupported version");
+    if (version != kVersionV3) {
+        return this->fail(Reason::kProfileInvalid, "E003", "unsupported version (NRPT v3 only)");
     }
 
     if (readLe16(data + 6) != kHeaderSize) {
@@ -194,42 +161,27 @@ bool PatchProfile::loadHeader(const UInt8* const data, const size_t size, UInt32
     }
 
     const UInt32 deviceID = readLe32(data + 28);
-    const UInt32 flags    = readLe32(data + 48);
-    if ((flags & ~kHeaderFlagsKnown) != 0) {
-        return this->fail(Reason::kProfileInvalid, "E008", "unsupported header flags");
-    }
-    if ((flags & kHeaderFlagRequireDeviceID) != 0) {
-        if (deviceID == 0 || deviceID > 0xFFFFU) {
-            return this->fail(Reason::kProfileInvalid, "E007", "invalid required deviceID");
-        }
-    }
-    else if (deviceID != 0) {
-        return this->fail(Reason::kProfileInvalid, "E007", "deviceID without require flag");
+    if (deviceID > 0xFFFFU) {
+        return this->fail(Reason::kProfileInvalid, "E007", "invalid deviceID");
     }
 
-    if (version == kVersionV1) {
-        pageRecordSize = kPageRecordSize;
-        imageCount     = 0;
-        imageTableSize = 0;
-        for (size_t index = 52; index < kHeaderSize; index++) {
-            if (data[index] != 0) {
-                return this->fail(Reason::kProfileInvalid, "E009", "header reserved not zero");
-            }
-        }
-    }
-    else {
-        pageRecordSize = kPageRecordSizeV2;
-        imageCount     = readLe16(data + 52);
-        imageTableSize = readLe32(data + 54);
-        for (size_t index = 58; index < kHeaderSize; index++) {
-            if (data[index] != 0) {
-                return this->fail(Reason::kProfileInvalid, "E009", "header reserved not zero");
-            }
-        }
+    if (readLe32(data + 48) != 0) {
+        return this->fail(Reason::kProfileInvalid, "E008", "reserved header field not zero");
     }
 
-    if (size > kMaxProfileSize) {
-        return this->fail(Reason::kProfileInvalid, "E010", "profile too large");
+    imageCount     = readLe16(data + 52);
+    imageTableSize = readLe32(data + 54);
+    if (imageCount == 0 || imageCount > kMaxImages) {
+        return this->fail(Reason::kProfileInvalid, "E034", "invalid image count");
+    }
+    if (imageTableSize < imageCount * kImageEntryHeaderSize || imageTableSize > kMaxImageTableSize) {
+        return this->fail(Reason::kProfileInvalid, "E035", "invalid image table size");
+    }
+
+    for (size_t index = 58; index < kHeaderSize; index++) {
+        if (data[index] != 0) {
+            return this->fail(Reason::kProfileInvalid, "E009", "reserved header bytes not zero");
+        }
     }
 
     pageCount = readLe16(data + 32);
@@ -241,15 +193,7 @@ bool PatchProfile::loadHeader(const UInt8* const data, const size_t size, UInt32
         return this->fail(Reason::kProfileInvalid, "E016", "siteCount out of range");
     }
 
-    if (version == kVersionV2) {
-        if (imageCount == 0 || imageCount > kMaxImages) {
-            return this->fail(Reason::kProfileInvalid, "E034", "imageCount out of range");
-        }
-        if (imageTableSize < imageCount * kImageEntryHeaderSize || imageTableSize > kMaxImageTableSize) {
-            return this->fail(Reason::kProfileInvalid, "E035", "invalid image table size");
-        }
-    }
-
+    pageRecordSize = kPageRecordSize;
     const UInt32 pageTableSize = readLe32(data + 36);
     const UInt32 siteTableSize = readLe32(data + 40);
     if (pageTableSize != pageCount * pageRecordSize) {
@@ -274,43 +218,34 @@ bool PatchProfile::loadHeader(const UInt8* const data, const size_t size, UInt32
     }
 
     strlcpy(this->build_, profileBuild, sizeof(this->build_));
-    this->apuMask_     = apuMask;
-    this->deviceID_    = deviceID;
+    this->apuMask_        = apuMask;
+    this->deviceID_       = deviceID;
     this->profileVersion_ = version;
-    headerFlags        = flags;
     return true;
 }
 
 bool PatchProfile::loadImageTable(const UInt8* const table, const UInt32 imageCount, const UInt32 imageTableSize)
 {
-    const UInt8* cursor     = table;
-    const UInt8* const end  = table + imageTableSize;
+    const UInt8* cursor    = table;
+    const UInt8* const end = table + imageTableSize;
 
     for (UInt32 imageIndex = 0; imageIndex < imageCount; imageIndex++) {
         if (static_cast<size_t>(end - cursor) < kImageEntryHeaderSize) {
-            return this->fail(Reason::kProfileInvalid, "E035", "truncated image entry header");
+            return this->fail(Reason::kProfileInvalid, "E035", "image entry exceeds image table");
         }
 
-        const UInt8  kind          = cursor[0];
-        const UInt8  flags         = cursor[1];
+        const UInt32 kind          = cursor[0];
+        const UInt32 reserved      = cursor[1];
         const UInt32 pathLength    = readLe16(cursor + 2);
         const UInt64 unslidVmaddr  = readLe64(cursor + 4);
         const UInt32 vmSize        = readLe32(cursor + 12);
-        const UInt32 segmentCount  = cursor[16];
-        const UInt32 sectionCount  = cursor[17];
-        const UInt16 reserved      = readLe16(cursor + 18);
 
-        if (reserved != 0 || (flags & ~kImageFlagSuffixMatch) != 0 || (flags & kImageFlagSuffixMatch) == 0
-            || kind > kImageKindSharedCache || pathLength < 1 || pathLength > kMaxImagePathLength
-            || segmentCount < 1 || segmentCount > kMaxSegmentsPerImage
-            || sectionCount > kMaxSectionsPerImage)
-        {
+        if (reserved != 0 || kind > kImageKindSharedCache || pathLength < 1 || pathLength > kMaxImagePathLength) {
             return this->fail(Reason::kProfileInvalid, "E035", "invalid image entry");
         }
 
         const UInt32 pathFieldSize = (pathLength + 1U + 3U) & ~3U;
-        const UInt32 entrySize = kImageEntryHeaderSize + pathFieldSize + segmentCount * kSegmentNameSize
-                                 + sectionCount * kSectionNameSize;
+        const UInt32 entrySize     = kImageEntryHeaderSize + pathFieldSize;
         if (static_cast<size_t>(end - cursor) < entrySize) {
             return this->fail(Reason::kProfileInvalid, "E035", "image entry exceeds image table");
         }
@@ -330,51 +265,23 @@ bool PatchProfile::loadImageTable(const UInt8* const table, const UInt32 imageCo
             }
         }
 
-        // Segment and section name tables: fixed 16-byte NUL-padded printable ASCII, unique per table.
-        const UInt8* names = cursor + kImageEntryHeaderSize + pathFieldSize;
-        for (UInt32 segment = 0; segment < segmentCount; segment++) {
-            const UInt8* const name = names + segment * kSegmentNameSize;
-            if (!isValidFixedName(name, kSegmentNameSize)) {
-                return this->fail(Reason::kProfileInvalid, "E038", "invalid segment name");
-            }
-            for (UInt32 other = 0; other < segment; other++) {
-                if (memcmp(name, names + other * kSegmentNameSize, kSegmentNameSize) == 0) {
-                    return this->fail(Reason::kProfileInvalid, "E038", "duplicate segment name");
-                }
-            }
-        }
-        names += segmentCount * kSegmentNameSize;
-        for (UInt32 section = 0; section < sectionCount; section++) {
-            const UInt8* const name = names + section * kSectionNameSize;
-            if (!isValidFixedName(name, kSectionNameSize)) {
-                return this->fail(Reason::kProfileInvalid, "E038", "invalid section name");
-            }
-            for (UInt32 other = 0; other < section; other++) {
-                if (memcmp(name, names + other * kSectionNameSize, kSectionNameSize) == 0) {
-                    return this->fail(Reason::kProfileInvalid, "E038", "duplicate section name");
-                }
-            }
-        }
-
         if (vmSize == 0 || vmSize > kMaxImageVmSize || (kind == kImageKindSharedCache && unslidVmaddr == 0)) {
             return this->fail(Reason::kProfileInvalid, "E041", "invalid image geometry");
         }
 
         for (UInt32 other = 0; other < imageIndex; other++) {
-            if (this->images_[other].kind == kind && strcmp(this->images_[other].path,
-                                                            reinterpret_cast<const char*>(path)) == 0)
+            if (this->images_[other].kind == kind
+                && strcmp(this->images_[other].path, reinterpret_cast<const char*>(path)) == 0)
             {
                 return this->fail(Reason::kProfileInvalid, "E039", "duplicate image path");
             }
         }
 
-        auto& image          = this->images_[imageIndex];
-        image.kind           = kind;
-        image.flags          = flags;
-        image.segmentCount   = static_cast<UInt8>(segmentCount);
-        image.sectionCount   = static_cast<UInt8>(sectionCount);
-        image.unslidVmaddr   = unslidVmaddr;
-        image.vmSize         = vmSize;
+        auto& image            = this->images_[imageIndex];
+        image.kind             = static_cast<UInt8>(kind);
+        image.reserved         = 0;
+        image.unslidVmaddr     = unslidVmaddr;
+        image.vmSize           = vmSize;
         memcpy(image.path, path, pathLength);
         image.path[pathLength] = '\0';
 
@@ -388,35 +295,7 @@ bool PatchProfile::loadImageTable(const UInt8* const table, const UInt32 imageCo
     return true;
 }
 
-bool PatchProfile::loadPageTable(const UInt8* const table, const UInt32 pageCount, const UInt32 siteCount,
-                                 const UInt16 version)
-{
-    const bool parsed = version == kVersionV2 ? this->loadPageTableV2(table, pageCount, siteCount)
-                                              : this->loadPageTableV1(table, pageCount, siteCount);
-    if (!parsed) { return false; }
-
-    // Identity uniqueness (specification section 6 rule 5): identical content hash is only allowed
-    // when both records are offset-gated to different offsets, otherwise the first-match rule would
-    // be ambiguous.
-    for (UInt32 first = 0; first < pageCount; first++) {
-        for (UInt32 second = first + 1; second < pageCount; second++) {
-            const auto& a = this->pages_[first];
-            const auto& b = this->pages_[second];
-            if (a.pageHash != b.pageHash) { continue; }
-
-            const bool offsetDistinguished = (a.matchFlags & kMatchRequireOffset) != 0
-                                             && (b.matchFlags & kMatchRequireOffset) != 0
-                                             && a.pageFileOffset != b.pageFileOffset;
-            if (!offsetDistinguished) {
-                return this->fail(Reason::kProfileInvalid, "E031", "duplicate page identity");
-            }
-        }
-    }
-
-    return true;
-}
-
-bool PatchProfile::loadPageTableV1(const UInt8* const table, const UInt32 pageCount, const UInt32 siteCount)
+bool PatchProfile::loadPageTable(const UInt8* const table, const UInt32 pageCount, const UInt32 siteCount)
 {
     UInt32 expectedFirstSite = 0;
 
@@ -427,70 +306,29 @@ bool PatchProfile::loadPageTableV1(const UInt8* const table, const UInt32 pageCo
         const UInt64 pageHash       = readLe64(record + 8);
         const UInt32 firstSite      = readLe32(record + 16);
         const UInt32 sitesInPage    = readLe16(record + 20);
-        const UInt16 matchFlags     = readLe16(record + 22);
-
-        if ((pageFileOffset & (kPageSize - 1U)) != 0) {
-            return this->fail(Reason::kProfileInvalid, "E017", "page offset misaligned");
-        }
-        if ((matchFlags & ~kMatchKnownFlags) != 0) {
-            return this->fail(Reason::kProfileInvalid, "E018", "unsupported page match flags");
-        }
-        if ((matchFlags & kMatchRequiredFlags) != kMatchRequiredFlags) {
-            return this->fail(Reason::kProfileInvalid, "E019", "required match flag missing");
-        }
-        if (sitesInPage == 0 || sitesInPage > kMaxSitesPerPage) {
-            return this->fail(Reason::kProfileInvalid, "E023", "sites per page out of range");
-        }
-        if (firstSite != expectedFirstSite) {
-            return this->fail(Reason::kProfileInvalid, "E021", "non-canonical site range");
-        }
-        if (static_cast<UInt64>(firstSite) + sitesInPage > siteCount) {
-            return this->fail(Reason::kProfileInvalid, "E020", "page site range exceeds site table");
-        }
-
-        auto& page          = this->pages_[pageIndex];
-        page.pageFileOffset = pageFileOffset;
-        page.pageHash       = pageHash;
-        page.firstSite      = firstSite;
-        page.siteCount      = static_cast<UInt16>(sitesInPage);
-        page.matchFlags     = matchFlags;
-        page.imageIndex     = 0;
-        page.pageVmOffset   = 0;
-
-        expectedFirstSite += sitesInPage;
-    }
-
-    if (expectedFirstSite != siteCount) {
-        return this->fail(Reason::kProfileInvalid, "E022", "page site count sum mismatch");
-    }
-
-    return true;
-}
-
-bool PatchProfile::loadPageTableV2(const UInt8* const table, const UInt32 pageCount, const UInt32 siteCount)
-{
-    UInt32 expectedFirstSite = 0;
-
-    for (UInt32 pageIndex = 0; pageIndex < pageCount; pageIndex++) {
-        const UInt8* const record = table + static_cast<size_t>(pageIndex) * kPageRecordSizeV2;
-
-        const UInt64 pageFileOffset = readLe64(record + 0);
-        const UInt64 pageHash       = readLe64(record + 8);
-        const UInt32 firstSite      = readLe32(record + 16);
-        const UInt32 sitesInPage    = readLe16(record + 20);
-        const UInt16 matchFlags     = readLe16(record + 22);
+        const UInt32 mode           = record[22];
+        const UInt32 flags          = record[23];
         const UInt32 imageIndex     = readLe16(record + 24);
         const UInt16 reserved       = readLe16(record + 26);
         const UInt32 pageVmOffset   = readLe32(record + 28);
 
+        // pageFileOffset is diagnostic evidence only and is never part of page identity.
         if ((pageFileOffset & (kPageSize - 1U)) != 0) {
             return this->fail(Reason::kProfileInvalid, "E017", "page offset misaligned");
         }
-        if ((matchFlags & ~kMatchKnownFlags) != 0) {
-            return this->fail(Reason::kProfileInvalid, "E018", "unsupported page match flags");
+        if (mode != static_cast<UInt32>(Mode::kPage) && mode != static_cast<UInt32>(Mode::kDyld)) {
+            return this->fail(Reason::kProfileInvalid, "E018", "unsupported page mode");
         }
-        if ((matchFlags & kMatchRequiredFlags) != kMatchRequiredFlags) {
-            return this->fail(Reason::kProfileInvalid, "E019", "required match flag missing");
+        if (flags != 0 || reserved != 0 || imageIndex >= this->imageCount_) {
+            return this->fail(Reason::kProfileInvalid, "E038", "invalid page metadata");
+        }
+        const bool modeKindMatches =
+            (mode == static_cast<UInt32>(Mode::kPage)
+             && this->images_[imageIndex].kind == kImageKindStandalone)
+            || (mode == static_cast<UInt32>(Mode::kDyld)
+                && this->images_[imageIndex].kind == kImageKindSharedCache);
+        if (!modeKindMatches) {
+            return this->fail(Reason::kProfileInvalid, "E019", "page mode/image kind mismatch");
         }
         if (sitesInPage == 0 || sitesInPage > kMaxSitesPerPage) {
             return this->fail(Reason::kProfileInvalid, "E023", "sites per page out of range");
@@ -510,12 +348,23 @@ bool PatchProfile::loadPageTableV2(const UInt8* const table, const UInt32 pageCo
             return this->fail(Reason::kProfileInvalid, "E040", "invalid pageVmOffset");
         }
 
+        // Duplicate page identity: the same full-page hash may not appear twice in one mode (two
+        // records could both claim the same delivered content).
+        for (UInt32 other = 0; other < pageIndex; other++) {
+            if (this->pages_[other].mode == static_cast<UInt8>(mode)
+                && this->pages_[other].pageHash == pageHash)
+            {
+                return this->fail(Reason::kProfileInvalid, "E031", "duplicate page identity");
+            }
+        }
+
         auto& page          = this->pages_[pageIndex];
         page.pageFileOffset = pageFileOffset;
         page.pageHash       = pageHash;
         page.firstSite      = firstSite;
         page.siteCount      = static_cast<UInt16>(sitesInPage);
-        page.matchFlags     = matchFlags;
+        page.mode           = static_cast<UInt8>(mode);
+        page.flags          = static_cast<UInt8>(flags);
         page.imageIndex     = static_cast<UInt16>(imageIndex);
         page.pageVmOffset   = pageVmOffset;
 
@@ -587,6 +436,11 @@ bool PatchProfile::loadSiteTable(const UInt8* const table, const UInt32 siteCoun
     return true;
 }
 
+void PatchProfile::failBundleSelection(const Reason reason, const char* const code, const char* const context)
+{
+    (void) this->fail(reason, code, context);
+}
+
 void PatchProfile::noteAbsentProfile()
 {
     if (this->loadAttempted_) { return; }
@@ -596,8 +450,8 @@ void PatchProfile::noteAbsentProfile()
 
     this->state_        = State::kNoOp;
     this->reason_       = Reason::kProfileAbsent;
-    this->errorContext_ = "NRedOffsetProfile property missing";
-    SYSLOG("PatchEngine", "no NRedOffsetProfile injected; page backend stays inert");
+    this->errorContext_ = "NRedProfiles bundle absent";
+    SYSLOG("PatchEngine", "no NRedProfiles bundle injected; page backend stays inert");
 }
 
 bool PatchProfile::setProvisionalBuild(const char* const injectedBuild)
@@ -632,7 +486,7 @@ bool PatchProfile::confirmRunningBuild(const char* const actualBuild, const char
     if (injectedBuild != nullptr && injectedBuild[0] != '\0'
         && (strcmp(injectedBuild, actualBuild) != 0 || strcmp(injectedBuild, this->build_) != 0))
     {
-        this->revokeBuild(Reason::kBuildMismatch, "NRedSystemBuild differs from kern.osversion");
+        this->revokeBuild(Reason::kBuildMismatch, "NRedProfiles entry build differs from kern.osversion");
         return false;
     }
 
@@ -694,9 +548,11 @@ void PatchProfile::evaluateIdentity()
         return;
     }
 
-    if ((this->headerFlags_ & kHeaderFlagRequireDeviceID) != 0 && this->deviceID_ != this->runningDeviceID_) {
-        this->revokeBuild(Reason::kDeviceMismatch, "required deviceID differs from running iGPU");
-        return;
+    if (this->deviceID_ != 0) {
+        if (this->runningDeviceID_ == 0 || this->deviceID_ != this->runningDeviceID_) {
+            this->revokeBuild(Reason::kDeviceMismatch, "required deviceID differs from running iGPU");
+            return;
+        }
     }
 
     this->state_  = State::kLoaded;
@@ -707,142 +563,44 @@ void PatchProfile::evaluateIdentity()
     __atomic_store_n(&this->activeFlag_, 1, __ATOMIC_RELEASE);
 
     SYSLOG("PatchEngine", "NRPT profile active%s: build %s apuMask 0x%X running 0x%X device 0x%04X pages %u sites %u",
-           this->buildProvisional_ ? " (provisional build from NRedSystemBuild)" : "", this->build_,
+           this->buildProvisional_ ? " (provisional build from NRedProfiles entry)" : "", this->build_,
            static_cast<unsigned>(this->apuMask_), static_cast<unsigned>(this->runningApuMask_),
            static_cast<unsigned>(this->deviceID_), static_cast<unsigned>(this->pageCount_),
            static_cast<unsigned>(this->siteCount_));
 }
 
-void PatchProfile::setVnodeResolver(const tVnodeGetName getName, const tVnodePutName putName)
-{
-    this->vnodeGetName_ = getName;
-    this->vnodePutName_ = putName;
-}
-
-bool PatchProfile::vnodeGateActive() const
-{
-    return this->imageCount_ > 0 && this->vnodeGetName_ != nullptr && this->vnodePutName_ != nullptr;
-}
-
-void PatchProfile::recordVnodeRejected(const UInt32 pageIndex)
-{
-    const UInt32 word = pageIndex / 64U;
-    const UInt64 bit  = 1ULL << (pageIndex % 64U);
-    if ((__atomic_fetch_or(&this->vnodeRejectedBits_[word], bit, __ATOMIC_RELAXED) & bit) == 0) {
-        __atomic_fetch_add(&this->vnodeRejectedCount_, 1, __ATOMIC_RELAXED);
-    }
-    __atomic_fetch_add(&this->vnodeRejectedEventCount_, 1, __ATOMIC_RELAXED);
-}
-
-bool PatchProfile::vnodeGateAccepts(const UInt32 pageIndex, const char* const vnodeName) const
-{
-    if (vnodeName == nullptr) { return false; }
-
-    const auto& record = this->pages_[pageIndex];
-    if (record.imageIndex >= this->imageCount_) { return false; }
-
-    const auto& image = this->images_[record.imageIndex];
-    if (image.kind == kImageKindSharedCache) {
-        // dyld shared cache pages are delivered through the cache vnode.
-        return strstr(vnodeName, "dyld_shared_cache") != nullptr || strstr(vnodeName, "dyld") != nullptr;
-    }
-
-    // Standalone image: the vnode name is the file basename of the target dylib.
-    const char* token = strrchr(image.path, '/');
-    token             = token != nullptr ? token + 1 : image.path;
-    if (token[0] == '\0') { return false; }
-    return strstr(vnodeName, token) != nullptr;
-}
-
 void PatchProfile::applyChunk(const UInt8* const data, const size_t size, const UInt64 chunkBase,
-                              void* const vnode)
+                              const Mode route)
 {
     if (data == nullptr || size < kPageSize) { return; }
     if (__atomic_load_n(&this->activeFlag_, __ATOMIC_ACQUIRE) == 0) { return; }
 
     for (size_t offset = 0; offset + kPageSize <= size; offset += kPageSize) {
-        this->applyPage(data + offset, chunkBase + static_cast<UInt64>(offset), vnode);
+        this->applyPage(data + offset, chunkBase + static_cast<UInt64>(offset), route);
     }
 }
 
-void PatchProfile::applyPage(const UInt8* const page, const UInt64 chunkBase, void* const vnode)
+void PatchProfile::applyPage(const UInt8* const page, const UInt64 chunkBase, const Mode route)
 {
     __atomic_fetch_add(&this->chunkCallCount_, 1, __ATOMIC_RELAXED);
+    (void)chunkBase;    // pager offset is never part of page identity
 
-    const bool offsetAligned     = (chunkBase & (kPageSize - 1U)) == 0;
-    const bool gateActive        = this->vnodeGateActive();
-    const bool diagnosticsActive = this->diagnosticsActive();
-    bool       hashComputed      = false;
-    UInt64     pageHash          = 0;
-
-    // Vnode-name gate (NRPT v2 profiles only): the real vnode argument from the hook is resolved once
-    // per delivered chunk.  This mirrors the native backend's Gate 0 and is both the cheapest filter
-    // (no hashing of unrelated pages) and the safety boundary for pages that are delivered at a pager
-    // offset other than the one recorded in the profile.
-    const char*    vnodeName = nullptr;
-    VnodeNameGuard nameGuard{};
-    if (gateActive) {
-        if (vnode == nullptr || this->vnodeGetName_ == nullptr) { return; }    // fail closed, no write
-        vnodeName = this->vnodeGetName_(vnode);
-        if (vnodeName == nullptr) { return; }
-        nameGuard.name = vnodeName;
-        nameGuard.put  = this->vnodePutName_;
-    }
+    const UInt64 pageHash = fnv1a64(page, kPageSize);
 
     for (UInt32 pageIndex = 0; pageIndex < this->pageCount_; pageIndex++) {
         const auto& record = this->pages_[pageIndex];
 
-        if (gateActive && !this->vnodeGateAccepts(pageIndex, vnodeName)) {
-            this->recordVnodeRejected(pageIndex);
-            continue;
-        }
+        // Strict frozen-spec mode-domain routing: PAGE records are only considered by the page hook
+        // (_cs_validate_page) and DYLD records only by the range hook (_cs_validate_range).
+        if (record.mode != static_cast<UInt8>(route)) { continue; }
+        if (pageHash != record.pageHash) { continue; }
 
-        const bool requiresOffset = (record.matchFlags & kMatchRequireOffset) != 0;
-
-        // Diagnostics: remember that a chunk with the record's exact expected pager offset was delivered,
-        // even when its content does not match.
-        if (diagnosticsActive && requiresOffset && offsetAligned && record.pageFileOffset == chunkBase) {
-            this->recordOffsetSeen(pageIndex);
-        }
-
-        // With the vnode gate active, the full-page content hash alone identifies the page (the native
-        // backend likewise does not require a pager offset on its exact-page path).  Without the gate
-        // (v1 profiles or resolver unavailable) the legacy offset gate stays in force: fail closed.
-        const bool offsetMatches = offsetAligned && record.pageFileOffset == chunkBase;
-        if (!gateActive && (!offsetMatches || !offsetAligned)) {
-            if (!diagnosticsActive) { continue; }
-            if (requiresOffset && !offsetMatches) {
-                // Content diagnostics may still observe the record at other offsets.
-            }
-        }
-
-        if (!hashComputed) {
-            pageHash     = fnv1a64(page, kPageSize);
-            hashComputed = true;
-        }
-
-        const bool contentMatches = pageHash == record.pageHash;
-
-        if (requiresOffset && offsetAligned && record.pageFileOffset == chunkBase) {
-            this->recordExpectedOffsetEvidence(pageIndex, pageHash, page);
-        }
-        if (contentMatches) { this->recordHashObservation(pageIndex, chunkBase); }
-
-        if (!contentMatches) { continue; }
-
-        if (!gateActive && !offsetMatches) {
-            if (diagnosticsActive) { this->recordOffsetMismatch(pageIndex); }
-            continue;
-        }
-
-        // The record's enabled identity gates matched: it is authoritative for this chunk.
         __atomic_fetch_add(&this->matchedPageCount_, 1, __ATOMIC_RELAXED);
 
         const UInt32 wordIndex = pageIndex / 64U;
         const UInt64 bit       = 1ULL << (pageIndex % 64U);
         if ((__atomic_load_n(&this->appliedBits_[wordIndex], __ATOMIC_RELAXED) & bit) != 0) {
-            // Already applied once this boot; never write twice and never try another record.
-            return;
+            return;    // applied once this boot; never write twice
         }
 
         bool   sitesMatch = true;
@@ -856,28 +614,21 @@ void PatchProfile::applyPage(const UInt8* const page, const UInt64 chunkBase, vo
             }
         }
         if (!sitesMatch) {
-            // Zero writes for this page, no substitute record, no scan.
             __atomic_fetch_add(&this->findMismatchCount_, 1, __ATOMIC_RELAXED);
             if (this->takeLogBudget()) {
-                DBGLOG("UserPatch", "site find mismatch on profile page %u site %u (chunk 0x%llX)",
+                DBGLOG("UserPatch", "site find mismatch on profile page %u site %u (mode %s)",
                        static_cast<unsigned>(pageIndex), static_cast<unsigned>(badSite),
-                       static_cast<unsigned long long>(chunkBase));
+                       modeName(static_cast<Mode>(record.mode)));
             }
             (void)badSite;
             return;
         }
 
-        // Claim the applied bit before writing so a concurrent validation of the same content cannot
-        // write twice.  If write protection cannot be enabled the claim is released again.
         if ((__atomic_fetch_or(&this->appliedBits_[wordIndex], bit, __ATOMIC_ACQ_REL) & bit) != 0) { return; }
 
         if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
             __atomic_fetch_and(&this->appliedBits_[wordIndex], ~bit, __ATOMIC_RELAXED);
             __atomic_fetch_add(&this->writeFailureCount_, 1, __ATOMIC_RELAXED);
-            if (this->takeLogBudget()) {
-                DBGLOG("UserPatch", "failed to enable kernel writing for profile page %u",
-                       static_cast<unsigned>(pageIndex));
-            }
             return;
         }
 
@@ -889,32 +640,21 @@ void PatchProfile::applyPage(const UInt8* const page, const UInt64 chunkBase, vo
 
         if (MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
             __atomic_fetch_add(&this->writeFailureCount_, 1, __ATOMIC_RELAXED);
-            if (this->takeLogBudget()) {
-                DBGLOG("UserPatch", "failed to restore kernel writing after profile page %u",
-                       static_cast<unsigned>(pageIndex));
-            }
         }
 
         __atomic_fetch_add(&this->appliedPageCount_, 1, __ATOMIC_RELAXED);
-        if (gateActive && !offsetMatches) {
-            // Content identity is proven but the delivery offset differs from the recorded one: this is
-            // exactly the case the legacy offset gate rejected (GL pages at another pager offset).
-            __atomic_fetch_or(&this->hashOnlyAppliedBits_[wordIndex], bit, __ATOMIC_RELAXED);
-            __atomic_fetch_add(&this->hashOnlyAppliedCount_, 1, __ATOMIC_RELAXED);
-        }
         if (this->takeLogBudget()) {
-            DBGLOG("UserPatch", "applied profile page %u (%u site(s)) at chunk 0x%llX%s",
+            DBGLOG("UserPatch", "applied profile page %u (%u site(s), %s route)",
                    static_cast<unsigned>(pageIndex), static_cast<unsigned>(record.siteCount),
-                   static_cast<unsigned long long>(chunkBase),
-                   (gateActive && !offsetMatches) ? " [vnode-gated content match]" : "");
+                   modeName(static_cast<Mode>(record.mode)));
         }
         return;
     }
 
-    // No exact page image matched.  The page may already carry our replacement bytes from an earlier
-    // validation (the page cache is shared): recognise that, mark it applied and never write.
+    // Already-patched pass: the shared page cache may already carry our replace bytes.  Mark the
+    // record applied without writing; same strict mode-domain filter.
     for (UInt32 pageIndex = 0; pageIndex < this->pageCount_; pageIndex++) {
-        if (gateActive && !this->vnodeGateAccepts(pageIndex, vnodeName)) { continue; }
+        if (this->pages_[pageIndex].mode != static_cast<UInt8>(route)) { continue; }
         if (this->markAlreadyPatched(pageIndex, page)) { return; }
     }
 }
@@ -941,67 +681,6 @@ bool PatchProfile::markAlreadyPatched(const UInt32 pageIndex, const UInt8* const
                static_cast<unsigned>(pageIndex));
     }
     return true;
-}
-
-void PatchProfile::recordHashObservation(const UInt32 pageIndex, const UInt64 chunkBase)
-{
-    const UInt32 word = pageIndex / 64U;
-    const UInt64 bit  = 1ULL << (pageIndex % 64U);
-    if ((__atomic_fetch_or(&this->observedHashBits_[word], bit, __ATOMIC_RELAXED) & bit) == 0) {
-        // First observation: only the fetch_or winner writes the offset and updates the counter.
-        this->firstObservedOffsets_[pageIndex] = chunkBase;
-        __atomic_fetch_sub(&this->pendingObservationCount_, 1, __ATOMIC_RELAXED);
-    }
-}
-
-void PatchProfile::recordOffsetSeen(const UInt32 pageIndex)
-{
-    const UInt32 word = pageIndex / 64U;
-    const UInt64 bit  = 1ULL << (pageIndex % 64U);
-    __atomic_fetch_or(&this->offsetSeenBits_[word], bit, __ATOMIC_RELAXED);
-}
-
-void PatchProfile::recordOffsetMismatch(const UInt32 pageIndex)
-{
-    const UInt32 word = pageIndex / 64U;
-    const UInt64 bit  = 1ULL << (pageIndex % 64U);
-    if ((__atomic_fetch_or(&this->offsetMismatchBits_[word], bit, __ATOMIC_RELAXED) & bit) == 0) {
-        __atomic_fetch_add(&this->offsetMismatchEventCount_, 1, __ATOMIC_RELAXED);
-    }
-}
-
-void PatchProfile::recordExpectedOffsetEvidence(const UInt32 pageIndex, const UInt64 pageHash,
-                                                const UInt8* const page)
-{
-    const UInt32 count = __atomic_load_n(&this->expectedOffsetHashCounts_[pageIndex], __ATOMIC_RELAXED);
-    if (count >= kExpectedOffsetHashSlots) { return; }
-
-    // Skip a hash already recorded for this page (a page may be re-validated after being patched).
-    for (UInt32 slot = 0; slot < count && slot < kExpectedOffsetHashSlots; slot++) {
-        if (__atomic_load_n(&this->expectedOffsetHashes_[pageIndex][slot], __ATOMIC_RELAXED) == pageHash) { return; }
-    }
-
-    const auto& record = this->pages_[pageIndex];
-
-    // Check every generated site find against the delivered chunk even though the full-page hash
-    // differs.  This is what distinguishes a slightly changed target page from an unrelated page at a
-    // colliding offset.
-    UInt32 sitesFound = 0;
-    for (UInt32 siteIndex = 0; siteIndex < record.siteCount; siteIndex++) {
-        const auto& site = this->sites_[record.firstSite + siteIndex];
-        if (memcmp(page + site.siteInPage, site.find, site.size) == 0) { sitesFound += 1; }
-    }
-
-    // Claim a slot; a benign race may consume a slot but never writes out of bounds.
-    const UInt32 slot = __atomic_fetch_add(&this->expectedOffsetHashCounts_[pageIndex], 1, __ATOMIC_RELAXED);
-    if (slot < kExpectedOffsetHashSlots) {
-        this->expectedOffsetHashes_[pageIndex][slot]      = pageHash;
-        this->expectedOffsetSitesFound_[pageIndex][slot]  = static_cast<UInt8>(sitesFound);
-        this->expectedOffsetSitesTotal_[pageIndex][slot]  = static_cast<UInt16>(record.siteCount);
-    }
-
-    __atomic_fetch_or(&this->expectedOffsetSeenBits_[pageIndex / 64U], 1ULL << (pageIndex % 64U),
-                      __ATOMIC_RELAXED);
 }
 
 bool PatchProfile::fail(const Reason reason, const char* const code, const char* const context)
@@ -1135,94 +814,89 @@ UInt64 PatchProfile::appliedMaskWord(const UInt32 wordIndex) const
     return __atomic_load_n(&this->appliedBits_[wordIndex], __ATOMIC_RELAXED);
 }
 
-bool PatchProfile::hashObserved(const UInt32 pageIndex) const
+UInt16 PatchProfile::profileVersion() const { return this->profileVersion_; }
+
+UInt32 PatchProfile::imageCount() const { return this->imageCount_; }
+
+const char* PatchProfile::build() const { return this->build_; }
+
+UInt32 PatchProfile::apuMask() const { return this->apuMask_; }
+
+UInt32 PatchProfile::deviceID() const { return this->deviceID_; }
+
+UInt32 PatchProfile::pageCount() const { return this->pageCount_; }
+
+UInt32 PatchProfile::siteCount() const { return this->siteCount_; }
+
+bool PatchProfile::parsed() const { return this->profileParsed_; }
+
+UInt32 PatchProfile::appliedPages() const { return __atomic_load_n(&this->appliedPageCount_, __ATOMIC_RELAXED); }
+
+UInt32 PatchProfile::findMismatches() const { return __atomic_load_n(&this->findMismatchCount_, __ATOMIC_RELAXED); }
+
+UInt32 PatchProfile::matchedPages() const { return __atomic_load_n(&this->matchedPageCount_, __ATOMIC_RELAXED); }
+
+UInt32 PatchProfile::chunkCalls() const { return __atomic_load_n(&this->chunkCallCount_, __ATOMIC_RELAXED); }
+
+UInt32 PatchProfile::writeFailures() const { return __atomic_load_n(&this->writeFailureCount_, __ATOMIC_RELAXED); }
+
+UInt32 PatchProfile::alreadyPatchedPages() const
 {
-    return pageIndex < this->pageCount_ && maskBitSet(this->observedHashBits_, pageIndex);
+    return __atomic_load_n(&this->alreadyPatchedCount_, __ATOMIC_RELAXED);
 }
 
-bool PatchProfile::offsetMismatch(const UInt32 pageIndex) const
+bool PatchProfile::alreadyPatched(const UInt32 pageIndex) const
 {
-    return pageIndex < this->pageCount_ && maskBitSet(this->offsetMismatchBits_, pageIndex);
+    return pageIndex < this->pageCount_ && maskBitSet(this->alreadyPatchedBits_, pageIndex);
 }
 
-bool PatchProfile::offsetSeen(const UInt32 pageIndex) const
-{
-    return pageIndex < this->pageCount_ && maskBitSet(this->offsetSeenBits_, pageIndex);
-}
-
-bool PatchProfile::firstObservedOffset(const UInt32 pageIndex, UInt64& offset) const
-{
-    if (!this->hashObserved(pageIndex)) { return false; }
-    offset = __atomic_load_n(&this->firstObservedOffsets_[pageIndex], __ATOMIC_RELAXED);
-    return true;
-}
-
-UInt64 PatchProfile::observedHashMaskWord(const UInt32 wordIndex) const
-{
-    if (wordIndex >= kAppliedMaskWords) { return 0; }
-    return __atomic_load_n(&this->observedHashBits_[wordIndex], __ATOMIC_RELAXED);
-}
-
-UInt64 PatchProfile::offsetMismatchMaskWord(const UInt32 wordIndex) const
-{
-    if (wordIndex >= kAppliedMaskWords) { return 0; }
-    return __atomic_load_n(&this->offsetMismatchBits_[wordIndex], __ATOMIC_RELAXED);
-}
-
-UInt64 PatchProfile::offsetSeenMaskWord(const UInt32 wordIndex) const
-{
-    if (wordIndex >= kAppliedMaskWords) { return 0; }
-    return __atomic_load_n(&this->offsetSeenBits_[wordIndex], __ATOMIC_RELAXED);
-}
-
-UInt32 PatchProfile::offsetMismatchEvents() const
-{
-    return __atomic_load_n(&this->offsetMismatchEventCount_, __ATOMIC_RELAXED);
-}
-
-UInt32 PatchProfile::pendingObservations() const
-{
-    return __atomic_load_n(&this->pendingObservationCount_, __ATOMIC_RELAXED);
-}
-
-bool PatchProfile::pageRequiresOffset(const UInt32 pageIndex) const
-{
-    if (pageIndex >= this->pageCount_) { return false; }
-    return (this->pages_[pageIndex].matchFlags & kMatchRequireOffset) != 0;
-}
-
-UInt32 PatchProfile::expectedOffsetHashCount(const UInt32 pageIndex) const
-{
-    if (pageIndex >= this->pageCount_) { return 0; }
-    const UInt32 count = __atomic_load_n(&this->expectedOffsetHashCounts_[pageIndex], __ATOMIC_RELAXED);
-    return count < kExpectedOffsetHashSlots ? count : kExpectedOffsetHashSlots;
-}
-
-bool PatchProfile::expectedOffsetHashEntry(const UInt32 pageIndex, const UInt32 slot, UInt64& hash,
-                                           UInt32& sitesFound, UInt32& sitesTotal) const
-{
-    if (slot >= this->expectedOffsetHashCount(pageIndex)) { return false; }
-
-    hash       = __atomic_load_n(&this->expectedOffsetHashes_[pageIndex][slot], __ATOMIC_RELAXED);
-    sitesFound = __atomic_load_n(&this->expectedOffsetSitesFound_[pageIndex][slot], __ATOMIC_RELAXED);
-    sitesTotal = __atomic_load_n(&this->expectedOffsetSitesTotal_[pageIndex][slot], __ATOMIC_RELAXED);
-    return true;
-}
-
-bool PatchProfile::expectedOffsetSeen(const UInt32 pageIndex) const
-{
-    return pageIndex < this->pageCount_ && maskBitSet(this->expectedOffsetSeenBits_, pageIndex);
-}
-
-UInt64 PatchProfile::expectedOffsetSeenMaskWord(const UInt32 wordIndex) const
+UInt64 PatchProfile::alreadyPatchedMaskWord(const UInt32 wordIndex) const
 {
     if (wordIndex >= kAppliedMaskWords) { return 0; }
-    return __atomic_load_n(&this->expectedOffsetSeenBits_[wordIndex], __ATOMIC_RELAXED);
+    return __atomic_load_n(&this->alreadyPatchedBits_[wordIndex], __ATOMIC_RELAXED);
 }
+
+bool PatchProfile::maskBitSet(const volatile UInt64* const bits, const UInt32 pageIndex)
+{
+    const UInt32 word = pageIndex / 64U;
+    const UInt64 bit  = 1ULL << (pageIndex % 64U);
+    return (__atomic_load_n(&bits[word], __ATOMIC_RELAXED) & bit) != 0;
+}
+
+const char* PatchProfile::modeName(const Mode mode)
+{
+    switch (mode) {
+        case Mode::kPage: return "PAGE";
+        case Mode::kDyld: return "DYLD";
+        case Mode::kResolver: return "RESOLVER";
+        default: return "invalid";
+    }
+}
+
+UInt32 PatchProfile::pageModeCount(const Mode mode) const
+{
+    UInt32 count = 0;
+    for (UInt32 pageIndex = 0; pageIndex < this->pageCount_; pageIndex++) {
+        if (this->pages_[pageIndex].mode == static_cast<UInt8>(mode)) { count += 1; }
+    }
+    return count;
+}
+
+UInt32 PatchProfile::runningApuMask() const { return this->runningApuMask_; }
+UInt32 PatchProfile::runningDeviceID() const { return this->runningDeviceID_; }
+bool   PatchProfile::runningApuKnown() const { return this->apuKnown_; }
 
 PatchProfile::State PatchProfile::state() const { return this->state_; }
-
 PatchProfile::Reason PatchProfile::reason() const { return this->reason_; }
+const char* PatchProfile::errorCode() const
+{
+    return this->errorCode_ != nullptr ? this->errorCode_ : "none";
+}
+
+const char* PatchProfile::errorContext() const
+{
+    return this->errorContext_ != nullptr ? this->errorContext_ : "none";
+}
 
 const char* PatchProfile::stateName() const { return stateName(this->state_); }
 
@@ -1253,107 +927,3 @@ const char* PatchProfile::reasonName(const Reason reason)
     }
 }
 
-const char* PatchProfile::errorCode() const { return this->errorCode_ != nullptr ? this->errorCode_ : "none"; }
-
-const char* PatchProfile::errorContext() const
-{
-    return this->errorContext_ != nullptr ? this->errorContext_ : "none";
-}
-
-void PatchProfile::noteAppliedPage(const UInt32 pageIndex)
-{
-    if (pageIndex >= this->pageCount_) { return; }
-
-    const UInt32 word = pageIndex / 64U;
-    const UInt64 bit  = 1ULL << (pageIndex % 64U);
-    if ((__atomic_fetch_or(&this->appliedBits_[word], bit, __ATOMIC_ACQ_REL) & bit) == 0) {
-        __atomic_fetch_add(&this->appliedPageCount_, 1, __ATOMIC_RELAXED);
-    }
-
-    // Treat the direct write as a content observation of the record at its expected page file offset.
-    this->recordHashObservation(pageIndex, this->pages_[pageIndex].pageFileOffset);
-}
-
-UInt16 PatchProfile::profileVersion() const { return this->profileVersion_; }
-
-UInt32 PatchProfile::imageCount() const { return this->imageCount_; }
-
-bool PatchProfile::directTargetsAvailable() const
-{
-    return this->profileParsed_ && this->profileVersion_ == kVersionV2 && this->imageCount_ != 0;
-}
-
-const char* PatchProfile::build() const { return this->build_; }
-
-UInt32 PatchProfile::apuMask() const { return this->apuMask_; }
-
-UInt32 PatchProfile::deviceID() const { return this->deviceID_; }
-
-UInt32 PatchProfile::pageCount() const { return this->pageCount_; }
-
-UInt32 PatchProfile::siteCount() const { return this->siteCount_; }
-
-bool PatchProfile::parsed() const { return this->profileParsed_; }
-
-UInt32 PatchProfile::appliedPages() const { return __atomic_load_n(&this->appliedPageCount_, __ATOMIC_RELAXED); }
-
-UInt32 PatchProfile::findMismatches() const { return __atomic_load_n(&this->findMismatchCount_, __ATOMIC_RELAXED); }
-
-UInt32 PatchProfile::matchedPages() const { return __atomic_load_n(&this->matchedPageCount_, __ATOMIC_RELAXED); }
-
-UInt32 PatchProfile::chunkCalls() const { return __atomic_load_n(&this->chunkCallCount_, __ATOMIC_RELAXED); }
-
-UInt32 PatchProfile::writeFailures() const { return __atomic_load_n(&this->writeFailureCount_, __ATOMIC_RELAXED); }
-
-UInt32 PatchProfile::vnodeRejectedPages() const
-{
-    return __atomic_load_n(&this->vnodeRejectedCount_, __ATOMIC_RELAXED);
-}
-
-UInt32 PatchProfile::vnodeRejectedEvents() const
-{
-    return __atomic_load_n(&this->vnodeRejectedEventCount_, __ATOMIC_RELAXED);
-}
-
-UInt32 PatchProfile::alreadyPatchedPages() const
-{
-    return __atomic_load_n(&this->alreadyPatchedCount_, __ATOMIC_RELAXED);
-}
-
-UInt32 PatchProfile::hashOnlyAppliedPages() const
-{
-    return __atomic_load_n(&this->hashOnlyAppliedCount_, __ATOMIC_RELAXED);
-}
-
-bool PatchProfile::vnodeRejected(const UInt32 pageIndex) const
-{
-    return pageIndex < this->pageCount_ && maskBitSet(this->vnodeRejectedBits_, pageIndex);
-}
-
-bool PatchProfile::alreadyPatched(const UInt32 pageIndex) const
-{
-    return pageIndex < this->pageCount_ && maskBitSet(this->alreadyPatchedBits_, pageIndex);
-}
-
-bool PatchProfile::hashOnlyApplied(const UInt32 pageIndex) const
-{
-    return pageIndex < this->pageCount_ && maskBitSet(this->hashOnlyAppliedBits_, pageIndex);
-}
-
-UInt64 PatchProfile::vnodeRejectedMaskWord(const UInt32 wordIndex) const
-{
-    if (wordIndex >= kAppliedMaskWords) { return 0; }
-    return __atomic_load_n(&this->vnodeRejectedBits_[wordIndex], __ATOMIC_RELAXED);
-}
-
-UInt64 PatchProfile::alreadyPatchedMaskWord(const UInt32 wordIndex) const
-{
-    if (wordIndex >= kAppliedMaskWords) { return 0; }
-    return __atomic_load_n(&this->alreadyPatchedBits_[wordIndex], __ATOMIC_RELAXED);
-}
-
-UInt64 PatchProfile::hashOnlyAppliedMaskWord(const UInt32 wordIndex) const
-{
-    if (wordIndex >= kAppliedMaskWords) { return 0; }
-    return __atomic_load_n(&this->hashOnlyAppliedBits_[wordIndex], __ATOMIC_RELAXED);
-}

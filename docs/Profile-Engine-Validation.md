@@ -144,7 +144,54 @@ fail-closed offset gate (`VnodeGate=legacy-offset`). Hardware assertions (`Appli
 `FindMismatches=0`, `WriteFailures=0`, `VnodeGate=active`, full ioreg block on failure) are
 Lead-owned; see `build/task23-freeze-validation.md` §6.
 
-### 1.5 Package and binary audit (final)
+### 1.5 NRPT v3 multi-profile validation (task-27)
+
+NRPT v3 (spec commit `1396592`, codec `NootedRedTool/.../ProfileCodec.swift`) replaces v1/v2: the
+profile states a per-page **mode** (`PAGE` = standalone-file page hook, `DYLD` = shared-cache range
+hook), identity is full-page content (FNV-1a-64 + all site finds) with **no offset requirement**, and
+multiple profiles coexist in the `NRedProfiles` plist array. The independent tooling is now v3-only:
+
+| Tooling | Change |
+| --- | --- |
+| `test/nrpt_validator.py` | v3-only strict codec (`E001`–`E041`, `E050`–`E053`), bundle decode/selection, exact hook-domain simulation (PAGE page route / DYLD range route), vnode-gate model, no-offset identity with a diagnostic chunk base, applied-once/already-patched, fixture metadata re-resolution (kind/path/`__TEXT` geometry/cache mapping/`pageVmOffset`→file-offset evidence), mode-domain false-positive scan, mutation sweep, JSON report, CLI |
+| `test/test_nrpt_validator.py` | 42 synthetic tests (every stable error code has a crafted vector; modes; gate; duplicate-content; selection matrix; CLI) |
+| `test/inject_profile.py` + `test/test_inject_profile.py` | `NRedProfiles` array of `{Build, APUMask, DeviceID, Profile}` dicts: inject (repeatable entries or JSON manifest), verify (`--check` decodes and cross-checks metadata), extract (profiles + SHA-256 manifest), legacy keys removed; 7 tests |
+| `tools/find_nrpt_page_origin.py` | v3-only parser; prints target mode/image/`pageVmOffset` per expected hash |
+| `test/golden/synthetic-2page-v3.nrpt` | 432 B, SHA-256 `4f6fd501d417842f641df4da586d2c4752521134d8a0f295e06d69e9e786823f`; reference Swift codec and the Python validator encode/decode byte-identically |
+| `test/README.md`, `test/run-validation.sh` | v3 usage, bundle options, 42+7 tests |
+
+Official v3 artifact (task-26 commit `3096a31`) validated against the clean 15.8.2 fixture:
+
+| Item | Value |
+| --- | --- |
+| Profile | `build/profile-24H232-v3/nred-24H232-v3.nrpt`, 1,624 B, SHA-256 `1a430c92d7208332f76803ee52fbb03e7af77abdc29135ef351ea1ddd9a6d56e`; build `24H232`, APU `0x28`, device `0x1638`, 4 images / 13 pages / 18 sites, **PAGE=2, DYLD=11**, checksum `0x2573281E` |
+| Bundle | `build/profile-24H232-v3/nred-profiles.plist`, 2,602 B, SHA-256 `fd335ab0cc87b9f8846b25a8b50ac504c67e058f7dcb51a625f52e1e2a52a4ff`; `NRedProfiles` with 1 entry `{Build 24H232, APUMask 0x28, DeviceID 0x1638}`; bytes decode to the official profile |
+| Profile validation | `python3 test/nrpt_validator.py --profile build/profile-24H232-v3/nred-24H232-v3.nrpt --fixtures version-fixtures/15.8.2 --expected-build 24H232 --device-id 0x1638 --report build/validation-report-24H232-v3.json --mutation-sweep` → **PASS**; report SHA-256 `69bc90ff1ef5d1cc241000e9271f14423a87a24f15c6260e1d0db52061235c97` |
+| Bundle validation | same with `--bundle-plist build/profile-24H232-v3/nred-profiles.plist` → **PASS**, selection `selected` index 0; report SHA-256 `b37b3110b6022643c1aee9df4d22c0a17dc778653836582c1181814a39c795fa` |
+| Result detail | 13/13 pages applied, 18/18 sites, 4/4 images verified, all 13 `pageVmOffset`→fixture file offsets evidence-consistent; PAGE route 2/2 with wrong-mode and wrong-vnode `noMatch`; DYLD route pass (`.03`: 490 chunks records 1,3–11; `.02`: 1 chunk record 12); 13/13 mutated pages rejected; 0 false positives; 1 warning = record 11 byte-identical duplicate content in the DYLD domain (VADriver2 vs legacy VADriver; writes identical, offset-free identity cannot distinguish — same known evidence as earlier rounds). This is benign by construction: record 11 is `DYLD` mode, so only the range hook with a dyld/dyld_shared_cache vnode can consider it; the `PAGE` domain cannot apply it, and the duplicate itself is a shared-cache page, so only an in-domain delivery can match it (producing byte-identical writes). The validator's candidate scan is already mode+vnode-domain scoped, so `--strict-false-positives` fails on same-domain identity ambiguity, not route confusion; the default warning is the accepted policy. |
+
+Expected v3 metadata resolution (all verified): GL standalone `unslid 0x0/vmSize 0x14D000` (pages 0,2
+PAGE); MTL cache `0x7FFB08757000/0x44FC11`; VADriver2 cache `0x7FFB08606000/0xB8268`; AppleGVA cache
+`0x7FFA06672000/0xEE2CF`; DYLD pages re-resolved through the split-cache mapping tables to
+`dyld_shared_cache_x86_64h.03`/`.02` file offsets (e.g. AppleGVA `.02:0x6696000`, hash
+`0xBF4200EAD854986D`, site `0x41B`, `0f84d6030000` → `0f842a000000`).
+
+Official v3 package round-trip (task-25 artifact, `build/packages/NootedRedUserPatch-nrpt-v3-official`):
+
+| Check | Result |
+| --- | --- |
+| Release exe | `164e1aa8ee9fefcae15d937e1a2bf08e43c9500ecd5e3e982ba78557cb59d44a`, 114,624 B |
+| Debug exe | `d0d1bd4643c9ccbc95074a35a41a20286ccb03bbb19f859377f44b4c372e80b9`, 154,472 B |
+| Package `SHA256SUMS` (both) / zips | OK; release zip `6ced09e03fa03decfd0a8d8397e4c24072eb59b30c666db75c53729d9bc1a8d1`, debug zip `86ec8cc443ecbb821c7150e6d712be2431e42aa17be53c31d4e8d03d20757cf2` |
+| Injected `Info.plist` (both) | `fe9e16dcf63389f799f2fca38195612a078a12a68c5d154d7ac807506422bf80`; `--check` OK (1 entry, metadata matches); `--extract` profile SHA-256 equals the official `.nrpt`; legacy keys absent |
+| Binary audit | no `DirectPatch`/`vm_map_*`/`task_for_pid`/`proc_*`/`kauth_*`/`NRedOffsetProfile`/`NRedSystemBuild`/offset-era names; v3 diagnostics present (`NRedProfiles`, `SelectedProfileBuild`, `ProfileCount`, `ModePageCount`, `ModeDyldCount`, `VnodeGate`, applied/already-patched/find/write counters); 7-arg page + 6-arg range hook ABI present. `thread_call_allocate/enter/free` remain only for the bounded identity-discovery retry and diagnostics refresh timer (one-shot delayed callbacks, not a worker), same as the frozen hook-only candidate |
+
+**Limitation:** offline validation proves the v3 profile/bundle reaches the correct clean fixture
+pages and the tooling round-trips byte-exactly; runtime IORegistry assertions
+(`ProfileCount=1`, `SelectedProfileBuild=24H232`, `VnodeGate=active`, `AppliedPages→13`,
+`FindMismatches=0`, `WriteFailures=0`, `AlreadyPatched`/`HashOnly` counts) remain hardware-owned.
+
+### 1.6 Package and binary audit (final)
 
 - Both kext matrices built cleanly from frozen HEAD; release is bit-reproducible, debug embeds an
   AppleForge build-date tag and is diagnosis-only.
