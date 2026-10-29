@@ -1,5 +1,9 @@
 # tools/ — offscreen OpenGL blending probe (NootedRed #158)
 
+For offline multi-version validation fixtures, see
+[`README-validation-fixtures.md`](README-validation-fixtures.md) and
+`collect_validation_fixtures.py`.
+
 `gl_blend_probe` is a small, self-contained CGL/OpenGL 4.1-core harness used to
 investigate **NootedRed issue #158**: Chromium/Electron hardware acceleration
 corruption and GPU resets caused by the user-space `AMDRadeonX5000GLDriver`

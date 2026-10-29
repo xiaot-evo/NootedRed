@@ -19,11 +19,14 @@ obsolete; do not treat their failures as regressions.**
 | `gen_vda_va_data.py`, `gen_vda_gva_data.py` (deleted) | emitted `VDAVAData*.hpp` / `VDAGVAData*.hpp` C++ headers | pinned master tables + `tools/convert_master_patchdata.py` → `PatchData/` kinds 3/4 |
 | `collect_compat_data.py` (deleted) | rebuilt mainline patch tables/C++ headers from a target machine | `tools/collect_platform_data.py` (generic hardware/driver data); `PatchData/` + pinned master for patch tables |
 | `collect_target_data.py`, `README-collect-target-data.md` (deleted) | archived GL/MTL-only target collector before the generic platform collector | `tools/collect_platform_data.py` + `tools/adaptation_info.py` |
+| `tools/gen_vcn_kernel_data.py` (deleted) | generated the static `VCNData/24H*.hpp` call-site table | `NootedRed/VCNRuntimeResolver.cpp` (live Mach-O symbol/vtable parsing) |
+| `tools/test_vcn_data.py` (deleted) | tested the removed static VCNData table and build selector | `tools/collect_validation_fixtures.py` plus the runtime resolver's own validation |
+| `tools/vda_preflight.sh` (deleted) | checked the removed 15.8.1-only static VDA/VCN data and old generators | runtime resolver diagnostics and `tools/collect_validation_fixtures.py` |
 
 Kept because they are still valid:
 
-- `tools/test_vcn_data.py` — checks the single supported 24H32 kernel call-site table, exact-build
-  selector and `VCNBridge` lookup. Unsupported-build tables and fallbacks are removed.
+- `tools/collect_validation_fixtures.py` — collects kernel collections and dyld caches from installers /
+  mounted images for offline version validation.
 - `tools/test_userpatch_data.py` — format, generator/validator, pinned-source and generated-data tests.
 - `tools/test_build_artifacts.py` — guards the CI/build-branch globs for the main and satellite zips.
 - `tools/embed_patchdata.py`, `tools/test_embedded_patchdata.py` — deterministic embedding of
@@ -31,10 +34,9 @@ Kept because they are still valid:
   no longer reads external data at runtime).
 - `tools/master_source.py`, `tools/master_tables.py`, `tools/convert_master_patchdata.py`,
   `tools/userpatch_data.py`, `tools/extract_userpatch_fixture.py` — the current data pipeline.
-- `tools/collect_platform_data.py`, `import_platform_data.py`, `gen_vcn_kernel_data.py`,
-  `adaptation_info.py`, `hwinfo_probe.c`, `gl_blend_probe.c`, the VDA/Firefox shell helpers and their
-  READMEs — independent of the removed in-memory backend (some still target the main kext VCN bridge
-  or collection workflows).
+- `tools/collect_platform_data.py`, `import_platform_data.py`, `adaptation_info.py`, `hwinfo_probe.c`,
+  `gl_blend_probe.c`, the VDA/Firefox shell helpers and their READMEs — independent of the removed
+  in-memory backend (some still target the main kext VCN bridge or collection workflows).
 
 Historical descriptions live under [`docs/archive/`](../docs/archive/README.md); they are not
 implementation guidance.

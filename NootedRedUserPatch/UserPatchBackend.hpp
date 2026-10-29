@@ -1,4 +1,4 @@
-// NootedRedUserPatch code-signing backend
+// NootedRedUserPatch code-signing validation backend
 //
 // Copyright (C) 2026  ChefKiss.
 //
@@ -23,59 +23,60 @@
 #pragma once
 #include <Headers/kern_patcher.hpp>
 #include <Headers/kern_util.hpp>
-#include <PatchData.hpp>
+#include <mach/boolean.h>
 
-// Code-signing validation backend.
+// Code-signing validation routing for the generic NRPT profile engine.
 //
-// Big Sur+ only:
-//   - route _cs_validate_page;
-//   - after the original validator accepts the page, patch the pager data in
-//     place with MachInfo::setKernelWriting.
+// The backend only owns the routes and the hook wrappers: every matching and writing decision is made
+// by PatchProfile, which consumes the injected NRPT profile.  Both routes are installed from the Lilu
+// patcher-load callback, before any page-validation hook can run, and are safe no-ops until the
+// profile engine published a validated profile (so a missing or rejected profile never delays boot or
+// leaves kernel text routed conditionally).
 //
-// No task map, no process path, no slide, no range route.  The pager data is
-// shared by every mapping of the page, so one write is global.
+// Hook ABI (macOS 11+ / 24H232, see analysis/xnu-lilu-page-validation.md):
+//   _cs_validate_page:  void (blobs, pager, page_offset, data, int *validated, int *tainted, int *nx)
+//   _cs_validate_range: boolean_t (blobs, pager, range_offset, data, data_size, unsigned *tainted)
+//
+// Validation hooks must never allocate, touch IOKit/VFS or sleep.  Hardware identity is detected once
+// from the sleepable patcher-load context instead.
 class UserPatchBackend
 {
 public:
     static UserPatchBackend& singleton();
 
-    // Installs the page-only validation route.
-    bool install(KernelPatcher& patcher);
+    // Installs _cs_validate_page (page path) and _cs_validate_range (range/shared-cache path).  Each
+    // route is independent: a missing symbol disables that path only and is reported through the
+    // diagnostics properties.  Called once from the Lilu patcher-load callback.
+    void install(KernelPatcher& patcher);
 
-    // Parses the profile supplied by the injected Info.plist personality
-    // property.  Only memory is inspected; no VFS or thread is used.
-    bool loadProfileFromData(const void* data, size_t size, const char* expectedBuild);
+    // Detects the running AMD iGPU identity through Lilu's cached DeviceInfo and forwards it to the
+    // profile engine.  Must run in a sleepable IOKit-safe context (the patcher-load callback), never
+    // in a validation hook.
+    void detectHardwareIdentity();
 
-    bool   pageHookInstalled() const;
-    bool   rangeHookInstalled() const;
-    UInt32 appliedPageCount() const;
-    bool   profileLoaded() const;
-    const char* profileBuild() const;
+    bool pageHookInstalled() const;
+    bool rangeHookInstalled() const;
 
 private:
-    UserPatchBackend() = default;
+    UserPatchBackend()  = default;
     ~UserPatchBackend() = default;
     UserPatchBackend(const UserPatchBackend&) = delete;
     UserPatchBackend& operator=(const UserPatchBackend&) = delete;
     UserPatchBackend(UserPatchBackend&&) = delete;
     UserPatchBackend& operator=(UserPatchBackend&&) = delete;
 
-    // Parsed-offset performPagePatch: pageOffset selects the profile, fixed siteInPage writes.
-    void performPagePatch(const UInt8* data, size_t dataSize, UInt64 pageOffset);
-
-    // Big Sur+ page validator with explicit result pointers.
+    // 7-argument `void` page validator on macOS 11+ (confirmed for 24H232).
     static void wrapCsValidatePage(void* blobs, void* pager, UInt64 pageOffset, const void* data, int* validated,
                                    int* tainted, int* nx);
 
-    mach_vm_address_t orgCsValidatePage_{0};
+    // 6-argument `boolean_t` range validator.
+    static boolean_t wrapCsValidateRange(void* blobs, void* pager, UInt64 rangeOffset, const void* data,
+                                         UInt64 dataSize, unsigned* tainted);
 
-    bool    profileLoaded_{false};
-    UInt16  profilePageCount_{0};
-    char    profileBuild_[17]{};
+    mach_vm_address_t orgCsValidatePage_{0};
+    mach_vm_address_t orgCsValidateRange_{0};
 
     bool installAttempted_{false};
     bool pageHookInstalled_{false};
-
-    volatile UInt64 appliedPages_{0};
-    volatile UInt32 appliedPageCount_{0};
+    bool rangeHookInstalled_{false};
 };

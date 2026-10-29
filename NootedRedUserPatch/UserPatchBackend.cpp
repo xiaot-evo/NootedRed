@@ -1,4 +1,4 @@
-// NootedRedUserPatch code-signing backend
+// NootedRedUserPatch code-signing validation backend
 //
 // Copyright (C) 2026  ChefKiss.
 //
@@ -22,43 +22,27 @@
 
 #include <UserPatchBackend.hpp>
 
+#include <Headers/kern_devinfo.hpp>
 #include <Headers/kern_mach.hpp>
-#include <string.h>
-
-using tCsValidatePage = void (*)(void*, void*, UInt64, const void*, int*, int*, int*);
+#include <PatchProfile.hpp>
 
 namespace
 {
 
-    // Page offsets are supplied exclusively by the injected NRedOffsetProfile
-    // personality property.  There is deliberately no embedded fallback: a
-    // missing or mismatched profile leaves the page patch disabled.
-    UInt64 gPageFileOffsets[UserPatchData::kMaxPages]{};
+    using tCsValidatePage = void (*)(void*, void*, UInt64, const void*, int*, int*, int*);
+    using tCsValidateRange = boolean_t (*)(void*, void*, UInt64, const void*, UInt64, unsigned*);
 
-    constexpr UInt8 kProfileMagic[4] = {'N', 'R', 'P', 'F'};
-    constexpr UInt16 kProfileVersion = 1;
-    constexpr size_t kProfileHeaderSize = 32;
-
-    UInt32 fnv1a32(const UInt8* const data, const size_t size)
+    // Releases the Lilu DeviceInfo list on every return path.  Lilu's deleter is a deliberate no-op
+    // for the global cached instance it owns, so this only frees a list this call created.
+    struct DeviceInfoGuard
     {
-        UInt32 hash = 2166136261U;
-        for (size_t i = 0; i < size; i++) {
-            hash ^= data[i];
-            hash *= 16777619U;
-        }
-        return hash;
-    }
+        DeviceInfo* info{nullptr};
 
-    bool sitesFitAtOffsets(const UInt8* const ptr, const UserPatchData::Page& page,
-                           const UserPatchData::Site* const sites)
-    {
-        for (UInt32 i = 0; i < page.siteCount; i++) {
-            const auto& site = sites[page.siteIndex + i];
-            if (site.offset + site.size > UserPatchData::kPageSize) { return false; }
-            if (memcmp(ptr + site.offset, site.find, site.size) != 0) { return false; }
+        ~DeviceInfoGuard()
+        {
+            if (this->info != nullptr) { DeviceInfo::deleter(this->info); }
         }
-        return true;
-    }
+    };
 
 }    // namespace
 
@@ -68,173 +52,104 @@ UserPatchBackend& UserPatchBackend::singleton()
     return instance;
 }
 
-bool UserPatchBackend::install(KernelPatcher& patcher)
+void UserPatchBackend::install(KernelPatcher& patcher)
 {
-    if (this->installAttempted_) { return this->pageHookInstalled_; }
+    if (this->installAttempted_) { return; }
     this->installAttempted_ = true;
 
-    if (getKernelVersion() < KernelVersion::BigSur) {
-        SYSLOG("UserPatch", "kernel is older than Big Sur; page backend not installed");
-        return false;
-    }
-
+    // Page validation path.  Intel/AMD user-space driver pages are delivered through this route.
     KernelPatcher::RouteRequest pageRequest{"_cs_validate_page", wrapCsValidatePage, this->orgCsValidatePage_};
-    if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &pageRequest, 1)) {
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &pageRequest, 1)) {
+        this->pageHookInstalled_ = true;
+        SYSLOG("UserPatch", "installed _cs_validate_page route");
+    }
+    else {
         patcher.clearError();
-        return false;
+        SYSLOG("UserPatch", "_cs_validate_page route unavailable; page path not covered");
     }
-    this->pageHookInstalled_ = true;
 
-    SYSLOG("UserPatch", "installed _cs_validate_page backend (embedded offsets)");
-    return true;
+    // Range validation path.  dyld shared cache and Apple-protected pagers validate through this route.
+    KernelPatcher::RouteRequest rangeRequest{"_cs_validate_range", wrapCsValidateRange, this->orgCsValidateRange_};
+    if (patcher.routeMultipleLong(KernelPatcher::KernelID, &rangeRequest, 1)) {
+        this->rangeHookInstalled_ = true;
+        SYSLOG("UserPatch", "installed _cs_validate_range route");
+    }
+    else {
+        patcher.clearError();
+        SYSLOG("UserPatch", "_cs_validate_range route unavailable; shared-cache range path not covered");
+    }
 }
 
-bool UserPatchBackend::loadProfileFromData(const void* const data, const size_t size,
-                                           const char* const expectedBuild)
+void UserPatchBackend::detectHardwareIdentity()
 {
-    if (this->profileLoaded_) { return true; }
-    if (data == nullptr || size < kProfileHeaderSize) { return false; }
+    auto& profile = PatchProfile::singleton();
 
-    const auto* const buffer = static_cast<const UInt8*>(data);
-    if (memcmp(buffer, kProfileMagic, sizeof(kProfileMagic)) != 0) {
-        return false;
-    }
-
-    const auto version = static_cast<UInt16>(buffer[4] | (buffer[5] << 8));
-    const auto headerSize = static_cast<UInt16>(buffer[6] | (buffer[7] << 8));
-    const auto pageCount = static_cast<UInt16>(buffer[8] | (buffer[9] << 8));
-    if (version != kProfileVersion || headerSize != kProfileHeaderSize
-        || pageCount == 0
-        || pageCount > sizeof(gPageFileOffsets) / sizeof(gPageFileOffsets[0]))
-    {
-        return false;
-    }
-
-    const size_t offsetsSize = static_cast<size_t>(pageCount) * sizeof(UInt64);
-    if (size < kProfileHeaderSize + offsetsSize) {
-        return false;
-    }
-
-    char profileBuild[17]{};
-    memcpy(profileBuild, buffer + 12, 16);
-
-    if (expectedBuild == nullptr || expectedBuild[0] == '\0'
-        || strncmp(profileBuild, expectedBuild, 16) != 0)
-    {
-        return false;
-    }
-
-    const auto expectedChecksum = static_cast<UInt32>(buffer[28])
-                                  | (static_cast<UInt32>(buffer[29]) << 8)
-                                  | (static_cast<UInt32>(buffer[30]) << 16)
-                                  | (static_cast<UInt32>(buffer[31]) << 24);
-    if (fnv1a32(buffer + kProfileHeaderSize, offsetsSize) != expectedChecksum) {
-        return false;
-    }
-
-    for (UInt16 i = 0; i < pageCount; i++) {
-        UInt64 offset = 0;
-        memcpy(&offset, buffer + kProfileHeaderSize + static_cast<size_t>(i) * sizeof(UInt64), sizeof(offset));
-        if (offset == 0) {
-            return false;
-        }
-        gPageFileOffsets[i] = offset;
-    }
-
-    this->profilePageCount_ = pageCount;
-    strlcpy(this->profileBuild_, profileBuild, sizeof(this->profileBuild_));
-    this->profileLoaded_     = true;
-    SYSLOG("UserPatch", "loaded offset profile property for build %s (%u pages)", profileBuild,
-           static_cast<unsigned>(pageCount));
-    return true;
-}
-
-void UserPatchBackend::performPagePatch(const UInt8* data, size_t dataSize, UInt64 pageOffset)
-{
-    // Runs inside the code-signing validator; no IOKit, no VFS, no allocation.
-    if (!this->profileLoaded_) { return; }
-    const auto& patchData = UserPatchData::singleton();
-    if (data == nullptr || !patchData.loaded()) { return; }
-
-    const auto* const pages = patchData.pages();
-    const auto* const sites = patchData.sites();
-    if (pages == nullptr || sites == nullptr) { return; }
-
-    const UInt32 pageCount = patchData.pageCount();
-    if (pageCount != this->profilePageCount_
-        || pageCount > sizeof(gPageFileOffsets) / sizeof(gPageFileOffsets[0]))
-    {
+    // DeviceInfo is populated by Lilu before the patcher-load callbacks run, and it contains the iGPU
+    // entry the main kext uses.  A missing or unknown iGPU is a fail-closed condition, never a
+    // wildcard: the profile engine requires a running APU family.
+    const DeviceInfoGuard guard{DeviceInfo::create()};
+    auto* const deviceInfo = guard.info;
+    if (deviceInfo == nullptr || deviceInfo->videoBuiltin == nullptr) {
+        SYSLOG("UserPatch", "no AMD iGPU detected; APU identity unavailable");
+        profile.setRunningApu(0, 0);
         return;
     }
 
-    for (size_t dataOffset = 0; dataOffset + UserPatchData::kPageSize <= dataSize;
-         dataOffset += UserPatchData::kPageSize)
-    {
-        const UInt64 currentPageOffset = pageOffset + dataOffset;
-
-        for (UInt32 pageIndex = 0; pageIndex < pageCount; pageIndex++) {
-            if (gPageFileOffsets[pageIndex] != currentPageOffset) { continue; }
-
-            const auto& page = pages[pageIndex];
-            const UInt64 bit = 1ULL << (pageIndex & 63U);
-            if ((__atomic_load_n(&this->appliedPages_, __ATOMIC_RELAXED) & bit) != 0) { return; }
-
-            auto* const ptr = const_cast<UInt8*>(data + dataOffset);
-            if (!sitesFitAtOffsets(ptr, page, sites)) {
-                DBGLOG("UserPatch", "page %u offset 0x%llX: find mismatch", static_cast<unsigned>(pageIndex),
-                       static_cast<unsigned long long>(currentPageOffset));
-                return;
-            }
-
-            if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
-                SYSLOG("UserPatch", "failed to disable kernel write protection");
-                return;
-            }
-
-            for (UInt32 siteIndex = 0; siteIndex < page.siteCount; siteIndex++) {
-                const auto& site = sites[page.siteIndex + siteIndex];
-                memcpy(ptr + site.offset, site.replace, site.size);
-            }
-
-            if (MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
-                SYSLOG("UserPatch", "failed to restore kernel write protection");
-                return;
-            }
-
-            __atomic_fetch_or(&this->appliedPages_, bit, __ATOMIC_RELAXED);
-            __atomic_fetch_add(&this->appliedPageCount_, 1, __ATOMIC_RELAXED);
-            DBGLOG("UserPatch", "applied %s page %u: %u site(s) at offset 0x%llX",
-                   UserPatchData::tableName(page.tableKind), static_cast<unsigned>(pageIndex),
-                   static_cast<unsigned>(page.siteCount), static_cast<unsigned long long>(currentPageOffset));
-            return;
-        }
+    UInt32 deviceID = 0;
+    if (!WIOKit::getOSDataValue(deviceInfo->videoBuiltin, "device-id", deviceID)) {
+        SYSLOG("UserPatch", "iGPU device-id property unavailable; APU identity unavailable");
+        profile.setRunningApu(0, 0);
+        return;
     }
+
+    const UInt32 mask = PatchProfile::apuMaskForDeviceID(static_cast<UInt16>(deviceID & 0xFFFFU));
+    if (mask == 0) {
+        SYSLOG("UserPatch", "unsupported iGPU device ID 0x%X; APU identity unavailable",
+               static_cast<unsigned>(deviceID));
+        profile.setRunningApu(0, 0);
+        return;
+    }
+
+    SYSLOG("UserPatch", "detected iGPU device 0x%04X apuMask 0x%X", static_cast<unsigned>(deviceID & 0xFFFFU),
+           static_cast<unsigned>(mask));
+    profile.setRunningApu(mask, static_cast<UInt16>(deviceID & 0xFFFFU));
 }
 
-void UserPatchBackend::wrapCsValidatePage(void* blobs, void* pager, UInt64 pageOffset, const void* data,
-                                          int* validated, int* tainted, int* nx)
+void UserPatchBackend::wrapCsValidatePage(void* blobs, void* pager, UInt64 pageOffset, const void* data, int* validated,
+                                          int* tainted, int* nx)
 {
-    auto& self     = singleton();
-    auto  original = reinterpret_cast<tCsValidatePage>(self.orgCsValidatePage_);
-    FunctionCast(wrapCsValidatePage, reinterpret_cast<mach_vm_address_t>(original))(
-        blobs, pager, pageOffset, data, validated, tainted, nx);
+    auto& self = singleton();
+
+    // The original validator is always called first and its result is never modified.  Callers on
+    // macOS 15 consume the three out-parameters, not the return value.
+    auto original = reinterpret_cast<tCsValidatePage>(self.orgCsValidatePage_);
+    FunctionCast(wrapCsValidatePage, reinterpret_cast<mach_vm_address_t>(original))(blobs, pager, pageOffset, data,
+                                                                                    validated, tainted, nx);
 
     if (validated != nullptr && *validated != 0 && data != nullptr) {
-        self.performPagePatch(static_cast<const UInt8*>(data), UserPatchData::kPageSize, pageOffset);
+        PatchProfile::singleton().applyChunk(static_cast<const UInt8*>(data), PatchProfile::kPageSize, pageOffset);
     }
 }
 
+boolean_t UserPatchBackend::wrapCsValidateRange(void* blobs, void* pager, UInt64 rangeOffset, const void* data,
+                                                UInt64 dataSize, unsigned* tainted)
+{
+    auto& self = singleton();
+
+    auto original = reinterpret_cast<tCsValidateRange>(self.orgCsValidateRange_);
+    const boolean_t result = FunctionCast(wrapCsValidateRange, reinterpret_cast<mach_vm_address_t>(original))(
+        blobs, pager, rangeOffset, data, dataSize, tainted);
+
+    // Patch only after the original validator accepted the range; its return value is not affected by
+    // a patch failure.  A trailing partial page is never patched.
+    if (result != FALSE && data != nullptr && dataSize >= PatchProfile::kPageSize) {
+        PatchProfile::singleton().applyChunk(static_cast<const UInt8*>(data), static_cast<size_t>(dataSize),
+                                             rangeOffset);
+    }
+
+    return result;
+}
 
 bool UserPatchBackend::pageHookInstalled() const { return this->pageHookInstalled_; }
 
-bool UserPatchBackend::profileLoaded() const { return this->profileLoaded_; }
-
-const char* UserPatchBackend::profileBuild() const { return this->profileBuild_; }
-
-
-bool UserPatchBackend::rangeHookInstalled() const { return false; }
-
-UInt32 UserPatchBackend::appliedPageCount() const
-{
-    return __atomic_load_n(&this->appliedPageCount_, __ATOMIC_RELAXED);
-}
+bool UserPatchBackend::rangeHookInstalled() const { return this->rangeHookInstalled_; }

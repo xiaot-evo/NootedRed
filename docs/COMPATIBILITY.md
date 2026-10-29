@@ -81,9 +81,10 @@ validation. VDA readiness is never published for VCN 1.x profiles, so VDA tables
 
 There is no generic fallback. To add a build:
 
-1. collect its `SystemKernelExtensions.kc` and the matching VADriver/AppleGVA images;
-2. generate `NootedRed/VCNData/<build>.hpp` with `tools/gen_vcn_kernel_data.py` and register the
-   variant in `VCNData.cpp`;
+1. collect its `SystemKernelExtensions.kc` and the matching VADriver/AppleGVA images with
+   `tools/collect_validation_fixtures.py`;
+2. let `NootedRed/VCNRuntimeResolver.cpp` resolve the X5000/X6000 symbols and vtables at runtime
+   (there is no static `VCNData/<build>.hpp` and no build-string selector);
 3. derive a complete `PatchData/<build>` set from pinned exact pages, regenerate
    `PatchDataBlob.*`, and rebuild/re-sign the satellite;
 4. hardware-validate decode/encode and the GL/Metal paths before marking it supported.

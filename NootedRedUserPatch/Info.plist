@@ -34,10 +34,6 @@
 			<string>IOResources</string>
 			<key>IOResourceMatch</key>
 			<string>IOKit</string>
-			<key>NRedOffsetProfile</key>
-			<data>TlJQRgEAIAANAAAAMjRIMjMyAAAAAAAAAAAAADtHaa4A4AAAAAAAAACAAAAAAAAAADB7CAAAAAAA8H4IAAAAAABgYAgAAAAAAIBgCAAAAAAA8GAIAAAAAADQZAgAAAAAAPBkCAAAAAAAAGUIAAAAAABwZggAAAAAANBnCAAAAAAAYGkGAAAAAA==</data>
-			<key>NRedSystemBuild</key>
-			<string>24H232</string>
 		</dict>
 	</dict>
 	<key>NSHumanReadableCopyright</key>

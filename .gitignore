@@ -32,6 +32,9 @@ venv/
 # External tester datasets (Apple binaries, nvram, hardware identifiers)
 # ---------------------------------------------------------------------------
 /platform-data/
+/version-fixtures/
+/nred-validation-*/
+/nred-validation-*.zip
 
 # ---------------------------------------------------------------------------
 # Local workspace / agent instructions

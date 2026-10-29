@@ -1,78 +1,58 @@
 # NootedRedUserPatch
 
 Satellite Lilu plugin for NootedRed. It owns the **user-space** AMD graphics/media patch backend:
-the `_cs_validate_page` / `_cs_validate_range` hooks and the exact 4 KiB page tables that used to live
-in the main `NootedRed.kext`.
+the `_cs_validate_page` / `_cs_validate_range` hooks and the per-page patch matcher.
 
-Status: **Phase 2, hardened after independent review, embedded-data runtime**. The patch data is
-compiled into the kext as generated `const` arrays; the plugin performs **no runtime file I/O**. The
-target builds, but nothing in this directory has been validated on real hardware yet. Do not treat a
-successful build as evidence of a working patch set.
+Status: **generic profile-driven engine (NRPT v1), built in release and debug**. The kext contains
+**no patch data**: page offsets, page hashes, site offsets and find/replace bytes all come from an
+injected profile. Nothing in this directory has been boot-tested on real hardware yet; a successful
+build and the offline engine tests below are not evidence of a working hardware patch set.
 
-Design background: [`docs/Satellite-UserPatch-Plan.md`](../docs/Satellite-UserPatch-Plan.md).
-On-disk/generator data contract: [`docs/UserPatch-Data-Format.md`](../docs/UserPatch-Data-Format.md).
+Contracts:
+
+- profile format: [`docs/PatchProfile-Spec.md`](../docs/PatchProfile-Spec.md) (NRPT v1, frozen);
+- page-validation ABI and `page_offset` semantics: [`analysis/xnu-lilu-page-validation.md`](../analysis/xnu-lilu-page-validation.md);
+- target architecture/rationale: [`analysis/lilu-dyld-shared-cache-profile-engine.md`](../analysis/lilu-dyld-shared-cache-profile-engine.md).
 
 ## What it does
 
-- Installs `_cs_validate_page` and `_cs_validate_range` routes **unconditionally** from the Lilu
-  patcher-load callback. Data availability gates page *writes* only: until validated data is published,
-  the hooks are safe no-ops. This keeps all kernel-text routing inside the normal Lilu patcher-load
-  context instead of patching kernel text later from `IOService::start` (review D2).
-- Resolves the running build identity from the kernel only: `sysctl kern.osversion`, then XNU's
-  `osversion` global. There is no file/plist fallback and no filesystem work (see
-  [Build identity sources](#build-identity-sources)).
-- Loads the single embedded PatchData set directly; there is no build/Darwin/APU selection gate.
-- Validates the embedded manifest format and the pages checksum before trusting a byte, then validates
-  every site. The final match is the complete 4 KiB page image.
-- Retries transient boot-time identity/data-selection failures with a bounded kernel `thread_call` timer
-  (review D3); see [Runtime states and bounded retry](#runtime-states-and-bounded-retry).
-- For every page the kernel validator presents, compares the **complete 4 KiB page** against the
-  embedded page image. Only on exact equality are the site `find` bytes verified at their recorded
-  offsets and the `replace` bytes written, synchronously inside the callback under
-  `MachInfo::setKernelWriting`.
-- Serialises page writes with its own spinlock and skips pages that already contain the replacement
-  bytes (shared page caches re-validate the same page for several processes).
-- Applies VDA/AppleGVA pages only when the explicit `-NRedVDA` opt-in is present; exact page, build
-  and APU-mask gates still decide whether any byte is written.
-- Publishes its state and counters as IORegistry properties on its own service for diagnostics.
+- Installs both code-signing routes at Lilu patcher load, before any page validation can run:
+  `_cs_validate_page` (7-argument `void` with `int *validated`, `*tainted`, `*nx` on macOS 15) and
+  `_cs_validate_range` (6-argument `boolean_t`). Each route is installed independently; a missing
+  symbol disables that path only and is reported in the diagnostics.
+- Copies and fully validates the `NRedOffsetProfile` `OSData` property in `IOService::start`: NRPT
+  header/build/APU/device/counts/table sizes/payload FNV-1a-32 checksum, canonical page/site ranges,
+  bounds, padding and identity uniqueness. The parsed page/site records are copied into bounded static
+  arrays; the `OSData` bytes are removed and never referenced again.
+- Applies a page only when the original validator accepted it and every enabled identity gate of an
+  authoritative record passed: exact chunk offset (when required), FNV-1a-64 over the complete 4 KiB
+  chunk, and every site `find` byte at its recorded `siteInPage`. All writes of one page happen
+  together under `MachInfo::setKernelWriting` and only after all gates passed.
+- Applies each page record at most once per boot (atomic applied bitmap), so shared page caches and
+  page/range double delivery cannot write twice.
+- Fails closed: a missing, malformed, wrong-build or wrong-APU profile leaves the plugin loaded and
+  the hooks inert. There is no fallback profile, no family/prefix build match, no byte scan and no
+  guessed offset. The running `kern.osversion` build is authoritative; `NRedSystemBuild` is only an
+  extra sanity check and can never replace that comparison.
+- Publishes state and counters as IORegistry properties on its own service (see Diagnostics).
 
-## What it does not do
+Validation hooks never allocate, touch IOKit/VFS or sleep, and their logging is bounded by a shared
+budget. Hardware identity (iGPU device ID) is detected once in the sleepable patcher-load callback.
 
-- No kernel/kext patching (that stays in `NootedRed.kext`).
-- No runtime file access of any kind: **no VFS reads, no `/Library` PatchData directory, no
-  `SystemVersion.plist`/`PlatformSupport.plist` parsing, no path from a boot argument**. Patch data is
-  compiled into the kext; external `PatchData/` is generator input only.
-- No semantic/instruction-context scanner.
-- No byte-pattern search for patch sites: `SiteRecord.offset` is authoritative and `find` is only
-  verified there. In-page find uniqueness is explicitly **not** required.
-- No deferred page writes and no stored page/pager/vnode pointers: patching happens only inside the
-  validation callback while the mapping is valid. This is the specific failure mode that caused the
-  research branch's kernel page-fault panic.
-- No IOKit registry matching inside the validation hooks (review D5). The hooks only acquire-load the
-  published data flag; all IOKit work happens in the plugin's own early-boot/service/timer contexts.
+## Profile injection (no runtime file I/O)
 
-## Auto-enable and boot arguments
+The host generator injects one binary profile as the `NRedOffsetProfile` property of the
+`org.ChefKiss.NootedRedUserPatch` personality in the kext `Info.plist`, together with the matching
+`NRedSystemBuild` string. The committed `Info.plist` intentionally carries **no** profile: without an
+injected one the plugin reports `NoOp`/`ProfileAbsent` and writes nothing.
 
-The plugin is enabled automatically when NootedRed is present:
+- The profile is generated and offline-validated by the NootedRedTool pipeline; see
+  `docs/PatchProfile-Spec.md` §12/§13 and the `NootedRedTool` profile generator/validator.
+- The kext never reads a file, a directory, the boot arguments or the IORegistry for patch data.
+- A new macOS build needs a new generated profile, **not** a new kext binary. The kext must be
+  re-signed only when its own code changes.
 
-- `Info.plist` declares `org.ChefKiss.NootedRed` in `OSBundleLibraries`, so the satellite is resolved
-  and loaded only when the main kext is installed; the version value is `$(MODULE_VERSION)` and keeps
-  in sync with the main target because both share the project version.
-- At runtime the plugin logs whether the NootedRed `IOService` is already visible in the IORegistry as
-  a diagnostic; it does not gate the backend on that timing-sensitive lookup, because the kext loader
-  has already enforced the dependency.
-
-Debug boot arguments:
-
-| Boot argument | Effect |
-| --- | --- |
-| `-NRedUserPatchOff` | Lilu's disable-argument handling rejects the plugin before `pluginStart`, so no data is selected, no routes are installed, and nothing is published. A defensive check in `init()` logs the state if the plugin is ever started despite the flag. |
-| `-NRedUserPatchDebug` | Enables Lilu verbose logging for this plugin (`DBGLOG`). |
-| `-NRedUserPatchBeta` | Allows loading on non-release kernels (Lilu beta gate). |
-
-There is no boot argument that changes the embedded data selection.
-
-## Building
+## Build
 
 Requirements: macOS, Xcode Command Line Tools, `xmake`, and a sibling AppleForge checkout with its
 `Lilu` and `MacKernelSDK` submodules initialised. `xmake.lua` includes AppleForge from the
@@ -81,250 +61,143 @@ Requirements: macOS, Xcode Command Line Tools, `xmake`, and a sibling AppleForge
 ```sh
 export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 export AppleForgePath=/path/to/AppleForge
+export XMAKE_STATS=false
 
-xmake f -m release -y
-xmake -y
+xmake f --project=. -m release -y && xmake --project=. -y NootedRedUserPatch
+xmake f --project=. -m debug   -y && xmake --project=. -y NootedRedUserPatch
+```
+
+Artifacts:
+
+```
+build/branches/<branch>/macosx/x86_64/userpatch/release/NootedRedUserPatch.kext
+build/branches/<branch>/macosx/x86_64/userpatch/release/NootedRedUserPatch-<version>-RELEASE.zip
+build/branches/<branch>/macosx/x86_64/userpatch/debug/NootedRedUserPatch.kext
+build/branches/<branch>/macosx/x86_64/userpatch/debug/NootedRedUserPatch-<version>-DEBUG.zip
 ```
 
 **Git-worktree note.** xmake 3 resolves the *outermost* ancestor `xmake.lua` as the project. If this
-tree is a git worktree nested inside another xmake checkout (for example
-`/path/to/NootedRed/.agents/worktrees/...`), plain `xmake` silently builds the parent checkout instead
-of this tree. Pin the project explicitly:
+tree is a git worktree nested inside another xmake checkout, pin the project explicitly with
+`--project=.` as shown above.
 
-```sh
-xmake f --project=. -m release -y
-xmake --project=. -y
-```
-
-Allowed modes are `release`, `releasedbg` and `debug`.
-
-Artifacts (per branch, platform, architecture and mode):
-
-```
-build/branches/<branch>/macosx/x86_64/<mode>/NootedRed.kext
-build/branches/<branch>/macosx/x86_64/<mode>/NootedRed-<version>-<MODE>.zip
-build/branches/<branch>/macosx/x86_64/userpatch/<mode>/NootedRedUserPatch.kext
-build/branches/<branch>/macosx/x86_64/userpatch/<mode>/NootedRedUserPatch-<version>-<MODE>.zip
-```
-
-`<branch>` comes from `NRED_BUILD_BRANCH` and defaults to `shared` for direct `xmake` invocations. The
-satellite artifact directory is a **sibling** of the per-mode directories (`.../<arch>/userpatch/<mode>`),
-not nested inside them: AppleForge's `after_build` recursively archives `targetdir`, so nesting made the
-NootedRed archive include the satellite bundle and intermittently race with the satellite build's file
-moves. Keeping them siblings gives each target its own archive tree.
-
-`NootedRedUserPatch.kext` is built with `AppleForge` (`LiluPlugIn`) and a Catalina deployment target
+`NootedRedUserPatch.kext` is built with AppleForge (`LiluPlugIn`) and a Catalina deployment target
 (`10.15`); `PluginConfiguration` restricts loading to `KernelVersion::Catalina .. KernelVersion::Tahoe`.
-
-The embedded data source files (`PatchDataBlob.hpp/.cpp`) are generated and picked up by the existing
-`NootedRedUserPatch/**.cpp` glob, so **no xmake change is needed** when the data set changes. They add a
-bounded amount of generated code and `const` data to the kext.
+`NootedRedUserPatch/**.cpp` is globbed by the target, so adding/removing a source file needs no
+`xmake.lua` change.
 
 ## Installing
 
-This scaffold does **not** install kexts or reboot anything. Manual install outline (OpenCore):
+This directory does **not** install kexts or reboot anything. Manual install outline (OpenCore):
 
 1. Keep the main kext installed. `Lilu.kext` and `NootedRed.kext` are required; the satellite declares
    `NootedRed` as a library dependency and will not load without it.
-2. Copy `Lilu.kext`, `NootedRed.kext` and `NootedRedUserPatch.kext` into `EFI/OC/Kexts/`.
+2. Generate a profile for the exact running macOS build and inject it as `NRedOffsetProfile` (plus
+   `NRedSystemBuild`) into the satellite's `Info.plist` personality, then copy `Lilu.kext`,
+   `NootedRed.kext` and `NootedRedUserPatch.kext` into `EFI/OC/Kexts/`.
 3. Add `NootedRedUserPatch.kext` to `Kernel -> Add` in `config.plist` (`Enabled = true`,
    `BundlePath = NootedRedUserPatch.kext`). Lilu must load first; the kernel resolves the NootedRed
-   dependency regardless of the entry order.
-4. Reboot. There is **no data directory to install**: the patch data for the supported builds is
-   already inside the kext.
-5. Verify that the plugin loaded and what it decided:
-   `ioreg -l -n NootedRedUserPatch | grep NRedUserPatch`.
-6. Rollback: remove the `NootedRedUserPatch.kext` entry from `config.plist` and the file from
+   dependency regardless of entry order.
+4. Reboot and verify: `ioreg -l -n NootedRedUserPatch | grep NRedUserPatch`.
+5. Rollback: remove the `NootedRedUserPatch.kext` entry from `config.plist` and the file from
    `EFI/OC/Kexts/`, or boot once with `-NRedUserPatchOff`. The main kext must remain fully functional
    with the satellite absent; that is the primary rollback path.
 
-The kext must be loaded by the kernel through OpenCore/Lilu; it is not a user-space tool and there is
-no installer script in this scaffold. Adding or updating a build is a **kext rebuild/re-sign**, not a
-data drop-in (see below).
+## Runtime states
 
-## Embedded patch data (no runtime file I/O)
-
-The satellite does **not** read `/Library`, the kext `Resources` directory or any other path at
-runtime. The exact-page data for every supported build is compiled into the kext by the data-pipeline
-generator:
-
-```
-NootedRedUserPatch/PatchDataBlob.hpp   # generated index: NRedUserPatchData::kBuilds[], kBuildCount
-NootedRedUserPatch/PatchDataBlob.cpp   # generated const manifest/pages byte arrays per build
-```
-
-Embedded build: `24H32` — exact-page tables of kinds 1 GL, 2 Metal, 3 VDA/VA and 4 VDA/AppleGVA as
-generated from the repo-root `PatchData/` tree. Other builds are intentionally absent; the satellite
-fails closed with `BuildUnsupported` rather than falling back to a nearest build.
-
-The generated files are owned by the data-pipeline task. Do not hand-edit them. Regenerate/verify after
-any `PatchData/` change:
-
-```sh
-python3 tools/embed_patchdata.py               # deterministic regenerate PatchDataBlob.*
-python3 tools/embed_patchdata.py --check       # staleness/CI check
-python3 tools/test_embedded_patchdata.py       # array round-trip, index metadata, no-VFS tokens
-python3 tools/test_userpatch_data.py           # independent v1 validator + malformed-data tests
-python3 tools/convert_master_patchdata.py --check  # regenerate/verify the committed PatchData sets
-```
-
-Because the data is static, **adding a build requires regenerating `PatchDataBlob.*` and rebuilding and
-re-signing the kext** — the approved stability tradeoff (no runtime data-path/VFS risk, no
-unreadable-volume failure mode). A build that is not embedded is a terminal `BuildUnsupported` NoOp; it
-is never guessed from Darwin.
-
-External `PatchData/<build>/` remains only the generator input; it is not consumed by the running kext.
-There is no runtime data directory to copy or remove.
-
-The satellite parser enforces the same v1 contract as `tools/test_userpatch_data.py` on the embedded
-bytes: packed little-endian records, `headerSize == 72`, `manifestSize = 72 + 24*tableCount +
-16*pageCount + 76*siteCount`, canonical contiguous table/page/site ranges with strictly ascending table
-kinds, limits (16 tables / 64 pages / 1024 sites, 128 KiB manifest, 256 KiB pages), zeroed
-reserved/padding bytes, `find != replace`, no overlapping site writes, and both FNV-1a checksums. The
-generated index metadata (checksums, Darwin, apuMask, counts) is used only as an early filter/diagnostic
-mirror; the embedded bytes are always parsed and validated. The parser's record sizes are compile-time
-asserted, so a compiler/ABI change cannot silently alter the format.
-
-### Build identity sources
-
-The loader resolves the running build from the kernel only and stops at the first non-empty source:
-
-| Order | Source | Notes |
-| --- | --- | --- |
-| 1 | `sysctlbyname("kern.osversion")` | exact kernel build string, when the BSD layer is available in the calling context |
-| 2 | XNU `osversion` global | populated by the kernel from the booter-provided build string |
-
-There is deliberately **no filesystem/plist fallback**: forcing early kernel file I/O (including the
-PatchData reads and the plist fallback from the previous external-data design) hung the boot, so the
-embedded-data model keeps the boot path free of VFS work. If neither source is populated yet, the
-loader reports the retryable `BuildUnavailable` state and the bounded timer retries while doing no file
-I/O. The retry delay is converted with `NSEC_PER_MSEC`: `clock_interval_to_deadline()` is a raw
-`interval * scale` in mach absolute-time units, so the earlier raw `1000` scale factor made every
-nominal 2 s retry fire ~2 ms later and exhausted the whole bounded chain during early boot. On x86_64
-`mach_absolute_time` is nanosecond-based (timebase 1:1), so the two-second spacing is now real.
-
-Every identity source goes through the same strict validation (`[0-9A-Za-z._-]`, 1–15 bytes, no `.`/`..`,
-single embedded-data key); an over-long or malformed value is rejected and never truncated. A build is
-never derived from the Darwin version, and no source is a boot-argument path. `LoadAttempts` keeps
-counting and the bounded retry still applies to transient identity/IOKit failures.
-
-### Lean selection
-
-The lean path does not select by macOS build, Darwin version or APU mask:
-
-1. The single embedded PatchData set is loaded as soon as the plugin's data load runs.
-2. APU device ID is still read for diagnostics, but an unknown APU is not a no-op.
-3. The complete 4 KiB page image remains the final write gate: if the running driver's page does not
-   match byte-for-byte, nothing is written.
-
-There is no nearest-build, APU-mask or family fallback. Adding another macOS build still means adding
-its exact pages; the lean path only removes the surrounding hardware/build whitelist.
-## VDA pages
-
-VDA/VA and VDA/AppleGVA pages are treated like every other page: if the complete 4 KiB image matches,
-the sites are applied. There is no `-NRedVDA`/readiness gate in the satellite; the main kext's
-`NRedVCNBridgeReady` property remains a status/diagnostic signal only.
-## Runtime states and bounded retry
-
-State transitions are serialised by a single `IOLock` owned by `UserPatchRuntime` (review D4). The
-validation hooks do not take that lock; they acquire-load the immutable published data flag and update
-their counters with atomics.
+Serialised by one `IOLock`; validation hooks never take it (they only acquire-load the immutable
+published flag and update atomics).
 
 | State | Meaning |
 | --- | --- |
-| `Idle` | plugin kmod started; no data attempt yet. |
-| `Loaded` | validated embedded manifest/pages are published; hooks may now write matching pages. |
-| `NoOp` (retryable) | transient failure (`BuildUnavailable`, `ApuUnknown`). The bounded retry keeps trying; no file I/O. |
-| `NoOp` (terminal) | deterministic failure (`BuildInvalid`, `BuildUnsupported`, `BuildMismatch`, `DarwinMismatch`, `ApuMismatch`, malformed/checksum/size/site errors, limits, memory). No further load attempts for this boot. |
+| `Idle` | kmod/plugin started; profile or runtime identity not complete yet, or hooks not yet reached. |
+| `Loaded` | profile parsed, build/APU/device gates passed, tables published; hooks may now write matching pages. |
+| `NoOp` | fail-closed terminal state (`ProfileAbsent`, `ProfileInvalid`, `BuildUnavailable`, `BuildMismatch`, `ApuUnavailable`, `ApuMismatch`, `DeviceMismatch`). Nothing is written. |
 
 Entry points:
 
 | Entry point | What it does |
 | --- | --- |
-| plugin kmod start (`init`) | allocates the state lock and registers the Lilu patcher-load callback; no IOKit/VFS work. |
-| Lilu patcher load (`onPatcherLoad`) | installs both routes unconditionally, then attempts embedded-data selection, then arms the retry timer if work remains. |
-| `IOService::start` (`serviceStart`) | retries data selection and publishes diagnostics. It never routes kernel text and cannot install a second time. |
-| delayed `thread_call` (`retryCallback`) | bounded retries of identity/data selection in a kernel thread; never touches page pointers. |
+| plugin kmod start (`init`) | allocates the state lock and registers the Lilu patcher-load callback. No IOKit/VFS work. |
+| Lilu patcher load (`onPatcherLoad`) | installs both routes unconditionally, detects the running iGPU identity from Lilu's cached `DeviceInfo`, resolves the running build, and completes the profile transition if the profile is already loaded. |
+| `IOService::start` | copies/validates the injected profile, resolves the running build, completes the transition if hardware identity is already known, publishes diagnostics. |
+| delayed `thread_call` | bounded diagnostics refresh schedule (applied counters only). |
 
-Bounded retry policy:
-
-- load retries: up to 15 attempts, 2 s apart (covers `kern.osversion`/IOKit not being ready when the
-  plugin starts). The delay is converted with `NSEC_PER_MSEC` because
-  `clock_interval_to_deadline()` expects absolute-time units, not milliseconds;
-- once the bound is reached, the plugin logs `delayed retries finished: ...` with the final state
-  and stops scheduling timers. The routes stay installed and inert.
-
-If the plugin is disabled (`-NRedUserPatchOff`), Lilu rejects it before `init()` and no lock, routes,
-timers or properties exist.
+Both entry points may run in either order; the profile transition happens exactly once, when the
+profile and all identity gates are known. If both entry points ran and the authoritative running build
+is still unreadable, the plugin reports `NoOp`/`BuildUnavailable` instead of guessing.
 
 ## Diagnostics
 
-Log tags: `init` (plugin lifecycle/state machine), `UserPatchData` (embedded data selection/validation),
-`UserPatch` (hook installation, page application). Explicit `no-op: <Reason> (<detail>)`
-lines are emitted for every fail-closed decision.
+Log tags: `init` (plugin lifecycle/identity), `PatchEngine` (profile parse/identity decisions),
+`UserPatch` (routes and page application). Fail-closed decisions log one specific line, including the
+stable `E0xx` profile error code from `docs/PatchProfile-Spec.md` §11.
 
-IORegistry properties on the `NootedRedUserPatch` service (republished on every entry point/retry):
+IORegistry properties on the `NootedRedUserPatch` service:
 
 | Property | Meaning |
 | --- | --- |
 | `NRedUserPatchState` | `Idle` / `Loaded` / `NoOp` |
-| `NRedUserPatchReason` | last reason (`None`, `BuildUnsupported`, `BuildMismatch`, `ApuMismatch`, ...) |
-| `NRedUserPatchBuild` | profile build after a successful personality load |
-| `NRedUserPatchDataSource` | `personality:NRedOffsetProfile` after a successful load |
-| `NRedUserPatchApuMask` | candidate APU bits derived from the iGPU |
-| `NRedUserPatchPages`, `NRedUserPatchSites` | validated table sizes |
+| `NRedUserPatchReason` | last fail-closed reason (see Runtime states) |
+| `NRedUserPatchBuild` | active/expected profile build string |
+| `NRedUserPatchDataSource` | `personality:NRedOffsetProfile` after a successful parse, else `none` |
+| `NRedUserPatchErrorCode` / `NRedUserPatchErrorContext` | stable `E0xx` code and short field context (`none` when not applicable) |
+| `NRedUserPatchApuMask` / `NRedUserPatchDeviceID` | identity fields from the profile |
+| `NRedUserPatchPages` / `NRedUserPatchSites` | validated page/site counts |
 | `NRedUserPatchHooks` | `1` when the `_cs_validate_page` route is installed |
-| `NRedUserPatchRangeHook` | `1` when the `_cs_validate_range` route is installed (optional extra) |
+| `NRedUserPatchRangeHook` | `1` when the `_cs_validate_range` route is installed |
+| `NRedUserPatchLoaded` | `1` once the profile is active and hooks may write |
+| `NRedUserPatchAppliedPages` | pages patched exactly once (expected to reach `Pages` after all target pages fault) |
+| `NRedUserPatchFindMismatches` | identity matched but a site `find` did not (`0` in a healthy boot) |
+| `NRedUserPatchMatchedPages` | page identity matches observed in the validation hooks |
+| `NRedUserPatchChunkCalls` | 4 KiB chunks examined by the matcher |
+| `NRedUserPatchWriteFailures` | `setKernelWriting` enable/restore failures (`0` in a healthy boot) |
 
 ## Failure paths
 
-Every one of these is an expected, safe state; the plugin stays loaded, the routes stay installed and
-no page is written:
+Every one of these is an expected, safe state: the plugin stays loaded, the routes stay installed and
+no page is written.
 
 | Reason | Cause |
 | --- | --- |
-| `BuildUnavailable` | no build identity yet: `kern.osversion` sysctl and XNU `osversion` are empty/not populated (retryable) |
-| `BuildInvalid` | build string empty, over-long or not a usable embedded-data key (terminal) |
-| `ApuUnknown` | iGPU missing or device ID not in the supported APU table, or IOKit not ready yet (retryable) |
-| `BuildUnsupported` | the running build has no embedded PatchData set; the available build strings are logged (terminal) |
-| `ManifestTooLarge` | embedded manifest exceeds the 128 KiB v1 ceiling (terminal) |
-| `ManifestInvalid` / `ManifestChecksumMismatch` | magic/version/header/layout/ranges/padding/checksum mismatch, including an empty blob (terminal) |
-| `BuildMismatch` / `DarwinMismatch` / `ApuMismatch` | exact embedded/manifest selection failed (terminal) |
-| `PagesTooLarge` / `PagesSizeMismatch` / `PagesChecksumMismatch` | embedded pages size limit, length or FNV-1a 32 mismatch (terminal) |
-| `SiteInvalid` | site outside its page, find bytes absent at the offset, bad size/padding, overlap (terminal) |
-| `LimitExceeded` / `MemoryFailure` | counts beyond v1 limits / allocation failure (terminal) |
+| `ProfileAbsent` | no `NRedOffsetProfile` property injected (there is no fallback) |
+| `ProfileInvalid` | full profile rejection: see `NRedUserPatchErrorCode` (`E001`-`E032`); no partial state survives |
+| `BuildUnavailable` | authoritative running build unreadable/conflicting from the device-tree `OS Build Version`, `kern.osversion` sysctl and XNU `osversion` sources |
+| `BuildMismatch` | profile build != running `kern.osversion`, or the injected `NRedSystemBuild` hint disagrees with it |
+| `ApuUnavailable` | iGPU missing or unknown device ID — running APU family cannot be determined |
+| `ApuMismatch` | `profile.apuMask` does not intersect the detected APU family |
+| `DeviceMismatch` | profile header bit 0 requires an exact iGPU PCI device ID and it differs from the running one |
 
-`BuildUnavailable` and `ApuUnknown` are retryable and are retried by the bounded timer described above;
-all other reasons are terminal for the boot because the embedded data cannot become valid later.
 `-NRedUserPatchOff` is not a runtime reason: Lilu rejects the plugin before it starts.
 
-This directory has no host test runner for the kernel parser itself because it depends on kernel/Lilu
-headers. The equivalent host validation is the independent `tools/userpatch_data.py`/
-`tools/test_userpatch_data.py`, `tools/embed_patchdata.py --check` and
-`tools/test_embedded_patchdata.py`; the generated arrays are round-trip checked against the committed
-`PatchData/` bytes.
+## Verification performed for this revision
+
+- `xmake` release and debug builds of `NootedRedUserPatch` are green with no warnings; artifact
+  SHA-256 values are reported with the task hand-off (see `build/` for the exact kext/zip files).
+- The binary audit is clean: no page offsets, page hashes, find/replace constants, `NRPD`/`PatchData`
+  strings or per-build tables are compiled into the kext; only generic parser/matcher/identity code.
+- The engine was exercised offline with a temporary host harness (56 scenarios) covering: a golden
+  NRPT profile generated by an independent encoder (and confirmed byte-identical by the reference
+  `ProfileCodec.swift`), every `E001`-`E032` rejection path, identity gate order (build/APU/device),
+  offset-gated and offset-free matching, full-page hash mismatch, atomic no-partial-page find mismatch,
+  applied-once behaviour, range chunking and trailing-partial-chunk handling.
+- This revision has **not** been boot-tested. The next step is the offline-validator/package task and
+  then a hardware boot with `NRedUserPatchState`/`NRedUserPatchAppliedPages` verification.
 
 ## Source layout
 
 | File | Purpose |
 | --- | --- |
-| `Plugin.cpp` | `PluginConfiguration`, own `IOService`, locked runtime state machine, bounded `thread_call` retry, IORegistry diagnostics |
-| `PatchData.hpp/.cpp` | embedded build selection, kernel build/APU identity, manifest parser/validator, checksums |
-| `PatchDataBlob.hpp/.cpp` | **generated** embedded PatchData index and byte arrays (data-pipeline owned; do not hand-edit) |
-| `UserPatchBackend.hpp/.cpp` | `_cs_validate_page` / `_cs_validate_range` routes, exact-page compare, early `-NRedVDA` eligibility, atomic counters, serialised writes |
-| `Info.plist` | bundle identifier, Lilu + NootedRed dependencies, IOKit personality |
+| `Plugin.cpp` | `PluginConfiguration`, own `IOService`, locked runtime orchestration, build identity resolution, bounded diagnostics refresh, IORegistry properties |
+| `PatchProfile.hpp/.cpp` | generic NRPT parser/validator, identity gates, bounded page/site tables, chunk matcher, atomics, bounded hook logging |
+| `UserPatchBackend.hpp/.cpp` | `_cs_validate_page` / `_cs_validate_range` routing, 7-argument page wrapper, 6-argument range wrapper, one-shot iGPU identity detection |
+| `Info.plist` | bundle identifier, Lilu + NootedRed dependencies, IOKit personality (profile injected at deploy time) |
 
-## Known limitations (phase 2)
+## Known limitations
 
-- Boot-tested on 15.8.1 / `0x1638` with the `24H32` set; other builds have no embedded data.
-- Only the embedded builds can run: any other macOS build is a terminal `BuildUnsupported` NoOp.
-  Adding/updating a build requires regenerating `PatchDataBlob.*` and rebuilding/re-signing the kext.
-- The kext carries the embedded data payload (currently ~135 KiB of generated `const` arrays) plus its
-  generated source; this increases the bundle size compared with an external-data design.
-- Manifest v1 has no driver-binary hash: the exact 4 KiB page equality is the driver identity gate.
-- Data is keyed by exact build only; one build cannot carry per-APU-divergent page sets in v1.
-- APU family detection is conservative and does not read the STRAP0 revision register, so it accepts
-  the family's candidate bit set (never a different family).
-- If the bounded retries are exhausted, the satellite stays inert for the rest of the boot; it does not
-  poll indefinitely.
-- No installer helper (`NootedRedUserPatchCtl`) in this scaffold.
+- Not boot-tested yet; offline engine tests and a green build only.
+- A missing/invalid profile is a fail-closed `NoOp`: the satellite does nothing until the NootedRedTool
+  pipeline injects a profile for the exact running build.
+- APU/device identity is validated, but the actual patch safety identity is the full-page hash plus the
+  site finds; the profile is generated per APU family union (v1 has no per-APU page subsets).
+- The applied-page bitmap is one bit per profile page record, so a page record patches at most once per
+  boot; pages faulted before the profile activates are not retried.

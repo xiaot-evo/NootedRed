@@ -1,4 +1,4 @@
-// NootedRedUserPatch plugin entry point and runtime orchestration
+// NootedRedUserPatch plugin entry point and profile orchestration
 //
 // Copyright (C) 2026  ChefKiss.
 //
@@ -21,10 +21,9 @@
 // along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowledge/raw/branch/master/LICENSE-v1.md.
 
 // The satellite needs a later data-loading entry point than Lilu's plugin-start callback: the kernel
-// build string (`kern.osversion`), the IOKit registry and the data volume may not be ready when the
-// plugin kmod starts.  Defining this for the whole target (including Lilu's Library/plugin_start.cpp)
-// makes the IOKit subclass below the only definition, so Plugin.cpp owns both the service-start retry
-// point and the IOService identity.
+// build string and the IOKit registry may not be ready when the plugin kmod starts.  Defining this for
+// the whole target (including Lilu's Library/plugin_start.cpp) makes the IOKit subclass below the only
+// definition, so Plugin.cpp owns both the service-start entry point and the IOService identity.
 #ifndef LILU_CUSTOM_IOKIT_INIT
 #define LILU_CUSTOM_IOKIT_INIT 1
 #endif
@@ -33,43 +32,150 @@
 #include <Headers/kern_util.hpp>
 #include <Headers/kern_version.hpp>
 #include <Headers/plugin_start.hpp>
+#include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOKitKeys.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOService.h>
 #include <kern/clock.h>
-#include <mach/clock_types.h>
 #include <kern/thread_call.h>
-#include <libkern/c++/OSIterator.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSString.h>
-#include <PatchData.hpp>
+#include <libkern/sysctl.h>
+#include <mach/clock_types.h>
+#include <string.h>
+#include <PatchProfile.hpp>
 #include <UserPatchBackend.hpp>
 
 static const char* bootargOff   = "-NRedUserPatchOff";
 static const char* bootargDebug = "-NRedUserPatchDebug";
 static const char* bootargBeta  = "-NRedUserPatchBeta";
 
+// XNU's boot-supplied build string.  It is only a fallback source for the authoritative running build
+// when the device-tree property and the kern.osversion sysctl are both unreadable.
+extern "C" char osversion[];
+
 namespace
 {
 
-    // Bounded delayed retry (review D3).  Covers a build string / IOKit state that is not ready at
-    // patcher-load or service-start time.  The retries are deliberately finite and never touch page
-    // pointers.
-    constexpr UInt32 kMaxLoadRetries   = 15;
-    constexpr UInt32 kLoadRetryDelayMs = 2000;
+    constexpr size_t kBuildTextSize = 24;
 
-    // The Info.plist declares org.ChefKiss.NootedRed in OSBundleLibraries, so the kext loader itself only
-    // loads this plugin when NootedRed is installed.  This lookup is a diagnostic only.
-    bool nootedRedServiceVisible()
+    // Bounded diagnostics refresh schedule (milliseconds).  AppliedPages/FindMismatches are only
+    // meaningful once user-space has faulted the driver pages, so the counters are republished a
+    // finite number of times instead of running an endless timer.
+    constexpr UInt32 kRefreshDelaysMs[] = {5000, 15000, 30000, 60000, 120000, 240000};
+    constexpr UInt32 kRefreshCount      = sizeof(kRefreshDelaysMs) / sizeof(kRefreshDelaysMs[0]);
+
+    const char* const kProfileProperty = "NRedOffsetProfile";
+    const char* const kBuildHintProperty = "NRedSystemBuild";
+
+    bool copyBuildText(const char* const source, char* const out, const size_t outSize)
     {
-        auto* const matching = IOService::serviceMatching("NootedRed");
-        if (matching == nullptr) { return false; }
+        if (source == nullptr || outSize == 0) { return false; }
 
-        auto* const iterator = IOService::getMatchingServices(matching);
-        if (iterator == nullptr) { return false; }
+        size_t length = 0;
+        while (length < outSize && source[length] != '\0') { length++; }
+        if (length == 0 || length >= outSize || length > PatchProfile::kMaxBuildLength) { return false; }
 
-        const bool visible = iterator->getNextObject() != nullptr;
-        iterator->release();
-        return visible;
+        memcpy(out, source, length);
+        out[length] = '\0';
+        return true;
+    }
+
+    // Reads the bootloader-provided build string from the IODeviceTree root.  This is the same value
+    // the kernel publishes as kern.osversion on this platform and is available before any kext runs.
+    bool readDeviceTreeBuild(char* const out, const size_t outSize)
+    {
+        auto* const root = IORegistryEntry::fromPath("/", gIODTPlane);
+        if (root == nullptr) { return false; }
+
+        bool found = false;
+        auto* const property = root->getProperty(kOSBuildVersionKey);
+        if (auto* const stringValue = OSDynamicCast(OSString, property)) {
+            found = copyBuildText(stringValue->getCStringNoCopy(), out, outSize);
+        }
+        else if (auto* const dataValue = OSDynamicCast(OSData, property)) {
+            const size_t length = dataValue->getLength();
+            const auto* const bytes = static_cast<const UInt8*>(dataValue->getBytesNoCopy());
+            if (bytes != nullptr && length >= 1 && length < outSize) {
+                memcpy(out, bytes, length);
+                out[length] = '\0';
+                found       = true;
+            }
+        }
+        root->release();
+        return found;
+    }
+
+    bool readSysctlBuild(char* const out, const size_t outSize)
+    {
+        char   buffer[kBuildTextSize]{};
+        size_t size = sizeof(buffer);
+        if (sysctlbyname("kern.osversion", buffer, &size, nullptr, 0) != 0) { return false; }
+        buffer[sizeof(buffer) - 1] = '\0';
+        return copyBuildText(buffer, out, outSize);
+    }
+
+    bool readXnuBuild(char* const out, const size_t outSize)
+    {
+        return osversion[0] != '\0' && copyBuildText(osversion, out, outSize);
+    }
+
+    // Resolves the authoritative running build.  Every available source must agree; a disagreement is
+    // an unresolvable identity (fail closed), never a preference order.
+    bool readActualBuild(char* const out, const size_t outSize)
+    {
+        char deviceTreeBuild[kBuildTextSize]{};
+        char sysctlBuild[kBuildTextSize]{};
+        char xnuBuild[kBuildTextSize]{};
+
+        const bool haveDeviceTree = readDeviceTreeBuild(deviceTreeBuild, sizeof(deviceTreeBuild))
+                                    && PatchProfile::isValidBuildString(deviceTreeBuild);
+        const bool haveSysctl = readSysctlBuild(sysctlBuild, sizeof(sysctlBuild))
+                                && PatchProfile::isValidBuildString(sysctlBuild);
+        const bool haveXnu = readXnuBuild(xnuBuild, sizeof(xnuBuild)) && PatchProfile::isValidBuildString(xnuBuild);
+
+        const char* resolved = nullptr;
+        if (haveDeviceTree) { resolved = deviceTreeBuild; }
+        if (haveSysctl) {
+            if (resolved != nullptr && strcmp(resolved, sysctlBuild) != 0) {
+                SYSLOG("init", "running build sources disagree (device tree vs kern.osversion); identity unresolved");
+                return false;
+            }
+            resolved = sysctlBuild;
+        }
+        if (haveXnu) {
+            if (resolved != nullptr && strcmp(resolved, xnuBuild) != 0) {
+                SYSLOG("init", "running build sources disagree (kernel global vs detected); identity unresolved");
+                return false;
+            }
+            resolved = xnuBuild;
+        }
+
+        if (resolved == nullptr) { return false; }
+        strlcpy(out, resolved, outSize);
+        return true;
+    }
+
+    // The injected NRedSystemBuild hint is an early sanity input only.  It never replaces the
+    // authoritative running build comparison.
+    bool readInjectedBuild(IOService* const service, char* const out, const size_t outSize)
+    {
+        if (service == nullptr) { return false; }
+
+        auto* const property = service->getProperty(kBuildHintProperty);
+        if (auto* const value = OSDynamicCast(OSString, property)) {
+            return copyBuildText(value->getCStringNoCopy(), out, outSize);
+        }
+        if (auto* const value = OSDynamicCast(OSData, property)) {
+            const size_t length = value->getLength();
+            const auto* const bytes = static_cast<const UInt8*>(value->getBytesNoCopy());
+            if (bytes != nullptr && length >= 1 && length < outSize) {
+                memcpy(out, bytes, length);
+                out[length] = '\0';
+                return true;
+            }
+        }
+        return false;
     }
 
 }    // namespace
@@ -89,19 +195,18 @@ public:
 
 extern EXPORT PRODUCT_NAME* ADDPR(selfInstance);
 
-// Single-threaded state machine for load/install/retry transitions (review D4).
+// Orchestrates the two asynchronous entry points (Lilu patcher load and IOService start) into one
+// deterministic first-wins transition:
 //
-// Entry points:
-//   - plugin kmod start (`init`): allocate the lock, register `onPatcherLoadForce`; no IOKit/VFS work.
-//   - Lilu patcher load (`onPatcherLoad`): install both code-signing routes UNCONDITIONALLY (review D2),
-//     then attempt the data load, then arm the bounded retry if work remains.
-//   - IOService start (`serviceStart`): retry data load only.  It never routes
-//     kernel text, and it cannot install a second time (installation happens only at patcher load).
-//   - delayed `thread_call` (retryCallback): bounded retries of data load in a kernel thread.
+//   1. the NRPT profile is copied and validated exactly once (service start);
+//   2. the running build is resolved from the kernel/bootloader, the injected hint is only a sanity
+//      check;
+//   3. the APU family and iGPU device ID are detected once in the sleepable patcher-load callback;
+//   4. once all of the above are known the profile engine decides Loaded/NoOp exactly once; a
+//      deterministic failure is terminal and a missing identity is a fail-closed NoOp.
 //
-// All shared mutable state is guarded by `lock_` (an IOLock).  The validation hooks do not take this
-// lock: they only acquire-load the published data flag, and their
-// counters are atomics inside UserPatchBackend.
+// Validation hooks never take this lock: they only acquire-load the profile engine publication flag
+// and update its atomics.
 class UserPatchRuntime
 {
 public:
@@ -109,7 +214,7 @@ public:
 
     void init();
     void onPatcherLoad(KernelPatcher& patcher);
-    void serviceStart();
+    void onServiceStart(IOService* service);
 
 private:
     UserPatchRuntime() = default;
@@ -119,49 +224,29 @@ private:
     UserPatchRuntime(UserPatchRuntime&&) = delete;
     UserPatchRuntime& operator=(UserPatchRuntime&&) = delete;
 
-    // Snapshot of the state machine for IORegistry diagnostics.  Filled under the lock so property
-    // publication never runs with `lock_` held.
-    struct PublishSnapshot
-    {
-        UserPatchData::State  state;
-        UserPatchData::Reason reason;
-        char                  build[16];
-        char                  buildSource[64];
-        char                  dataSource[48];
-        UInt32                apuMask;
-        UInt32                appliedApuMask;
-        UInt32                pages;
-        UInt32                sites;
-        bool                  pageHook;
-        bool                  rangeHook;
-        UInt32                appliedPages;
-        bool                  profileLoaded;
-        char                  profileBuild[17];
-        UInt32                loadAttempts;
-        bool                  retryPending;
-    };
-
-    // All *Locked helpers require `lock_` to be held.
-    void ensureLocked();
-    void snapshotLocked(PublishSnapshot& snapshot) const;
-    static void publish(const PublishSnapshot& snapshot);
-    void logStateLocked(const char* prefix) const;
-    bool retryNeededLocked() const;
-    UInt32 retryDelayMs() const;
-
-    void clearRetryFlag();
-    void startRetryCall();
-    void startStatusRefresh();
-    void statusRefresh();
-    static void statusRefreshCallback(thread_call_param_t param0, thread_call_param_t param1);
-
-    static void retryCallback(thread_call_param_t param0, thread_call_param_t param1);
+    void loadProfileLocked(IOService* service);
+    void resolveIdentityLocked(IOService* service);
+    void finalizeIdentityLocked();
+    void afterTransition();
+    void publishDiagnostics();
+    void scheduleRefresh(UInt32 delayMs);
+    void refreshStep();
+    static void refreshCallback(thread_call_param_t param0, thread_call_param_t param1);
 
     IOLock* lock_{nullptr};
-    bool    disabled_{false};
-    bool    finalNoOp_{false};
-    bool    retryScheduled_{false};
-    UInt32  loadAttempts_{0};
+
+    bool disabled_{false};
+    bool patcherLoadDone_{false};
+    bool serviceStartDone_{false};
+    bool profileHandled_{false};
+    bool identityResolved_{false};
+
+    char actualBuild_[kBuildTextSize]{};
+    char injectedBuild_[kBuildTextSize]{};
+    bool injectedBuildValid_{false};
+
+    UInt32 refreshIndex_{0};
+    bool   refreshArmed_{false};
 };
 
 UserPatchRuntime& UserPatchRuntime::singleton()
@@ -173,8 +258,8 @@ UserPatchRuntime& UserPatchRuntime::singleton()
 void UserPatchRuntime::init()
 {
     if (checkKernelArgument(bootargOff)) {
-        // Lilu's PluginConfiguration disables the plugin before this runs; keep the check as a defensive
-        // guard in case the Lilu disable-argument handling changes.
+        // Lilu's PluginConfiguration disables the plugin before this runs; keep the check as a
+        // defensive guard in case the disable-argument handling changes.
         this->disabled_ = true;
         SYSLOG("init", "disabled by boot argument %s", bootargOff);
         return;
@@ -187,8 +272,9 @@ void UserPatchRuntime::init()
         return;
     }
 
-    SYSLOG("init", "NootedRedUserPatch %s starting", kextVersion);
-    SYSLOG("init", "embedded PatchData selected at runtime; no filesystem access");
+    SYSLOG("init", "NootedRedUserPatch %s starting (generic NRPT profile engine)", kextVersion);
+    SYSLOG("init", "patch data comes only from the injected %s personality property", kProfileProperty);
+
     lilu.onPatcherLoadForce([](void* const, KernelPatcher& patcher) {
         UserPatchRuntime::singleton().onPatcherLoad(patcher);
     });
@@ -198,259 +284,189 @@ void UserPatchRuntime::onPatcherLoad(KernelPatcher& patcher)
 {
     if (this->lock_ == nullptr) { return; }
 
-    SYSLOG("init", "parent NootedRed service: %s (kext dependency is enforced by the loader)",
-           nootedRedServiceVisible() ? "visible" : "not visible yet");
-
-    bool needRetry = false;
-    PublishSnapshot snapshot{};
     IOLockLock(this->lock_);
     if (!this->disabled_) {
-        // Unconditional install: an unreadable data volume must never delay kernel-text routing (D2).
+        this->patcherLoadDone_ = true;
+
+        // Unconditional install: a missing or rejected profile must never delay kernel-text routing.
         UserPatchBackend::singleton().install(patcher);
 
-        this->ensureLocked();
-        this->snapshotLocked(snapshot);
-        needRetry = this->retryNeededLocked();
-        if (needRetry) {
-            if (this->retryScheduled_) {
-                needRetry = false;
-            }
-            else {
-                this->retryScheduled_ = true;
-                snapshot.retryPending = true;
-            }
-        }
+        // Sleepable, IOKit-safe context: this is the only place hardware identity is detected.
+        UserPatchBackend::singleton().detectHardwareIdentity();
+
+        this->resolveIdentityLocked(ADDPR(selfInstance));
+        this->finalizeIdentityLocked();
     }
     IOLockUnlock(this->lock_);
 
-    if (!this->disabled_) { publish(snapshot); }
-    if (needRetry) { this->startRetryCall(); }
+    this->afterTransition();
 }
 
-void UserPatchRuntime::serviceStart()
+void UserPatchRuntime::onServiceStart(IOService* const service)
 {
     if (this->lock_ == nullptr) { return; }
 
-    bool needRetry = false;
-    PublishSnapshot snapshot{};
     IOLockLock(this->lock_);
     if (!this->disabled_) {
-        // Load only: hooks are installed exclusively at patcher load, so this entry point
-        // can never route kernel text late or install a second time (D2).
-        this->ensureLocked();
-        this->snapshotLocked(snapshot);
-        needRetry = this->retryNeededLocked();
-        if (needRetry) {
-            if (this->retryScheduled_) {
-                needRetry = false;
-            }
-            else {
-                this->retryScheduled_ = true;
-                snapshot.retryPending = true;
-            }
+        this->serviceStartDone_ = true;
+        this->loadProfileLocked(service);
+        this->resolveIdentityLocked(service);
+        this->finalizeIdentityLocked();
+    }
+    IOLockUnlock(this->lock_);
+
+    this->afterTransition();
+}
+
+void UserPatchRuntime::loadProfileLocked(IOService* const service)
+{
+    if (this->profileHandled_) { return; }
+    this->profileHandled_ = true;
+
+    if (service == nullptr) {
+        PatchProfile::singleton().noteAbsentProfile();
+        return;
+    }
+
+    // Read the injected build hint before the properties are removed.  It is a sanity check only.
+    char injected[kBuildTextSize]{};
+    if (readInjectedBuild(service, injected, sizeof(injected))) {
+        strlcpy(this->injectedBuild_, injected, sizeof(this->injectedBuild_));
+        this->injectedBuildValid_ = true;
+    }
+
+    // Validate and copy the whole profile while the OSData property is still alive.  The engine keeps
+    // only its own bounded static tables, so the property bytes may be freed afterwards.
+    auto* const property = service->getProperty(kProfileProperty);
+    auto* const data     = OSDynamicCast(OSData, property);
+    if (data != nullptr) {
+        PatchProfile::singleton().loadFromData(data->getBytesNoCopy(), data->getLength());
+    }
+    else {
+        PatchProfile::singleton().noteAbsentProfile();
+    }
+
+    service->removeProperty(kProfileProperty);
+    service->removeProperty(kBuildHintProperty);
+}
+
+void UserPatchRuntime::resolveIdentityLocked(IOService* const service)
+{
+    if (this->identityResolved_) { return; }
+
+    if (!this->injectedBuildValid_) {
+        char injected[kBuildTextSize]{};
+        if (readInjectedBuild(service, injected, sizeof(injected))) {
+            strlcpy(this->injectedBuild_, injected, sizeof(this->injectedBuild_));
+            this->injectedBuildValid_ = true;
         }
     }
-    IOLockUnlock(this->lock_);
 
-    if (!this->disabled_) { publish(snapshot); }
-    if (needRetry) { this->startRetryCall(); }
-    this->startStatusRefresh();
-}
-
-void UserPatchRuntime::ensureLocked()
-{
-    if (this->disabled_ || this->finalNoOp_) { return; }
-
-    auto& patchData = UserPatchData::singleton();
-    if (patchData.loaded()) { return; }
-
-    this->loadAttempts_ += 1;
-    if (patchData.load()) { return; }
-
-    if (!patchData.retryable()) {
-        this->finalNoOp_ = true;
-        SYSLOG("init", "data load failed permanently after %u attempt(s); hooks stay installed and inert",
-               static_cast<unsigned>(this->loadAttempts_));
+    char actual[kBuildTextSize]{};
+    if (!readActualBuild(actual, sizeof(actual))) {
+        // Deferred until both plugin entry points have run; finalizeIdentityLocked() then fails
+        // closed instead of guessing a build.
+        return;
     }
+
+    strlcpy(this->actualBuild_, actual, sizeof(this->actualBuild_));
+    this->identityResolved_ = true;
+
+    PatchProfile::singleton().setRunningBuild(this->actualBuild_,
+                                              this->injectedBuildValid_ ? this->injectedBuild_ : nullptr);
 }
 
-bool UserPatchRuntime::retryNeededLocked() const
+void UserPatchRuntime::finalizeIdentityLocked()
 {
-    if (this->disabled_ || this->finalNoOp_) { return false; }
+    if (this->identityResolved_ || !this->patcherLoadDone_ || !this->serviceStartDone_) { return; }
 
-    auto& patchData = UserPatchData::singleton();
-
-    if (!patchData.loaded()) { return this->loadAttempts_ < kMaxLoadRetries; }
-    return false;
+    // Both entry points ran and the authoritative running build is still unreadable: fail closed.
+    PatchProfile::singleton().setRunningBuild(nullptr, nullptr);
 }
 
-UInt32 UserPatchRuntime::retryDelayMs() const
+void UserPatchRuntime::afterTransition()
 {
-    return kLoadRetryDelayMs;
-}
+    this->publishDiagnostics();
 
-void UserPatchRuntime::clearRetryFlag()
-{
-    if (this->lock_ == nullptr) { return; }
-
+    bool armRefresh = false;
     IOLockLock(this->lock_);
-    this->retryScheduled_ = false;
-    IOLockUnlock(this->lock_);
-}
-
-void UserPatchRuntime::startRetryCall()
-{
-    const UInt32 delay = this->retryDelayMs();
-
-    thread_call_t call = thread_call_allocate(retryCallback, nullptr);
-    if (call == nullptr) {
-        SYSLOG("init", "failed to allocate the delayed retry thread call; stopping retries");
-        this->clearRetryFlag();
-        return;
+    if (!this->disabled_ && PatchProfile::singleton().loaded() && !this->refreshArmed_) {
+        this->refreshArmed_ = true;
+        armRefresh          = true;
     }
-
-    UInt64 deadline = 0;
-    // mach_absolute_time is nanosecond-based on x86_64 (timebase 1:1), so NSEC_PER_MSEC is the correct
-    // scale for a millisecond delay.  (Passing 1000 here made every retry run ~1000x too early and the
-    // whole bounded chain fired during bsd_init before kern.osversion was populated.)
-    clock_interval_to_deadline(delay, static_cast<uint32_t>(NSEC_PER_MSEC), &deadline);
-
-    // TRUE means the call was already pending; for a freshly allocated call that cannot happen, but never
-    // free a call that may be pending.
-    if (thread_call_enter1_delayed(call, call, deadline)) {
-        SYSLOG("init", "delayed retry call was unexpectedly already pending; stopping retries");
-        this->clearRetryFlag();
-        return;
-    }
-
-    SYSLOG("init", "delayed retry armed in %u ms", static_cast<unsigned>(delay));
-}
-
-void UserPatchRuntime::retryCallback(thread_call_param_t, thread_call_param_t param1)
-{
-    auto& self = singleton();
-    auto* const thisCall = static_cast<thread_call_t>(param1);
-
-    bool needNext     = false;
-    bool publishState = false;
-    PublishSnapshot snapshot{};
-    if (self.lock_ != nullptr) {
-        IOLockLock(self.lock_);
-        self.retryScheduled_ = false;
-
-        if (!self.disabled_) {
-            if (!self.finalNoOp_) {
-                self.ensureLocked();
-            }
-
-            self.snapshotLocked(snapshot);
-            publishState = true;
-
-            needNext = self.retryNeededLocked();
-            if (needNext) {
-                self.retryScheduled_ = true;
-                snapshot.retryPending = true;
-            }
-            else {
-                self.logStateLocked("delayed retries finished");
-            }
-        }
-        IOLockUnlock(self.lock_);
-    }
-
-    if (publishState) { publish(snapshot); }
-    if (needNext) { self.startRetryCall(); }
-    if (thisCall != nullptr) { thread_call_free(thisCall); }
-}
-
-void UserPatchRuntime::startStatusRefresh()
-{
-    constexpr UInt32 kStatusRefreshMs = 5000;
-
-    if (this->disabled_) { return; }
-
-    thread_call_t call = thread_call_allocate(statusRefreshCallback, nullptr);
-    if (call == nullptr) {
-        SYSLOG("init", "failed to allocate status refresh call");
-        return;
-    }
-
-    UInt64 deadline = 0;
-    clock_interval_to_deadline(kStatusRefreshMs, static_cast<uint32_t>(NSEC_PER_MSEC), &deadline);
-    if (thread_call_enter1_delayed(call, call, deadline)) {
-        SYSLOG("init", "status refresh call was already pending");
-    }
-}
-
-void UserPatchRuntime::statusRefresh()
-{
-    if (this->lock_ == nullptr || this->disabled_) { return; }
-
-    PublishSnapshot snapshot{};
-    IOLockLock(this->lock_);
-    this->snapshotLocked(snapshot);
     IOLockUnlock(this->lock_);
 
-    publish(snapshot);
+    if (armRefresh) {
+        this->refreshIndex_ = 1;
+        this->scheduleRefresh(kRefreshDelaysMs[0]);
+    }
 }
 
-void UserPatchRuntime::statusRefreshCallback(thread_call_param_t, thread_call_param_t param1)
-{
-    auto* const thisCall = static_cast<thread_call_t>(param1);
-    singleton().statusRefresh();
-    if (thisCall != nullptr) { thread_call_free(thisCall); }
-}
-
-void UserPatchRuntime::snapshotLocked(PublishSnapshot& snapshot) const
-{
-    auto& patchData = UserPatchData::singleton();
-    auto& backend   = UserPatchBackend::singleton();
-
-    snapshot.state              = patchData.state();
-    snapshot.reason             = patchData.reason();
-    strlcpy(snapshot.build, patchData.buildString(), sizeof(snapshot.build));
-    strlcpy(snapshot.buildSource, patchData.buildSource(), sizeof(snapshot.buildSource));
-    strlcpy(snapshot.dataSource, patchData.dataSource(), sizeof(snapshot.dataSource));
-    snapshot.apuMask            = patchData.apuMask();
-    snapshot.appliedApuMask     = patchData.matchedApuMask();
-    snapshot.pages              = patchData.pageCount();
-    snapshot.sites              = patchData.siteCount();
-    snapshot.pageHook           = backend.pageHookInstalled();
-    snapshot.rangeHook          = backend.rangeHookInstalled();
-    snapshot.appliedPages       = backend.appliedPageCount();
-    snapshot.profileLoaded      = backend.profileLoaded();
-    strlcpy(snapshot.profileBuild, backend.profileBuild(), sizeof(snapshot.profileBuild));
-    snapshot.loadAttempts       = this->loadAttempts_;
-    snapshot.retryPending       = this->retryScheduled_;
-}
-
-void UserPatchRuntime::publish(const PublishSnapshot& snapshot)
+void UserPatchRuntime::publishDiagnostics()
 {
     auto* const service = ADDPR(selfInstance);
     if (service == nullptr) { return; }
 
-    service->setProperty("NRedUserPatchState", UserPatchData::stateName(snapshot.state));
-    service->setProperty("NRedUserPatchReason", UserPatchData::reasonName(snapshot.reason));
-    service->setProperty("NRedUserPatchBuild",
-                         snapshot.profileLoaded ? snapshot.profileBuild : snapshot.build);
-    service->setProperty("NRedUserPatchDataSource",
-                         snapshot.profileLoaded ? "personality:NRedOffsetProfile" : snapshot.dataSource);
-    service->setProperty("NRedUserPatchApuMask", static_cast<unsigned long long>(snapshot.apuMask), 32);
-    service->setProperty("NRedUserPatchPages", static_cast<unsigned long long>(snapshot.pages), 32);
-    service->setProperty("NRedUserPatchSites", static_cast<unsigned long long>(snapshot.sites), 32);
-    service->setProperty("NRedUserPatchHooks", snapshot.pageHook ? 1ULL : 0ULL, 32);
-    service->setProperty("NRedUserPatchRangeHook", snapshot.rangeHook ? 1ULL : 0ULL, 32);
+    auto& profile = PatchProfile::singleton();
+    auto& backend = UserPatchBackend::singleton();
+
+    const char* const buildText = profile.build()[0] != '\0'
+                                      ? profile.build()
+                                      : (this->actualBuild_[0] != '\0' ? this->actualBuild_ : "none");
+
+    service->setProperty("NRedUserPatchState", profile.stateName());
+    service->setProperty("NRedUserPatchReason", profile.reasonName());
+    service->setProperty("NRedUserPatchBuild", buildText);
+    service->setProperty("NRedUserPatchDataSource", profile.parsed() ? "personality:NRedOffsetProfile" : "none");
+    service->setProperty("NRedUserPatchErrorCode", profile.errorCode());
+    service->setProperty("NRedUserPatchErrorContext", profile.errorContext());
+    service->setProperty("NRedUserPatchApuMask", static_cast<unsigned long long>(profile.apuMask()), 32);
+    service->setProperty("NRedUserPatchDeviceID", static_cast<unsigned long long>(profile.deviceID()), 32);
+    service->setProperty("NRedUserPatchPages", static_cast<unsigned long long>(profile.pageCount()), 32);
+    service->setProperty("NRedUserPatchSites", static_cast<unsigned long long>(profile.siteCount()), 32);
+    service->setProperty("NRedUserPatchHooks", static_cast<unsigned long long>(backend.pageHookInstalled() ? 1 : 0),
+                         32);
+    service->setProperty("NRedUserPatchRangeHook",
+                         static_cast<unsigned long long>(backend.rangeHookInstalled() ? 1 : 0), 32);
+    service->setProperty("NRedUserPatchLoaded", static_cast<unsigned long long>(profile.loaded() ? 1 : 0), 32);
+    service->setProperty("NRedUserPatchAppliedPages", static_cast<unsigned long long>(profile.appliedPages()), 32);
+    service->setProperty("NRedUserPatchFindMismatches", static_cast<unsigned long long>(profile.findMismatches()), 32);
+    service->setProperty("NRedUserPatchMatchedPages", static_cast<unsigned long long>(profile.matchedPages()), 32);
+    service->setProperty("NRedUserPatchChunkCalls", static_cast<unsigned long long>(profile.chunkCalls()), 32);
+    service->setProperty("NRedUserPatchWriteFailures", static_cast<unsigned long long>(profile.writeFailures()), 32);
 }
 
-void UserPatchRuntime::logStateLocked(const char* const prefix) const
+void UserPatchRuntime::scheduleRefresh(const UInt32 delayMs)
 {
-    auto& patchData = UserPatchData::singleton();
-    auto& backend   = UserPatchBackend::singleton();
+    thread_call_t call = thread_call_allocate(refreshCallback, nullptr);
+    if (call == nullptr) {
+        SYSLOG("init", "failed to allocate status refresh call; diagnostics keep their last values");
+        return;
+    }
 
-    SYSLOG("init", "%s: data=%s reason=%s loadAttempts=%u hooks=%s range=%s", prefix,
-           patchData.stateName(), patchData.reasonName(), static_cast<unsigned>(this->loadAttempts_),
-           backend.pageHookInstalled() ? "installed" : "absent",
-           backend.rangeHookInstalled() ? "installed" : "absent");
+    UInt64 deadline = 0;
+    clock_interval_to_deadline(delayMs, static_cast<uint32_t>(NSEC_PER_MSEC), &deadline);
+    if (thread_call_enter1_delayed(call, call, deadline)) {
+        // Cannot happen for a freshly allocated call; never free a possibly pending call.
+        SYSLOG("init", "status refresh call was unexpectedly pending");
+    }
+}
+
+void UserPatchRuntime::refreshStep()
+{
+    this->publishDiagnostics();
+
+    if (this->refreshIndex_ < kRefreshCount) {
+        this->scheduleRefresh(kRefreshDelaysMs[this->refreshIndex_]);
+        this->refreshIndex_ += 1;
+    }
+}
+
+void UserPatchRuntime::refreshCallback(thread_call_param_t, thread_call_param_t param1)
+{
+    auto* const thisCall = static_cast<thread_call_t>(param1);
+    singleton().refreshStep();
+    if (thisCall != nullptr) { thread_call_free(thisCall); }
 }
 
 OSDefineMetaClassAndStructors(PRODUCT_NAME, IOService)
@@ -475,18 +491,9 @@ bool PRODUCT_NAME::start(IOService* provider)
     }
 
     if (ADDPR(startSuccess)) {
-        UserPatchRuntime::singleton().serviceStart();
-    }
-
-    if (auto* const profile = OSDynamicCast(OSData, this->getProperty("NRedOffsetProfile"))) {
-        const char* expectedBuild = nullptr;
-        if (auto* const build = OSDynamicCast(OSString, this->getProperty("NRedSystemBuild"))) {
-            expectedBuild = build->getCStringNoCopy();
-        }
-        UserPatchBackend::singleton().loadProfileFromData(profile->getBytesNoCopy(), profile->getLength(),
-                                                          expectedBuild);
-        this->removeProperty("NRedOffsetProfile");
-        this->removeProperty("NRedSystemBuild");
+        // Reads and validates the injected NRedOffsetProfile property before user-space pages can be
+        // validated, then resolves the running identity and publishes the diagnostics state.
+        UserPatchRuntime::singleton().onServiceStart(this);
     }
 
     return ADDPR(startSuccess);
