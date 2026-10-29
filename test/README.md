@@ -12,11 +12,12 @@ Implemented in pure Python 3 (stdlib only) and intentionally independent from th
 
 | File | Purpose |
 | --- | --- |
-| `nrpt_validator.py` | strict NRPT v1 decoder/encoder (all `E001`–`E032` codes), kext-algorithm simulator (offset gate, full-page FNV-1a-64, all site finds, atomic replace writes, applied-once, no try-next-record), clean-fixture resolver, false-positive checks, JSON + human report, CLI |
-| `test_nrpt_validator.py` | 69 synthetic unit tests: FNV vectors, round trip/canonical size/determinism, one crafted-byte vector for every stable error code, identity/apply semantics, fixture resolution, ambiguity, mutation/duplicate sweeps, native hash-scan parity, CLI end-to-end |
+| `nrpt_validator.py` | strict NRPT v1/v2 decoder/encoder (`E001`–`E041` codes), kext-algorithm simulator (offset gate, full-page FNV-1a-64, all site finds, atomic replace writes, applied-once, no try-next-record), clean-fixture resolver, false-positive checks, JSON + human report, CLI |
+| `test_nrpt_validator.py` | 87 synthetic unit tests: FNV vectors, round trip/canonical size/determinism, one crafted-byte vector for every stable error code, identity/apply semantics, fixture resolution, v2 image-table metadata re-resolution (synthetic Mach-O + dyld cache), ambiguity, mutation/duplicate sweeps, native hash-scan parity, CLI end-to-end |
 | `run-validation.sh` | one-shot runner: unit tests, then real-profile validation against the clean host fixture |
 | `inject_profile.py` | inject / check / extract the `NRedOffsetProfile` + `NRedSystemBuild` personality properties in a kext `Info.plist` (deterministic package build; used when the tool's injection CLI is unavailable) |
-| `golden/synthetic-2page.nrpt` | synthetic golden profile that the reference Swift codec and this Python codec encode byte-identically (cross-implementation parity) |
+| `golden/synthetic-2page.nrpt` | synthetic NRPT v1 golden profile that the reference Swift codec and this Python codec encode byte-identically (cross-implementation parity) |
+| `golden/synthetic-2page-v2.nrpt` | synthetic NRPT v2 golden (image table + 32-byte page records) that the reference Swift codec and this Python codec encode byte-identically |
 | `golden/engine-crosscheck/` | synthetic vectors from the independent C++ engine harness; the Python simulator must reproduce the engine's patched page bytes exactly |
 | `hash_scan.c` | optional native FNV-1a-64 page scanner (compiled on demand with clang) used for full-cache hash-only identity / duplicate-content scans; pure-Python fallback keeps the tool dependency-free |
 
@@ -54,12 +55,35 @@ test/run-validation.sh build/packages/NootedRed-15.8.2-nrpt/nred-24H232.nrpt
 # or with explicit identity gates:
 NRPT_DEVICE_ID=0x1638 NRPT_EXPECTED_BUILD=24H232 \
     test/run-validation.sh /path/to/nred-24H232.nrpt
+
+# NRPT v2 profile against an extracted clean fixture tree (spec section 0.6)
+NRPT_DEVICE_ID=0x1638 NRPT_EXPECTED_BUILD=24H232 FIXTURES=version-fixtures/15.8.2 \
+    test/run-validation.sh build/profile-24H232-v2/nred-24H232-v2.nrpt
 ```
 
 `run-validation.sh` writes `build/validation-report.json` by default (`NRPT_REPORT` overrides).
 Exit code 0 means every intended page resolved to a unique clean 4 KiB page, matched its identity,
 applied all sites atomically, was applied only once, and no unintended fixture page matched any
 record identity.
+
+## NRPT v2 support
+
+The validator decodes both NRPT v1 (hook-only) and NRPT v2 profiles (v2 adds the target-image table
+and 32-byte page records). For v2 it additionally re-resolves every page's `(imageIndex,
+pageVmOffset)` against the clean fixture — spec section 0.6 — before applying it:
+
+- standalone images (`kind 0`): the fixture file is parsed as Mach-O; the page's `pageStartVA`
+  (`imageUnslidVmaddr + pageVmOffset`) is located in a real `LC_SEGMENT_64`/section, the recorded
+  `pageFileOffset` is recomputed from the segment file offset, and the segment/section names are
+  checked against the image metadata name lists;
+- dyld shared cache images (`kind 1`): the image is located in the fixture cache image-text list by
+  unslid address + path suffix, its Mach-O `__TEXT` geometry is verified against the metadata, the
+  page is mapped through the cache mapping tables (subcache file offset), and the page hash/sites are
+  verified as in v1.
+
+These re-resolution failures are reported with the same stable `E037`/`E040`/`E041` codes. v1
+profiles keep the v1 discovery path (recorded `pageFileOffset` + full-page hash + duplicate-content
+scan) and continue to validate unchanged.
 
 ## What the validator does (spec section 8 / 13)
 
@@ -121,6 +145,9 @@ The JSON report is deterministic (no timestamps, sorted keys) and contains:
 | T12 | deterministic report (two runs byte-identical) |
 | T13 | CLI end-to-end PASS on a synthetic fixture tree; corrupted profile exits ≠0 with `E00x` |
 | T14 | cross-implementation: reference Swift codec golden is byte-identical; independent C++ engine harness patched bytes reproduced exactly |
+| T15 | NRPT v2 codec/model: round trip, size formula, v1 vs v2 distinction, golden parity (Swift codec) |
+| T16 | NRPT v2 stable error vectors `E034`–`E041` (image count/entry/table size/path/page metadata/duplicate path/page vm offset/geometry) |
+| T17 | NRPT v2 metadata re-resolution: synthetic standalone Mach-O + dyld-cache fixture; segment/section/file-offset verification; wrong vmOffset/hash/path/segment/vmSize rejection |
 
 The real-profile end-to-end check (host clean images, 13 pages / 18 sites for 24H232) is executed by
 `run-validation.sh` and recorded in the task-8 validation report under `build/`.

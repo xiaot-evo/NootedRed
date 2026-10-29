@@ -16,7 +16,7 @@ patch addresses, page offsets, `find` or `replace` bytes in the generator.
 | `Decoding.swift` | Real x86_64 disassembler: Capstone 5 loaded dynamically (`dlopen`), `cs_insn` layout verified by a self-test before use; strict Intel-syntax operand parser (registers, immediates, memory base/index/scale/displacement). Fails closed when Capstone is unavailable — no byte-scan fallback. |
 | `FunctionAnalysis.swift` | Function extents from `LC_FUNCTION_STARTS` (symbol/next-symbol fallback), whole-body decode with 100% byte-coverage validation, basic blocks, branch-target-on-boundary checks, reachability, and an Objective-C metadata parser (`__objc_classlist` → `class_ro_t` → method lists, relative and classic layouts). |
 | `SemanticRules.swift` | The rule engine and the 12 semantic rules that resolve the 18 sites on macOS 15.8.2/24H232 (GL/Metal gfx9 HwInfo, GL dual-quad, Metal RB+ gate/allow, VDA accelerator/addrlib/factory/feedback-stride/chip-family, AppleGVA AVDGetGPUAccelerators). Each rule resolves a function through symbols or parsed ObjC metadata, matches instructions by decoded semantics, requires exactly one unambiguous match, derives `find` from the image and synthesises a same-length `replace` whose decoded effect is re-validated. |
-| `ProfilePipeline.swift` | Fixture environment (build, APU mask, device ID, user-patch-loaded guard), image set, NRPT profile construction through `ProfileCodec.encode`, page hashes/flags, identity-collision scan over every target `__TEXT` page, offline validator built on `ProfileCodec.applyPage`, JSON evidence and the CLI. |
+| `ProfilePipeline.swift` | Fixture environment (build, APU mask, device ID, user-patch-loaded guard), image set, NRPT v2 profile construction through `ProfileCodec.encode` (image table with kind/canonical path/unslid VM address/`__TEXT` extent/segment+section names, per-page `imageIndex`+`pageVmOffset`), page hashes/flags, identity-collision scan over every target `__TEXT` page, offline validator built on `ProfileCodec.applyPage` plus v2 metadata re-resolution, JSON evidence and the CLI. |
 
 ## CLI
 
@@ -41,6 +41,26 @@ zero or multiple semantic matches in the expected function(s), non-decodable fun
 whose 4 KiB read is short, an unintended page matching a profile page identity, any model rule
 violation from `ProfileCodec.encode`, or a failure of the built-in offline validation.
 
+## NRPT v2 target-image metadata
+
+The profile is NRPT **v2** (docs/PatchProfile-Spec.md §0). Each page record additionally carries
+`imageIndex` (index into the image table) and `pageVmOffset` (4 KiB-aligned `pageStart - image
+mach-header unslid VM address`). Image entries carry `kind` (0 = standalone file-backed dylib,
+1 = dyld shared cache image), a canonical absolute path derived from the parsed image (the
+generator strips the fixture-root prefix, so extracted fixtures and the live system produce the
+same bytes), the unslid mach-header VM address, the `__TEXT` vmsize bound and the parsed
+segment/section names (metadata/evidence; the runtime does not depend on them). The consumer
+computes the live page address as `dyld imageLoadAddress + pageVmOffset`, which works for both the
+standalone GL bundle and cache images. The evidence JSON records, per page, the image path/kind,
+segment, section, in-segment page index, `pageVmOffset`, page VA, page-file offset and page hash,
+and the built-in validator re-resolves every `(imageIndex, pageVmOffset)` to the exact fixture page
+for all records.
+
+Generation must use a **clean fixture**. The live root is refused when `NootedRedUserPatch` is
+loaded; even without the hook the running system's patched driver pages can leak through the
+unified buffer cache, so `version-fixtures/<build>` is extracted with `F_NOCACHE` source reads and
+passed as the `--generate-profile` root. Identical inputs produce byte-identical profiles.
+
 ## Page identity flags
 
 `ProfileCodec.encode` derives counts, table sizes and the payload checksum; the generator only
@@ -58,10 +78,15 @@ any hash comparison. There are no hash-only page records.
 Generated on the clean host system (no UserPatch loaded) with `--generate-profile / --out <dir>`:
 
 - offline validation PASS, 1858 `__TEXT` pages scanned, 13 page records matched, 0 find mismatches
-- 13 pages / 18 sites / 1096 bytes, all 13 page records with `matchFlags = 0x0007`
-- sha256 `fddf26a502da55ee18bf6c2eb966b02ff8000b363db18b4b648f76f036047365`
+- 13 pages / 18 sites / 4 target images / 2776 bytes, all 13 page records with `matchFlags = 0x0007`
+- sha256 `56afabe0b7f77346057108ba1b458bbdecc5f436a720f5915484f579257bc3f4`
+- generated from the clean `F_NOCACHE` fixture `version-fixtures/15.8.2` (build 24H232, device
+  0x1638); byte-identical across repeated runs; artifacts published under
+  `build/profile-24H232-v2/`
 
-The AppleGVA record is the mainline-validated `AVDGetGPUAccelerators` patch: page `.02` file offset
+The 4-image set is GL (`kind 0`, unslid 0), Metal, VADriver2 and AppleGVA (`kind 1`, cache unslid
+addresses `0x7FFB08757000` / `0x7FFB08606000` / `0x7FFA06672000`). The AppleGVA record is the
+mainline-validated `AVDGetGPUAccelerators` patch: page `.02` file offset
 `0x6696000`, page hash `0xBF4200EAD854986D`, site `0x41B`, `find 0F84D6030000` (the `je` to the
 empty-return block after the Intel-accelerator null test) replaced by `0F842A000000` (the AMD
 accelerator insertion tail after the output-vector capacity check, storing the accelerator

@@ -1,6 +1,6 @@
 import Foundation
 
-// MARK: - NRPT v1 binary patch profile
+// MARK: - NRPT v2 binary patch profile
 //
 // Pure host-side codec for the binary profile defined in docs/PatchProfile-Spec.md.
 // Foundation only: no file I/O, no environment access, no hardcoded patch data.
@@ -8,7 +8,13 @@ import Foundation
 // the payload checksum from the arrays so a profile can never be internally inconsistent.
 //
 // Layout (little-endian, packed, no implicit padding):
-//   Header 64 B | PageTable pageCount*24 B | SiteTable siteCount*40 B
+//   Header 64 B | PageTable pageCount*32 B | SiteTable siteCount*40 B | ImageTable imageTableSize B
+//
+// v2 adds the target-image metadata required by the direct-patch path: each page record names
+// its image (index into the image table), the segment and section inside that image and the
+// 4 KiB page index inside the segment. The image table carries the image path and kind
+// (standalone file-backed Mach-O or dyld shared cache image). All values are produced by the
+// generator from the parsed target image; none are baked into the consumer.
 //
 // Fail-closed contract: `decode` rejects the whole byte string with a typed
 // ProfileCodecError for any rule violation; `encode` refuses any invalid model.
@@ -20,9 +26,9 @@ enum NRPTFormat {
     /// ASCII "NRPT".
     static let magic: [UInt8] = [0x4E, 0x52, 0x50, 0x54]
 
-    static let version: UInt16 = 1
+    static let version: UInt16 = 2
     static let headerSize = 64
-    static let pageRecordSize = 24
+    static let pageRecordSize = 32
     static let siteRecordSize = 40
 
     /// Page unit hashed by `pageHash` and written by page patches.
@@ -37,7 +43,21 @@ enum NRPTFormat {
     static let maxSitesPerPage = 64
     static let maxSitePatchSize = 16
 
-    /// APU family bits defined by v1 (Raven .. Green Sardine).
+    /// Target image table (v2).
+    static let maxImages = 16
+    static let maxImagePathLength = 200
+    static let imageEntryHeaderSize = 20
+    static let maxSegmentsPerImage = 16
+    static let maxSectionsPerImage = 16
+    static let segmentNameSize = 16
+    static let sectionNameSize = 16
+    /// Image table entries carry their own size; bound the whole table defensively.
+    static let maxImageTableSize = maxImages * (imageEntryHeaderSize
+        + roundUp4(maxImagePathLength + 1)
+        + maxSegmentsPerImage * segmentNameSize
+        + maxSectionsPerImage * sectionNameSize)
+
+    /// APU family bits defined for the profile identity gate (Raven .. Green Sardine).
     static let knownApuMask: UInt32 = 0x3F
 
     /// Header field offsets, in bytes from the start of the profile.
@@ -54,16 +74,63 @@ enum NRPTFormat {
         static let siteTableSize = 40
         static let payloadChecksum = 44
         static let flags = 48
-        static let reserved = 52
-        static let reservedSize = 12
+        static let imageCount = 52
+        static let imageTableSize = 54
+        static let reserved = 58
+        static let reservedSize = 6
+    }
+
+    /// Page record field offsets (v2, 32 bytes).
+    enum PageRecord {
+        static let pageFileOffset = 0
+        static let pageHash = 8
+        static let firstSite = 16
+        static let siteCount = 20
+        static let matchFlags = 22
+        static let imageIndex = 24
+        static let reserved = 26
+        static let pageVmOffset = 28
+    }
+
+    /// Image table entry (v2, 20-byte header then variable tables):
+    ///   kind u8, flags u8 (bit0 = match path by suffix), pathLength u16,
+    ///   imageUnslidVmaddr u64, imageVmSize u32, segmentCount u8, sectionCount u8,
+    ///   reserved u16,
+    ///   path bytes (NUL-terminated, padded to 4-byte alignment),
+    ///   segmentCount * 16-byte segment names, sectionCount * 16-byte section names.
+    enum ImageEntry {
+        static let kind = 0
+        static let flags = 1
+        static let pathLength = 2
+        static let imageUnslidVmaddr = 4
+        static let imageVmSize = 12
+        static let segmentCount = 16
+        static let sectionCount = 17
+        static let reserved = 18
+        static let headerSize = 20
+
+        /// Path is matched by suffix (absolute installed path vs. the running map path).
+        static let flagSuffixMatch: UInt8 = 1 << 0
+        static let allKnownFlags: UInt8 = flagSuffixMatch
     }
 
     static func pageTableOffset(pageIndex: Int) -> Int {
         headerSize + pageIndex * pageRecordSize
     }
 
-    static func encodedSize(pageCount: Int, siteCount: Int) -> Int {
-        headerSize + pageCount * pageRecordSize + siteCount * siteRecordSize
+    /// Wire size of one image table entry: fixed header, NUL-terminated path padded to
+    /// 4-byte alignment, then the fixed-width segment and section name tables.
+    static func imageEntrySize(pathLength: Int, segmentCount: Int, sectionCount: Int) -> Int {
+        imageEntryHeaderSize + roundUp4(pathLength + 1)
+            + segmentCount * segmentNameSize + sectionCount * sectionNameSize
+    }
+
+    static func roundUp4(_ value: Int) -> Int {
+        (value + 3) & ~3
+    }
+
+    static func encodedSize(pageCount: Int, siteCount: Int, imageTableSize: Int) -> Int {
+        headerSize + pageCount * pageRecordSize + siteCount * siteRecordSize + imageTableSize
     }
 }
 
@@ -128,23 +195,81 @@ struct NRPTSite: Equatable {
     var replaceSize: Int { replace.count }
 }
 
-/// One page record (24 bytes on the wire) plus the sites it owns.
+/// Target image kind for the direct-patch locator.
+enum NRPTImageKind: UInt8, Equatable {
+    /// Standalone, file-backed Mach-O (e.g. the GL driver bundle executable).
+    case standaloneFile = 0
+    /// Image inside the split dyld shared cache.
+    case dyldSharedCache = 1
+}
+
+/// One target image referenced by page records (v2 image table entry).
+struct NRPTImage: Equatable {
+    /// Standalone file-backed image or dyld shared cache image.
+    var kind: NRPTImageKind
+    /// Canonical image path derived from the parsed target, e.g.
+    /// "/System/Library/Extensions/AMDRadeonVADriver2.bundle/Contents/MacOS/AMDRadeonVADriver2".
+    /// Always starts with "/"; the generator strips fixture-root prefixes so the bytes are
+    /// independent of where the fixture was extracted.
+    var path: String
+    /// Unslid VM address of the image's mach header (`__TEXT` vmaddr) as parsed from the
+    /// image. For a dyld shared cache image this is the cache's unslid address, so the
+    /// consumer can derive slide = imageLoadAddress - imageUnslidVmaddr. Standalone dylibs
+    /// use 0 here and are located by path suffix instead.
+    var unslidVMAddress: UInt64
+    /// Total mapped image extent used to bound `pageVmOffset` before any user-map read.
+    var vmSize: UInt32
+    /// Segment names of the parsed image (evidence/metadata, 1...16).
+    var segmentNames: [String]
+    /// Section names of the parsed image (evidence/metadata, 0...16).
+    var sectionNames: [String]
+
+    init(kind: NRPTImageKind, path: String, unslidVMAddress: UInt64, vmSize: UInt32,
+         segmentNames: [String], sectionNames: [String]) {
+        self.kind = kind
+        self.path = path
+        self.unslidVMAddress = unslidVMAddress
+        self.vmSize = vmSize
+        self.segmentNames = segmentNames
+        self.sectionNames = sectionNames
+    }
+
+    var pathBytes: [UInt8] { Array(path.utf8) }
+
+    /// Encoded size of this image's table entry.
+    var entrySize: Int {
+        NRPTFormat.imageEntrySize(pathLength: pathBytes.count,
+                                  segmentCount: segmentNames.count,
+                                  sectionCount: sectionNames.count)
+    }
+}
+
+/// One page record (64 bytes on the wire) plus the sites it owns and the target-image
+/// metadata used by the direct-patch path.
 struct NRPTPage: Equatable {
     /// Page base offset in the target image namespace; must be 4096-aligned.
     var pageFileOffset: UInt64
     /// FNV-1a-64 over the complete 4096-byte clean page.
     var pageHash: UInt64
-    /// Identity rules; v1 defaults to offset + hash + sites.
+    /// Identity rules; defaults to offset + hash + sites.
     var matchFlags: NRPTMatchFlags
     /// Sites in site-table order; 1...64 entries.
     var sites: [NRPTSite]
+    /// Index into `NRPTProfile.images` (v2).
+    var imageIndex: UInt16
+    /// 4096-aligned offset of the page from the image's unslid mach-header VM address
+    /// (v2): `pageStartVA - image.unslidVMAddress`. The consumer computes the live page
+    /// address as `imageLoadAddress + pageVmOffset`.
+    var pageVmOffset: UInt32
 
     init(pageFileOffset: UInt64, pageHash: UInt64, matchFlags: NRPTMatchFlags = .defaultV1,
-         sites: [NRPTSite]) {
+         sites: [NRPTSite], imageIndex: UInt16, pageVmOffset: UInt32) {
         self.pageFileOffset = pageFileOffset
         self.pageHash = pageHash
         self.matchFlags = matchFlags
         self.sites = sites
+        self.imageIndex = imageIndex
+        self.pageVmOffset = pageVmOffset
     }
 }
 
@@ -167,19 +292,27 @@ struct NRPTHeader: Equatable {
     }
 }
 
-/// A complete NRPT v1 profile: header identity + canonical page/site tables.
+/// A complete NRPT v2 profile: header identity, target image table and canonical page/site
+/// tables.
 struct NRPTProfile: Equatable {
     var header: NRPTHeader
+    /// Target image table; page records index into this array (v2).
+    var images: [NRPTImage]
     var pages: [NRPTPage]
 
-    init(header: NRPTHeader, pages: [NRPTPage]) {
+    init(header: NRPTHeader, images: [NRPTImage], pages: [NRPTPage]) {
         self.header = header
+        self.images = images
         self.pages = pages
     }
 
     var pageCount: Int { pages.count }
     var siteCount: Int { pages.reduce(0) { $0 + $1.sites.count } }
-    var encodedSize: Int { NRPTFormat.encodedSize(pageCount: pageCount, siteCount: siteCount) }
+    var imageTableSize: Int { images.reduce(0) { $0 + $1.entrySize } }
+    var encodedSize: Int {
+        NRPTFormat.encodedSize(pageCount: pageCount, siteCount: siteCount,
+                               imageTableSize: imageTableSize)
+    }
 }
 
 // MARK: - Errors
@@ -256,6 +389,23 @@ enum ProfileCodecError: Error, Equatable, CustomStringConvertible {
     /// E033: `pageHash` was called with an input that is not exactly 4096 bytes.
     /// This is a codec-helper precondition, not a rule of the wire format.
     case invalidPageSize(actual: Int)
+    /// E034: `imageCount` outside 1...64.
+    case invalidImageCount(Int)
+    /// E035: an image table entry is malformed (kind, reserved byte or pathLength).
+    case invalidImageEntry(imageIndex: Int, reason: String)
+    /// E036: `imageTableSize` differs from the size derived from the entries.
+    case imageTableSizeMismatch(stored: UInt32, derived: UInt32)
+    /// E037: an image path is empty, too long, non-printable or not absolute.
+    case invalidImagePath(imageIndex: Int)
+    /// E038: page metadata is invalid (image index, reserved bytes, empty/invalid segment or
+    /// section name).
+    case invalidPageMetadata(pageIndex: Int)
+    /// E039: two image table entries have the same kind and path.
+    case duplicateImagePath(imageIndex: Int, duplicateOf: Int)
+    /// E040: `pageVmOffset` is not 4 KiB aligned or the page leaves the image extent.
+    case invalidPageVmOffset(pageIndex: Int)
+    /// E041: an image's `imageUnslidVmaddr`/`imageVmSize` geometry is invalid.
+    case invalidImageGeometry(imageIndex: Int)
 
     /// Stable `<E0xx>` diagnostic code from the spec.
     var code: String {
@@ -293,6 +443,14 @@ enum ProfileCodecError: Error, Equatable, CustomStringConvertible {
         case .duplicatePageIdentity: return "E031"
         case .emptyProfile: return "E032"
         case .invalidPageSize: return "E033"
+        case .invalidImageCount: return "E034"
+        case .invalidImageEntry: return "E035"
+        case .imageTableSizeMismatch: return "E036"
+        case .invalidImagePath: return "E037"
+        case .invalidPageMetadata: return "E038"
+        case .duplicateImagePath: return "E039"
+        case .invalidPageVmOffset: return "E040"
+        case .invalidImageGeometry: return "E041"
         }
     }
 
@@ -368,6 +526,22 @@ enum ProfileCodecError: Error, Equatable, CustomStringConvertible {
             return "\(code): profile has no pages"
         case let .invalidPageSize(actual):
             return "\(code): page is \(actual) bytes, expected \(NRPTFormat.pageSize)"
+        case let .invalidImageCount(count):
+            return "\(code): imageCount \(count) outside 1...\(NRPTFormat.maxImages)"
+        case let .invalidImageEntry(imageIndex, reason):
+            return "\(code): image \(imageIndex) entry is invalid: \(reason)"
+        case let .imageTableSizeMismatch(stored, derived):
+            return "\(code): imageTableSize \(stored), derived \(derived)"
+        case let .invalidImagePath(imageIndex):
+            return "\(code): image \(imageIndex) path is invalid"
+        case let .invalidPageMetadata(pageIndex):
+            return "\(code): page \(pageIndex) target-image metadata is invalid"
+        case let .duplicateImagePath(imageIndex, duplicateOf):
+            return "\(code): image \(imageIndex) duplicates image \(duplicateOf) path"
+        case let .invalidPageVmOffset(pageIndex):
+            return "\(code): page \(pageIndex) pageVmOffset is unaligned or outside the image extent"
+        case let .invalidImageGeometry(imageIndex):
+            return "\(code): image \(imageIndex) unslid address/extent is invalid"
         }
     }
 
@@ -456,6 +630,59 @@ enum ProfileCodec {
             throw ProfileCodecError.siteCountOutOfRange(totalSites)
         }
         guard totalSites >= 1 else { throw ProfileCodecError.siteCountOutOfRange(0) }
+
+        // Target image table (v2).
+        guard !profile.images.isEmpty, profile.images.count <= NRPTFormat.maxImages else {
+            throw ProfileCodecError.invalidImageCount(profile.images.count)
+        }
+        for (imageIndex, image) in profile.images.enumerated() {
+            let pathBytes = image.pathBytes
+            guard pathBytes.count >= 1, pathBytes.count <= NRPTFormat.maxImagePathLength,
+                  pathBytes.allSatisfy(isAllowedImagePathByte),
+                  pathBytes.first == UInt8(ascii: "/") else {
+                throw ProfileCodecError.invalidImagePath(imageIndex: imageIndex)
+            }
+            guard image.vmSize > 0, image.vmSize <= 0xFFFF_F000 else {
+                throw ProfileCodecError.invalidImageGeometry(imageIndex: imageIndex)
+            }
+            switch image.kind {
+            case .dyldSharedCache:
+                guard image.unslidVMAddress != 0 else {
+                    throw ProfileCodecError.invalidImageGeometry(imageIndex: imageIndex)
+                }
+            case .standaloneFile:
+                break
+            }
+            guard !image.segmentNames.isEmpty,
+                  image.segmentNames.count <= NRPTFormat.maxSegmentsPerImage,
+                  image.sectionNames.count <= NRPTFormat.maxSectionsPerImage else {
+                throw ProfileCodecError.invalidImageGeometry(imageIndex: imageIndex)
+            }
+            var seenNames: Set<String> = []
+            for name in image.segmentNames {
+                guard isValidImageName(name, capacity: NRPTFormat.segmentNameSize),
+                      seenNames.insert(name).inserted else {
+                    throw ProfileCodecError.invalidImageGeometry(imageIndex: imageIndex)
+                }
+            }
+            seenNames.removeAll()
+            for name in image.sectionNames {
+                guard isValidImageName(name, capacity: NRPTFormat.sectionNameSize),
+                      seenNames.insert(name).inserted else {
+                    throw ProfileCodecError.invalidImageGeometry(imageIndex: imageIndex)
+                }
+            }
+            for otherIndex in 0 ..< imageIndex {
+                let other = profile.images[otherIndex]
+                guard other.kind == image.kind, other.path == image.path else { continue }
+                throw ProfileCodecError.duplicateImagePath(imageIndex: imageIndex,
+                                                           duplicateOf: otherIndex)
+            }
+        }
+        let imageTableSize = profile.imageTableSize
+        guard imageTableSize <= NRPTFormat.maxImageTableSize else {
+            throw ProfileCodecError.invalidImageCount(profile.images.count)
+        }
         guard profile.encodedSize <= NRPTFormat.maxProfileSize else {
             throw ProfileCodecError.profileTooLarge(profile.encodedSize)
         }
@@ -475,6 +702,14 @@ enum ProfileCodec {
             guard page.matchFlags.isSuperset(of: .requiredV1) else {
                 throw ProfileCodecError.requiredPageMatchFlagMissing(pageIndex: pageIndex,
                                                                      flags: rawMatchFlags)
+            }
+            guard Int(page.imageIndex) < profile.images.count else {
+                throw ProfileCodecError.invalidPageMetadata(pageIndex: pageIndex)
+            }
+            let targetImage = profile.images[Int(page.imageIndex)]
+            guard page.pageVmOffset & 0x0FFF == 0,
+                  UInt64(page.pageVmOffset) + UInt64(NRPTFormat.pageSize) <= UInt64(targetImage.vmSize) else {
+                throw ProfileCodecError.invalidPageVmOffset(pageIndex: pageIndex)
             }
             guard page.sites.count >= 1, page.sites.count <= NRPTFormat.maxSitesPerPage else {
                 throw ProfileCodecError.sitesPerPageExceeded(pageIndex: pageIndex,
@@ -534,6 +769,7 @@ enum ProfileCodec {
             globalSiteIndex += page.sites.count
         }
         assert(globalSiteIndex == totalSites)
+        assert(imageTableSize >= profile.images.count * NRPTFormat.imageEntryHeaderSize)
 
         // Identity uniqueness (spec §6 rule 5).
         for pageIndex in 0 ..< profile.pages.count {
@@ -549,6 +785,18 @@ enum ProfileCodec {
                 }
             }
         }
+    }
+
+    /// Image paths use printable ASCII only; the leading '/' is checked separately.
+    private static func isAllowedImagePathByte(_ byte: UInt8) -> Bool {
+        byte >= 0x20 && byte <= 0x7E
+    }
+
+    /// A fixed-width NUL-padded segment/section name: 1...capacity printable ASCII bytes.
+    private static func isValidImageName(_ name: String, capacity: Int) -> Bool {
+        let bytes = Array(name.utf8)
+        guard bytes.count >= 1, bytes.count < capacity else { return false }
+        return bytes.allSatisfy { $0 >= 0x20 && $0 <= 0x7E }
     }
 
     /// Validates header identity fields (shared by encode, decode and caller-side checks).
@@ -596,7 +844,7 @@ enum ProfileCodec {
 
     // MARK: Encode
 
-    /// Serializes a valid profile into canonical NRPT v1 bytes.
+    /// Serializes a valid profile into canonical NRPT v2 bytes.
     /// Throws a ProfileCodecError and produces no bytes if any model rule is violated.
     static func encode(_ profile: NRPTProfile) throws -> Data {
         try validate(profile)
@@ -613,6 +861,9 @@ enum ProfileCodec {
             appendLE(UInt32(firstSite), to: &pageTable)
             appendLE(UInt16(page.sites.count), to: &pageTable)
             appendLE(page.matchFlags.rawValue, to: &pageTable)
+            appendLE(page.imageIndex, to: &pageTable)
+            appendLE(UInt16(0), to: &pageTable) // reserved
+            appendLE(page.pageVmOffset, to: &pageTable)
             firstSite += page.sites.count
 
             for site in page.sites {
@@ -625,7 +876,37 @@ enum ProfileCodec {
             }
         }
 
-        let checksum = payloadChecksum(pageTable: pageTable, siteTable: siteTable)
+        var imageTable = Data()
+        imageTable.reserveCapacity(profile.imageTableSize)
+        for image in profile.images {
+            let pathBytes = image.pathBytes
+            let entrySize = image.entrySize
+            imageTable.append(image.kind.rawValue)
+            imageTable.append(NRPTFormat.ImageEntry.flagSuffixMatch)
+            appendLE(UInt16(pathBytes.count), to: &imageTable)
+            appendLE(image.unslidVMAddress, to: &imageTable)
+            appendLE(image.vmSize, to: &imageTable)
+            imageTable.append(UInt8(image.segmentNames.count))
+            imageTable.append(UInt8(image.sectionNames.count))
+            appendLE(UInt16(0), to: &imageTable) // reserved
+            imageTable.append(contentsOf: pathBytes)
+            let pathFieldSize = NRPTFormat.roundUp4(pathBytes.count + 1)
+            imageTable.append(contentsOf: [UInt8](repeating: 0, count: pathFieldSize - pathBytes.count))
+            for name in image.segmentNames {
+                appendFixedName(name, capacity: NRPTFormat.segmentNameSize, to: &imageTable)
+            }
+            for name in image.sectionNames {
+                appendFixedName(name, capacity: NRPTFormat.sectionNameSize, to: &imageTable)
+            }
+            assert(imageTable.count % 4 == 0)
+            assert(imageTable.count >= entrySize)
+        }
+
+        var payload = Data()
+        payload.append(pageTable)
+        payload.append(siteTable)
+        payload.append(imageTable)
+        let checksum = payloadChecksum(payload)
 
         var buildField = [UInt8](repeating: 0, count: NRPTFormat.buildFieldSize)
         let buildBytes = Array(profile.header.build.utf8)
@@ -634,8 +915,7 @@ enum ProfileCodec {
         }
 
         var output = Data()
-        output.reserveCapacity(NRPTFormat.encodedSize(pageCount: profile.pageCount,
-                                                      siteCount: profile.siteCount))
+        output.reserveCapacity(profile.encodedSize)
         output.append(contentsOf: NRPTFormat.magic)
         appendLE(NRPTFormat.version, to: &output)
         appendLE(UInt16(NRPTFormat.headerSize), to: &output)
@@ -648,17 +928,29 @@ enum ProfileCodec {
         appendLE(UInt32(siteTable.count), to: &output)
         appendLE(checksum, to: &output)
         appendLE(profile.header.flags.rawValue, to: &output)
+        appendLE(UInt16(profile.images.count), to: &output)
+        appendLE(UInt32(imageTable.count), to: &output)
         output.append(contentsOf: [UInt8](repeating: 0, count: NRPTFormat.Header.reservedSize))
         output.append(pageTable)
         output.append(siteTable)
+        output.append(imageTable)
 
         assert(output.count == profile.encodedSize)
         return output
     }
 
+    /// Appends a fixed-width NUL-padded segment/section name.
+    private static func appendFixedName(_ name: String, capacity: Int, to data: inout Data) {
+        let bytes = Array(name.utf8)
+        data.append(contentsOf: bytes)
+        if bytes.count < capacity {
+            data.append(contentsOf: [UInt8](repeating: 0, count: capacity - bytes.count))
+        }
+    }
+
     // MARK: Decode
 
-    /// Parses and validates a complete NRPT v1 byte string.
+    /// Parses and validates a complete NRPT v2 byte string.
     /// Throws a ProfileCodecError on the first violation; never returns a partial profile.
     static func decode(_ data: Data) throws -> NRPTProfile {
         let bytes = [UInt8](data)
@@ -719,6 +1011,7 @@ enum ProfileCodec {
         // Counts and table sizes.
         let pageCount = Int(leU16(bytes, NRPTFormat.Header.pageCount))
         let siteCount = Int(leU16(bytes, NRPTFormat.Header.siteCount))
+        let imageCount = Int(leU16(bytes, NRPTFormat.Header.imageCount))
         guard pageCount >= 1 else { throw ProfileCodecError.emptyProfile }
         guard pageCount <= NRPTFormat.maxPages else {
             throw ProfileCodecError.pageCountOutOfRange(pageCount)
@@ -727,8 +1020,18 @@ enum ProfileCodec {
         guard siteCount <= NRPTFormat.maxSites else {
             throw ProfileCodecError.siteCountOutOfRange(siteCount)
         }
+        guard imageCount >= 1, imageCount <= NRPTFormat.maxImages else {
+            throw ProfileCodecError.invalidImageCount(imageCount)
+        }
+        let storedImageTableSize = Int(leU32(bytes, NRPTFormat.Header.imageTableSize))
+        guard storedImageTableSize >= imageCount * NRPTFormat.imageEntryHeaderSize,
+              storedImageTableSize <= NRPTFormat.maxImageTableSize else {
+            throw ProfileCodecError.invalidImageEntry(imageIndex: 0,
+                                                      reason: "implausible image table size")
+        }
 
-        let encodedSize = NRPTFormat.encodedSize(pageCount: pageCount, siteCount: siteCount)
+        let encodedSize = NRPTFormat.encodedSize(pageCount: pageCount, siteCount: siteCount,
+                                                 imageTableSize: storedImageTableSize)
         guard encodedSize <= NRPTFormat.maxProfileSize else {
             throw ProfileCodecError.profileTooLarge(encodedSize)
         }
@@ -749,7 +1052,7 @@ enum ProfileCodec {
             throw ProfileCodecError.totalSizeMismatch(declared: encodedSize, actual: bytes.count)
         }
 
-        // Payload checksum covers the page table followed by the site table.
+        // Payload checksum covers the page table, the site table and the image table.
         let payload = Data(bytes[NRPTFormat.headerSize...])
         let storedChecksum = leU32(bytes, NRPTFormat.Header.payloadChecksum)
         let computedChecksum = payloadChecksum(payload)
@@ -760,17 +1063,115 @@ enum ProfileCodec {
 
         let pageTableBase = NRPTFormat.headerSize
         let siteTableBase = pageTableBase + Int(storedPageTableSize)
+        let imageTableBase = siteTableBase + Int(storedSiteTableSize)
+
+        // Image table (v2).
+        var images: [NRPTImage] = []
+        images.reserveCapacity(imageCount)
+        var imageCursor = imageTableBase
+        for imageIndex in 0 ..< imageCount {
+            guard imageCursor + NRPTFormat.ImageEntry.headerSize <= bytes.count else {
+                throw ProfileCodecError.invalidImageEntry(imageIndex: imageIndex,
+                                                          reason: "truncated header")
+            }
+            let kindByte = bytes[imageCursor + NRPTFormat.ImageEntry.kind]
+            let flagsByte = bytes[imageCursor + NRPTFormat.ImageEntry.flags]
+            let pathLength = Int(leU16(bytes, imageCursor + NRPTFormat.ImageEntry.pathLength))
+            let unslidVmaddr = leU64(bytes, imageCursor + NRPTFormat.ImageEntry.imageUnslidVmaddr)
+            let imageVmSize = leU32(bytes, imageCursor + NRPTFormat.ImageEntry.imageVmSize)
+            let segmentCount = Int(bytes[imageCursor + NRPTFormat.ImageEntry.segmentCount])
+            let sectionCount = Int(bytes[imageCursor + NRPTFormat.ImageEntry.sectionCount])
+            let reservedImage = leU16(bytes, imageCursor + NRPTFormat.ImageEntry.reserved)
+            guard reservedImage == 0 else {
+                throw ProfileCodecError.invalidImageEntry(imageIndex: imageIndex,
+                                                          reason: "reserved bytes set")
+            }
+            guard flagsByte & ~NRPTFormat.ImageEntry.allKnownFlags == 0,
+                  flagsByte & NRPTFormat.ImageEntry.flagSuffixMatch != 0 else {
+                throw ProfileCodecError.invalidImageEntry(imageIndex: imageIndex,
+                                                          reason: "invalid flags \(flagsByte)")
+            }
+            guard let kind = NRPTImageKind(rawValue: kindByte) else {
+                throw ProfileCodecError.invalidImageEntry(imageIndex: imageIndex,
+                                                          reason: "unknown image kind \(kindByte)")
+            }
+            guard pathLength >= 1, pathLength <= NRPTFormat.maxImagePathLength,
+                  segmentCount >= 1, segmentCount <= NRPTFormat.maxSegmentsPerImage,
+                  sectionCount >= 0, sectionCount <= NRPTFormat.maxSectionsPerImage else {
+                throw ProfileCodecError.invalidImageEntry(imageIndex: imageIndex,
+                                                          reason: "invalid path/name counts")
+            }
+            let entrySize = NRPTFormat.imageEntrySize(pathLength: pathLength,
+                                                      segmentCount: segmentCount,
+                                                      sectionCount: sectionCount)
+            guard imageCursor + entrySize <= bytes.count else {
+                throw ProfileCodecError.invalidImageEntry(imageIndex: imageIndex,
+                                                          reason: "entry exceeds profile")
+            }
+            let pathBase = imageCursor + NRPTFormat.ImageEntry.headerSize
+            let pathFieldSize = NRPTFormat.roundUp4(pathLength + 1)
+            let pathBytes = Array(bytes[pathBase ..< pathBase + pathLength])
+            let terminator = bytes[pathBase + pathLength]
+            let trailing = bytes[(pathBase + pathLength + 1) ..< (pathBase + pathFieldSize)]
+            guard terminator == 0, trailing.allSatisfy({ $0 == 0 }) else {
+                throw ProfileCodecError.invalidImageEntry(imageIndex: imageIndex,
+                                                          reason: "path not NUL padded")
+            }
+            guard pathBytes.first == UInt8(ascii: "/"),
+                  pathBytes.allSatisfy(isAllowedImagePathByte) else {
+                throw ProfileCodecError.invalidImagePath(imageIndex: imageIndex)
+            }
+            let path = String(decoding: pathBytes, as: UTF8.self)
+            guard !path.isEmpty else {
+                throw ProfileCodecError.invalidImagePath(imageIndex: imageIndex)
+            }
+            var nameCursor = pathBase + pathFieldSize
+            var segmentNames: [String] = []
+            segmentNames.reserveCapacity(segmentCount)
+            for _ in 0 ..< segmentCount {
+                segmentNames.append(try decodeFixedName(bytes, nameCursor,
+                                                        capacity: NRPTFormat.segmentNameSize,
+                                                        pageIndex: -1))
+                nameCursor += NRPTFormat.segmentNameSize
+            }
+            var sectionNames: [String] = []
+            sectionNames.reserveCapacity(sectionCount)
+            for _ in 0 ..< sectionCount {
+                sectionNames.append(try decodeFixedName(bytes, nameCursor,
+                                                        capacity: NRPTFormat.sectionNameSize,
+                                                        pageIndex: -1))
+                nameCursor += NRPTFormat.sectionNameSize
+            }
+            guard imageVmSize > 0, imageVmSize <= 0xFFFF_F000,
+                  kind != .dyldSharedCache || unslidVmaddr != 0 else {
+                throw ProfileCodecError.invalidImageGeometry(imageIndex: imageIndex)
+            }
+            for (otherIndex, other) in images.enumerated()
+                where other.kind == kind && other.path == path {
+                throw ProfileCodecError.duplicateImagePath(imageIndex: imageIndex,
+                                                           duplicateOf: otherIndex)
+            }
+            images.append(NRPTImage(kind: kind, path: path, unslidVMAddress: unslidVmaddr,
+                                    vmSize: imageVmSize, segmentNames: segmentNames,
+                                    sectionNames: sectionNames))
+            imageCursor += entrySize
+        }
+        let derivedImageTableSize = imageCursor - imageTableBase
+        guard derivedImageTableSize == storedImageTableSize else {
+            throw ProfileCodecError.imageTableSizeMismatch(stored: UInt32(storedImageTableSize),
+                                                           derived: UInt32(derivedImageTableSize))
+        }
 
         var pages: [NRPTPage] = []
         pages.reserveCapacity(pageCount)
         var runningFirstSite = 0
         for pageIndex in 0 ..< pageCount {
             let recordBase = pageTableBase + pageIndex * NRPTFormat.pageRecordSize
-            let pageFileOffset = leU64(bytes, recordBase)
-            let pageHash = leU64(bytes, recordBase + 8)
-            let firstSite = leU32(bytes, recordBase + 16)
-            let pageSites = Int(leU16(bytes, recordBase + 20))
-            let matchFlagsRaw = leU16(bytes, recordBase + 22)
+            let pageFileOffset = leU64(bytes, recordBase + NRPTFormat.PageRecord.pageFileOffset)
+            let pageHash = leU64(bytes, recordBase + NRPTFormat.PageRecord.pageHash)
+            let firstSite = leU32(bytes, recordBase + NRPTFormat.PageRecord.firstSite)
+            let pageSites = Int(leU16(bytes, recordBase + NRPTFormat.PageRecord.siteCount))
+            let matchFlagsRaw = leU16(bytes, recordBase + NRPTFormat.PageRecord.matchFlags)
 
             guard pageFileOffset & 0x0FFF == 0 else {
                 throw ProfileCodecError.pageOffsetMisaligned(pageIndex: pageIndex,
@@ -800,6 +1201,22 @@ enum ProfileCodec {
                                                              firstSite: firstSite,
                                                              siteCount: pageSites,
                                                              headerSiteCount: siteCount)
+            }
+
+            // Target-image metadata (v2).
+            let imageIndex = leU16(bytes, recordBase + NRPTFormat.PageRecord.imageIndex)
+            let reservedPageBytes = leU16(bytes, recordBase + NRPTFormat.PageRecord.reserved)
+            let pageVmOffset = leU32(bytes, recordBase + NRPTFormat.PageRecord.pageVmOffset)
+            guard reservedPageBytes == 0 else {
+                throw ProfileCodecError.invalidPageMetadata(pageIndex: pageIndex)
+            }
+            guard Int(imageIndex) < imageCount else {
+                throw ProfileCodecError.invalidPageMetadata(pageIndex: pageIndex)
+            }
+            let targetImage = images[Int(imageIndex)]
+            guard pageVmOffset & 0x0FFF == 0,
+                  UInt64(pageVmOffset) + UInt64(NRPTFormat.pageSize) <= UInt64(targetImage.vmSize) else {
+                throw ProfileCodecError.invalidPageVmOffset(pageIndex: pageIndex)
             }
 
             var sites: [NRPTSite] = []
@@ -854,7 +1271,9 @@ enum ProfileCodec {
             }
 
             pages.append(NRPTPage(pageFileOffset: pageFileOffset, pageHash: pageHash,
-                                  matchFlags: matchFlags, sites: sites))
+                                  matchFlags: matchFlags, sites: sites,
+                                  imageIndex: imageIndex,
+                                  pageVmOffset: pageVmOffset))
             runningFirstSite += pageSites
         }
         guard runningFirstSite == siteCount else {
@@ -865,12 +1284,40 @@ enum ProfileCodec {
         let profile = NRPTProfile(
             header: NRPTHeader(build: build, apuMask: apuMask, deviceID: deviceID,
                                flags: headerFlags),
+            images: images,
             pages: pages)
 
         // Re-run the model validation as a single source of truth for the remaining rules
-        // (site overlap, identity uniqueness, empty profile, limits).
+        // (site overlap, identity uniqueness, empty profile, limits, metadata bounds).
         try validate(profile)
         return profile
+    }
+
+    /// Decodes a fixed-width NUL-padded segment/section name. `imageIndex` and `pageIndex`
+    /// select the error context: image-table names pass `pageIndex = -1` and use
+    /// `imageIndex`, page-level names are no longer stored on the wire in v2.
+    private static func decodeFixedName(_ bytes: [UInt8], _ offset: Int, capacity: Int,
+                                        imageIndex: Int = -1, pageIndex: Int = -1) throws -> String {
+        func contextError() -> ProfileCodecError {
+            pageIndex >= 0
+                ? ProfileCodecError.invalidPageMetadata(pageIndex: pageIndex)
+                : ProfileCodecError.invalidImageEntry(imageIndex: max(imageIndex, 0),
+                                                      reason: "invalid name table")
+        }
+        guard offset + capacity <= bytes.count else {
+            throw contextError()
+        }
+        let field = bytes[offset ..< offset + capacity]
+        guard let terminator = field.firstIndex(of: 0) else {
+            throw contextError()
+        }
+        let nameBytes = Array(field[..<terminator])
+        guard !nameBytes.isEmpty, nameBytes.count < capacity,
+              nameBytes.allSatisfy({ $0 >= 0x20 && $0 <= 0x7E }),
+              field[terminator...].allSatisfy({ $0 == 0 }) else {
+            throw contextError()
+        }
+        return String(decoding: nameBytes, as: UTF8.self)
     }
 
     // MARK: Pure page simulation

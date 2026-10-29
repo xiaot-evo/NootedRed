@@ -336,7 +336,8 @@ class StructuralTests(ValidatorTestCase):
         self.expect_decode_code(self.mutate(self.profile_bytes, {0: b"NRPX"}), "E002")
 
     def test_e003_unsupported_version(self) -> None:
-        self.expect_decode_code(self.mutate(self.profile_bytes, {4: V._p16(2)}), "E003")
+        # v2 is supported now; an unknown version must still be rejected as E003.
+        self.expect_decode_code(self.mutate(self.profile_bytes, {4: V._p16(3)}), "E003")
 
     def test_e004_invalid_header_size(self) -> None:
         self.expect_decode_code(self.mutate(self.profile_bytes, {6: V._p16(63)}), "E004")
@@ -1193,13 +1194,342 @@ class CrossEngineGoldenTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# NRPT v2: synthetic image builders, codec/structural tests, metadata re-resolution
+# ---------------------------------------------------------------------------
+
+
+def encode_macho(segments: list[dict]) -> bytes:
+    """Build a minimal 64-bit Mach-O with LC_SEGMENT_64 commands (synthetic fixture data)."""
+    commands = bytearray()
+    for segment in segments:
+        sections = segment.get("sections", [])
+        command_size = 72 + len(sections) * 80
+        commands += (0x19).to_bytes(4, "little") + command_size.to_bytes(4, "little")
+        commands += segment["name"].encode().ljust(16, b"\x00")
+        commands += segment["vmaddr"].to_bytes(8, "little") + segment["vmsize"].to_bytes(8, "little")
+        commands += segment.get("fileoff", 0).to_bytes(8, "little")
+        commands += segment.get("filesize", segment["vmsize"]).to_bytes(8, "little")
+        commands += b"\x00" * 8  # maxprot/initprot
+        commands += len(sections).to_bytes(4, "little") + b"\x00" * 4
+        for section in sections:
+            commands += section["name"].encode().ljust(16, b"\x00")
+            commands += segment["name"].encode().ljust(16, b"\x00")
+            commands += section["addr"].to_bytes(8, "little") + section["size"].to_bytes(8, "little")
+            commands += section.get("offset", 0).to_bytes(4, "little") + b"\x00" * 28
+        assert len(commands) >= command_size
+    header = bytearray()
+    header += (0xFEEDFACF).to_bytes(4, "little")
+    header += (0x01000007).to_bytes(4, "little")  # CPU_TYPE_X86_64
+    header += (3).to_bytes(4, "little")  # CPU_SUBTYPE_X86_64_ALL
+    header += (6).to_bytes(4, "little")  # MH_DYLIB
+    header += len(segments).to_bytes(4, "little")
+    header += len(commands).to_bytes(4, "little")
+    header += b"\x00" * 8  # flags + reserved (mach_header_64 is 32 bytes)
+    return bytes(header + commands)
+
+
+GL_FIXTURE_REL = "System/Library/Extensions/AMDRadeonX5000GLDriver.bundle/Contents/MacOS/AMDRadeonX5000GLDriver"
+MTL_FIXTURE_REL = "System/Library/Extensions/AMDRadeonX5000MTLDriver.bundle/Contents/MacOS/AMDRadeonX5000MTLDriver"
+CACHE_FIXTURE_REL = "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h"
+
+
+def build_synthetic_v2_fixture(root: str) -> tuple[V.Profile, bytes]:
+    """Create a clean fixture (one standalone Mach-O + one dyld-cache image) and its v2 profile."""
+    gl_page = deterministic_page(b"synthetic-v2-gl-page")
+    mtl_page = deterministic_page(b"synthetic-v2-mtl-page")
+    gl_macho = encode_macho(
+        [
+            {"name": "__TEXT", "vmaddr": 0, "vmsize": 0x4000, "fileoff": 0,
+             "sections": [{"name": "__text", "addr": 0, "size": 0x4000, "offset": 0}]},
+            {"name": "__LINKEDIT", "vmaddr": 0x4000, "vmsize": 0x1000, "fileoff": 0x4000,
+             "sections": []},
+        ]
+    )
+    gl_file = bytearray(0x4000)
+    gl_file[0 : len(gl_macho)] = gl_macho
+    gl_file[0x1000 : 0x2000] = gl_page
+    write_fixture(root, {GL_FIXTURE_REL: bytes(gl_file)})
+
+    cache_path = "/System/Library/Extensions/AMDRadeonX5000MTLDriver.bundle/Contents/MacOS/" \
+                 "AMDRadeonX5000MTLDriver"
+    cache = bytearray(0x4000)
+    cache[0:16] = b"dyld_v1 x86_64h\x00"
+    cache[0x10:0x14] = (0x228).to_bytes(4, "little")
+    cache[0x14:0x18] = (1).to_bytes(4, "little")
+    cache[0x228:0x230] = (0x7FFB00000000).to_bytes(8, "little")
+    cache[0x230:0x238] = (0x4000).to_bytes(8, "little")
+    cache[0x238:0x240] = (0).to_bytes(8, "little")
+    cache[0x88:0x90] = (0x300).to_bytes(8, "little")
+    cache[0x90:0x98] = (1).to_bytes(8, "little")
+    image_text_array = bytearray(32)
+    image_text_array[16:24] = (0x7FFB00001000).to_bytes(8, "little")
+    image_text_array[24:28] = (0x2000).to_bytes(4, "little")
+    image_text_array[28:32] = (0x320).to_bytes(4, "little")
+    cache[0x300:0x320] = image_text_array
+    encoded_path = cache_path.encode()
+    cache[0x320 : 0x320 + len(encoded_path)] = encoded_path
+    cache_macho = encode_macho(
+        [{"name": "__TEXT", "vmaddr": 0x7FFB00001000, "vmsize": 0x2000, "fileoff": 0x1000,
+          "sections": [{"name": "__text", "addr": 0x7FFB00001000, "size": 0x2000, "offset": 0x1000}]}]
+    )
+    cache[0x1000 : 0x1000 + len(cache_macho)] = cache_macho
+    cache[0x2000:0x3000] = mtl_page
+    write_fixture(root, {CACHE_FIXTURE_REL: bytes(cache)})
+
+    images = [
+        V.Image(kind=V.IMAGE_KIND_STANDALONE, path="/" + GL_FIXTURE_REL, unslid_vmaddr=0,
+                vm_size=0x4000, segments=["__TEXT", "__LINKEDIT"], sections=["__text"]),
+        V.Image(kind=V.IMAGE_KIND_SHARED_CACHE, path=cache_path, unslid_vmaddr=0x7FFB00001000,
+                vm_size=0x2000, segments=["__TEXT"], sections=["__text"]),
+    ]
+    pages = [
+        V.Page(page_file_offset=0x1000, page_hash=V.fnv1a64(gl_page),
+               match_flags=V.DEFAULT_MATCH_FLAGS,
+               sites=[make_site(gl_page, 0x100, 6)], image_index=0, page_vm_offset=0x1000),
+        V.Page(page_file_offset=0x2000, page_hash=V.fnv1a64(mtl_page),
+               match_flags=V.DEFAULT_MATCH_FLAGS,
+               sites=[make_site(mtl_page, 0x200, 3)], image_index=1, page_vm_offset=0x1000),
+    ]
+    profile = V.Profile(
+        header=V.Header(build="24H232", apu_mask=0x28, device_id=0, version=V.VERSION_V2),
+        pages=pages, version=V.VERSION_V2, images=images,
+    )
+    return profile, V.encode(profile)
+
+
+def v2_structural_model() -> V.Profile:
+    """Small valid v2 profile with short synthetic paths (structural/E-code tests)."""
+    site = V.Site(0x100, b"\x01\x02\x03\x04", b"\x01\x02\x03\x05")
+    images = [
+        V.Image(kind=V.IMAGE_KIND_STANDALONE, path="/A", unslid_vmaddr=0, vm_size=0x2000,
+                segments=["__TEXT"], sections=["__text"]),
+        V.Image(kind=V.IMAGE_KIND_STANDALONE, path="/B", unslid_vmaddr=0, vm_size=0x2000,
+                segments=["__TEXT"], sections=["__text"]),
+    ]
+    pages = [
+        V.Page(page_file_offset=0x1000, page_hash=0x1111, match_flags=V.DEFAULT_MATCH_FLAGS,
+               sites=[V.Site(0x100, b"\x11\x12", b"\x11\x13")], image_index=0, page_vm_offset=0x1000),
+        V.Page(page_file_offset=0x3000, page_hash=0x2222, match_flags=V.DEFAULT_MATCH_FLAGS,
+               sites=[V.Site(0x200, b"\x21\x22", b"\x21\x23")], image_index=1, page_vm_offset=0x1000),
+    ]
+    return V.Profile(
+        header=V.Header(build="24H232", apu_mask=0x28, device_id=0, version=V.VERSION_V2),
+        pages=pages, version=V.VERSION_V2, images=images,
+    )
+
+
+class V2CodecTests(unittest.TestCase):
+    def test_v2_round_trip_and_size(self) -> None:
+        model = v2_structural_model()
+        data = V.encode(model)
+        self.assertEqual(len(data), 64 + 2 * 32 + 2 * 40 + model.image_table_size)
+        self.assertEqual(V.decode(data), model)
+        self.assertEqual(V.encode(V.decode(data)), data)
+        self.assertEqual(V.encode(model), data)
+        self.assertEqual(data[4:6], (2).to_bytes(2, "little"))
+
+    def test_v1_and_v2_are_distinct(self) -> None:
+        v1 = V.encode(base_profile())
+        self.assertEqual(V.decode(v1).version, V.VERSION_V1)
+        v2 = V.encode(v2_structural_model())
+        self.assertEqual(V.decode(v2).version, V.VERSION_V2)
+        self.assertNotEqual(len(v1), len(v2))
+
+    def test_v2_image_table_model_limits(self) -> None:
+        model = v2_structural_model()
+        model.images[0].flags = 0
+        with self.assertRaises(V.NRPTCodecError) as context:
+            V.encode(model)
+        self.assertEqual(context.exception.code, "E035")
+
+
+class V2StructuralTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.model = v2_structural_model()
+        cls.base = V.encode(cls.model)
+        cls.page_table_base = 64
+        cls.image_table_base = 64 + 2 * 32 + 2 * 40
+        cls.image1_base = cls.image_table_base + cls.model.images[0].entry_size
+
+    def mutate(self, changes: dict[int, bytes], *, append: bytes = b"", fix_checksum: bool = True) -> bytes:
+        data = bytearray(self.base + append)
+        for offset, replacement in changes.items():
+            data[offset : offset + len(replacement)] = replacement
+        if fix_checksum:
+            data[44:48] = V._p32(V.fnv1a32(bytes(data[64:])))
+        return bytes(data)
+
+    def expect_code(self, data: bytes, code: str) -> None:
+        COVERED_CODES.add(code)
+        with self.assertRaises(V.NRPTCodecError) as context:
+            V.decode(data)
+        self.assertEqual(context.exception.code, code, f"expected {code}, got {context.exception}")
+
+    def test_e034_invalid_image_count(self) -> None:
+        self.expect_code(self.mutate({52: V._p16(0)}), "E034")
+
+    def test_e035_invalid_image_entry(self) -> None:
+        self.expect_code(self.mutate({self.image_table_base + 1: b"\x00"}), "E035")
+
+    def test_e036_image_table_size_mismatch(self) -> None:
+        self.expect_code(
+            self.mutate({54: V._p32(self.model.image_table_size + 4)}, append=b"\x00\x00\x00\x00"),
+            "E036",
+        )
+
+    def test_e037_invalid_image_path(self) -> None:
+        self.expect_code(self.mutate({self.image_table_base + 20: b"X"}), "E037")
+
+    def test_e038_invalid_page_metadata(self) -> None:
+        self.expect_code(self.mutate({self.page_table_base + 24: V._p16(2)}), "E038")
+        self.expect_code(self.mutate({self.page_table_base + 26: V._p16(1)}), "E038")
+
+    def test_e039_duplicate_image_path(self) -> None:
+        path_offset = self.image1_base + 20
+        self.expect_code(self.mutate({path_offset: b"/A"}), "E039")
+
+    def test_e040_invalid_page_vm_offset(self) -> None:
+        self.expect_code(self.mutate({self.page_table_base + 28: V._p32(0x1001)}), "E040")
+
+    def test_e041_invalid_image_geometry(self) -> None:
+        self.expect_code(self.mutate({self.image_table_base + 12: V._p32(0)}), "E041")
+
+
+class V2MetadataTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmpdir = tempfile.TemporaryDirectory(prefix="nrpt-v2-fixture-")
+        cls.root = cls._tmpdir.name
+        cls.profile, cls.profile_bytes = build_synthetic_v2_fixture(cls.root)
+        cls.images = V.discover_images(cls.root)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmpdir.cleanup()
+
+    def validate(self, profile: V.Profile, *, expected_build: str = "24H232") -> dict:
+        return V.validate_profile_against_fixture(
+            profile,
+            self.images,
+            profile_path="synthetic-v2.nrpt",
+            profile_bytes=V.encode(profile),
+            fixture_root=self.root,
+            expected_build=expected_build,
+            device_id=0x1638,
+        )
+
+    def test_metadata_re_resolution_pass(self) -> None:
+        report = self.validate(self.profile)
+        self.assertEqual(report["result"], "PASS")
+        self.assertEqual(report["profile"]["version"], 2)
+        self.assertEqual(len(report["images"]), 2)
+        self.assertTrue(all(image["verified"] for image in report["images"]))
+        for page in report["pages"]:
+            metadata = page["metadata"]
+            self.assertTrue(metadata["verified"])
+            image_unslid = next(
+                image["unslidVmaddr"] for image in report["images"]
+                if image["index"] == metadata["imageIndex"]
+            )
+            self.assertEqual(
+                int(metadata["pageStart"], 16),
+                int(image_unslid, 16) + int(metadata["pageVmOffset"], 16),
+            )
+        gl_page = report["pages"][0]["metadata"]
+        self.assertEqual(gl_page["namespace"], "standalone-file-offset")
+        self.assertEqual(gl_page["segment"], "__TEXT")
+        self.assertEqual(gl_page["section"], "__text")
+        self.assertEqual(int(gl_page["fileOffset"], 16), 0x1000)
+        mtl_page = report["pages"][1]["metadata"]
+        self.assertEqual(mtl_page["namespace"], "subcache-file-offset")
+        self.assertTrue(mtl_page["file"].endswith("dyld_shared_cache_x86_64h"))
+        self.assertEqual(report["summary"]["appliedPages"], 2)
+
+    def test_metadata_wrong_page_vm_offset_rejected(self) -> None:
+        model = V.decode(V.encode(self.profile))
+        model.pages[0].page_vm_offset = 0x2000
+        with self.assertRaises(V.ValidationFailure) as context:
+            self.validate(model)
+        self.assertIn("E040", str(context.exception))
+
+    def test_metadata_wrong_page_hash_rejected(self) -> None:
+        model = V.decode(V.encode(self.profile))
+        model.pages[0].page_hash ^= 0xFFFFFFFFFFFFFFFF
+        with self.assertRaises(V.ValidationFailure) as context:
+            self.validate(model)
+        self.assertIn("E040", str(context.exception))
+
+    def test_metadata_missing_image_path_rejected(self) -> None:
+        model = V.decode(V.encode(self.profile))
+        model.images[0].path = "/System/Library/Extensions/AMDRadeonX5000GLDriver.bundle/Contents/MacOS/Missing"
+        with self.assertRaises(V.ValidationFailure) as context:
+            self.validate(model)
+        self.assertIn("E037", str(context.exception))
+
+    def test_metadata_bogus_segment_rejected(self) -> None:
+        model = V.decode(V.encode(self.profile))
+        model.images[0].segments = ["__TEXT", "__LINKEDIT", "__BOGUS"]
+        with self.assertRaises(V.ValidationFailure) as context:
+            self.validate(model)
+        self.assertIn("E041", str(context.exception))
+
+    def test_metadata_vm_size_mismatch_rejected(self) -> None:
+        model = V.decode(V.encode(self.profile))
+        model.images[0].vm_size = 0x3000
+        with self.assertRaises(V.ValidationFailure) as context:
+            self.validate(model)
+        self.assertIn("E041", str(context.exception))
+
+
+class GoldenV2ParityTests(unittest.TestCase):
+    GOLDEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden",
+                               "synthetic-2page-v2.nrpt")
+    GOLDEN_SHA256 = "6a36b368f1c03d1e3205eb274e455dde99d52b9d6cb49155153612c346671e85"
+
+    def golden_model(self) -> V.Profile:
+        site0 = V.Site(0x0100, bytes.fromhex("c7477804000000"), bytes.fromhex("c7477801000000"))
+        site1 = V.Site(0x0160, bytes.fromhex("83e0fe"), bytes.fromhex("83c801"))
+        site2 = V.Site(0x0200, bytes.fromhex("750b"), bytes.fromhex("eb0b"))
+        images = [
+            V.Image(kind=V.IMAGE_KIND_STANDALONE,
+                    path="/System/Library/Extensions/SyntheticGL.bundle/Contents/MacOS/SyntheticGL",
+                    unslid_vmaddr=0, vm_size=0x5000, segments=["__TEXT", "__LINKEDIT"],
+                    sections=["__text"]),
+            V.Image(kind=V.IMAGE_KIND_SHARED_CACHE,
+                    path="/System/Library/Extensions/SyntheticMTL.bundle/Contents/MacOS/SyntheticMTL",
+                    unslid_vmaddr=0x7FFB00000000, vm_size=0x4000, segments=["__TEXT"],
+                    sections=["__text"]),
+        ]
+        pages = [
+            V.Page(0x2000, 0x1111222233334444, V.DEFAULT_MATCH_FLAGS, [site0],
+                   image_index=0, page_vm_offset=0x2000),
+            V.Page(0x87000, 0xAAAABBBBCCCCDDDD, V.DEFAULT_MATCH_FLAGS, [site1, site2],
+                   image_index=1, page_vm_offset=0x1000),
+        ]
+        return V.Profile(
+            header=V.Header(build="24H232", apu_mask=0x28, device_id=0, version=V.VERSION_V2),
+            pages=pages, version=V.VERSION_V2, images=images,
+        )
+
+    def test_reference_codec_golden_is_byte_identical(self) -> None:
+        with open(self.GOLDEN_PATH, "rb") as handle:
+            golden = handle.read()
+        self.assertEqual(len(golden), 520)
+        self.assertEqual(hashlib.sha256(golden).hexdigest(), self.GOLDEN_SHA256)
+        self.assertEqual(V.decode(golden), self.golden_model())
+        self.assertEqual(V.encode(self.golden_model()), golden)
+        self.assertEqual(V.encode(V.decode(golden)), golden)
+
+
+# ---------------------------------------------------------------------------
 # Meta coverage: every stable error code has at least one crafted-byte test
 # ---------------------------------------------------------------------------
 
 
 class ZZCoverageTests(unittest.TestCase):
     def test_all_stable_codes_covered(self) -> None:
-        expected = {f"E{index:03d}" for index in range(1, 34)}
+        expected = {f"E{index:03d}" for index in range(1, 42)}
         self.assertEqual(
             COVERED_CODES,
             expected,

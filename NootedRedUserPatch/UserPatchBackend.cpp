@@ -57,6 +57,23 @@ void UserPatchBackend::install(KernelPatcher& patcher)
     if (this->installAttempted_) { return; }
     this->installAttempted_ = true;
 
+    // The hook's first argument is the real vnode.  The engine resolves its name for the vnode-name
+    // gate (same mechanism as the native backend: vnode_getname/vnode_putname).  If the symbols cannot
+    // be solved the engine stays on the legacy pager-offset gate and fails closed for late/renamed
+    // pages; nothing is written without the full-page hash and site finds either way.
+    auto* const vnodeGetName = reinterpret_cast<PatchProfile::tVnodeGetName>(
+        patcher.solveSymbol(KernelPatcher::KernelID, "_vnode_getname"));
+    auto* const vnodePutName = reinterpret_cast<PatchProfile::tVnodePutName>(
+        patcher.solveSymbol(KernelPatcher::KernelID, "_vnode_putname"));
+    PatchProfile::singleton().setVnodeResolver(vnodeGetName, vnodePutName);
+    if (vnodeGetName != nullptr && vnodePutName != nullptr) {
+        SYSLOG("UserPatch", "vnode-name gate available");
+    }
+    else {
+        patcher.clearError();
+        SYSLOG("UserPatch", "vnode name symbols unavailable; legacy pager-offset matching only");
+    }
+
     // Page validation path.  Intel/AMD user-space driver pages are delivered through this route.
     KernelPatcher::RouteRequest pageRequest{"_cs_validate_page", wrapCsValidatePage, this->orgCsValidatePage_};
     if (patcher.routeMultipleLong(KernelPatcher::KernelID, &pageRequest, 1)) {
@@ -115,36 +132,37 @@ void UserPatchBackend::detectHardwareIdentity()
     profile.setRunningApu(mask, static_cast<UInt16>(deviceID & 0xFFFFU));
 }
 
-void UserPatchBackend::wrapCsValidatePage(void* blobs, void* pager, UInt64 pageOffset, const void* data, int* validated,
-                                          int* tainted, int* nx)
+void UserPatchBackend::wrapCsValidatePage(void* vnode, void* pager, UInt64 pageOffset, const void* data,
+                                          int* validated, int* tainted, int* nx)
 {
     auto& self = singleton();
 
     // The original validator is always called first and its result is never modified.  Callers on
     // macOS 15 consume the three out-parameters, not the return value.
     auto original = reinterpret_cast<tCsValidatePage>(self.orgCsValidatePage_);
-    FunctionCast(wrapCsValidatePage, reinterpret_cast<mach_vm_address_t>(original))(blobs, pager, pageOffset, data,
+    FunctionCast(wrapCsValidatePage, reinterpret_cast<mach_vm_address_t>(original))(vnode, pager, pageOffset, data,
                                                                                     validated, tainted, nx);
 
     if (validated != nullptr && *validated != 0 && data != nullptr) {
-        PatchProfile::singleton().applyChunk(static_cast<const UInt8*>(data), PatchProfile::kPageSize, pageOffset);
+        PatchProfile::singleton().applyChunk(static_cast<const UInt8*>(data), PatchProfile::kPageSize, pageOffset,
+                                             vnode);
     }
 }
 
-boolean_t UserPatchBackend::wrapCsValidateRange(void* blobs, void* pager, UInt64 rangeOffset, const void* data,
+boolean_t UserPatchBackend::wrapCsValidateRange(void* vnode, void* pager, UInt64 rangeOffset, const void* data,
                                                 UInt64 dataSize, unsigned* tainted)
 {
     auto& self = singleton();
 
     auto original = reinterpret_cast<tCsValidateRange>(self.orgCsValidateRange_);
     const boolean_t result = FunctionCast(wrapCsValidateRange, reinterpret_cast<mach_vm_address_t>(original))(
-        blobs, pager, rangeOffset, data, dataSize, tainted);
+        vnode, pager, rangeOffset, data, dataSize, tainted);
 
     // Patch only after the original validator accepted the range; its return value is not affected by
     // a patch failure.  A trailing partial page is never patched.
     if (result != FALSE && data != nullptr && dataSize >= PatchProfile::kPageSize) {
         PatchProfile::singleton().applyChunk(static_cast<const UInt8*>(data), static_cast<size_t>(dataSize),
-                                             rangeOffset);
+                                             rangeOffset, vnode);
     }
 
     return result;

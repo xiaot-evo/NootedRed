@@ -216,7 +216,36 @@ final class AnalyzerImageSet {
         }
         return images
     }
+
+    /// Canonical, install-path-independent image path for the profile image table.
+    ///
+    /// Cache images already carry the dyld-cache image path (absolute). The standalone
+    /// GL bundle is discovered through the fixture root, so the fixture prefix is
+    /// stripped to obtain the same "/System/Library/..." path on every host and
+    /// fixture extraction. The value is always derived from the parsed image and the
+    /// environment root; no path is hardcoded.
+    func canonicalPath(for driver: DriverImage) throws -> String {
+        let image = try image(for: driver)
+        var path = image.path
+        let rootPath = environment.root.standardizedFileURL.path
+        if rootPath != "/" {
+            if path == rootPath {
+                path = "/"
+            } else if path.hasPrefix(rootPath + "/") {
+                path = String(path.dropFirst(rootPath.count))
+            }
+        }
+        guard path.hasPrefix("/") else { return "/" + path }
+        return path
+    }
+
+    func kind(for driver: DriverImage) -> DriverImageKind {
+        driver.isStandaloneFile ? .standaloneFile : .dyldSharedCache
+    }
 }
+
+/// Profile image kind for a driver image.
+typealias DriverImageKind = NRPTImageKind
 
 // MARK: - Generated site / page model
 
@@ -231,12 +260,18 @@ struct GeneratedSite {
     let pageHash: UInt64
     let matchFlags: NRPTMatchFlags
     let pageBytes: Data
+    /// Target-image metadata (NRPT v2), all derived from the parsed image.
+    let imageIndex: UInt16
+    let pageVmOffset: UInt32
+    let pageIndex: UInt32
+    let segmentName: String
+    let sectionName: String
 }
 
 // MARK: - Generator
 
 enum ProfileGenerator {
-    static let generatorVersion = "PatchAnalyzer/1.0"
+    static let generatorVersion = "PatchAnalyzer/2.0"
 
     struct Output {
         let profile: NRPTProfile
@@ -249,6 +284,54 @@ enum ProfileGenerator {
         let images = try AnalyzerImageSet(environment: environment)
         let decoder = images.decoder
         var sites: [GeneratedSite] = []
+
+        // Target image table (NRPT v2), in deterministic first-discovery order.
+        var imageTable: [NRPTImage] = []
+        func imageRecord(for driver: DriverImage) throws -> UInt16 {
+            let path = try images.canonicalPath(for: driver)
+            let kind = images.kind(for: driver)
+            if let existing = imageTable.firstIndex(where: { $0.kind == kind && $0.path == path }) {
+                return UInt16(existing)
+            }
+            let image = try images.image(for: driver)
+            guard image.loadAddress == image.text.vmaddr else {
+                throw AnalyzerError.malformed(
+                    "\(driver.rawValue): image load address differs from __TEXT vmaddr")
+            }
+            guard image.text.vmsize > 0, image.text.vmsize <= 0xFFFF_F000 else {
+                throw AnalyzerError.malformed("\(driver.rawValue): __TEXT vmsize out of range")
+            }
+            // Fixed 16-byte NUL-padded name fields: only names shorter than the field
+            // capacity are representable on the wire (the runtime does not depend on
+            // names; the generator still verifies the patched segment/section is listed).
+            var segmentNames: [String] = []
+            for segment in image.segments
+                where !segmentNames.contains(segment.name)
+                    && segment.name.utf8.count < NRPTFormat.segmentNameSize {
+                segmentNames.append(segment.name)
+            }
+            var sectionNames: [String] = []
+            for section in image.sections
+                where !sectionNames.contains(section.sectname)
+                    && section.sectname.utf8.count < NRPTFormat.sectionNameSize {
+                sectionNames.append(section.sectname)
+            }
+            guard segmentNames.count >= 1,
+                  segmentNames.count <= NRPTFormat.maxSegmentsPerImage else {
+                throw AnalyzerError.unsupported(
+                    "\(driver.rawValue): \(segmentNames.count) segments exceed the NT v2 image table")
+            }
+            if sectionNames.count > NRPTFormat.maxSectionsPerImage {
+                // Deterministic prefix: first-seen sections cover the patched __text section.
+                sectionNames = Array(sectionNames.prefix(NRPTFormat.maxSectionsPerImage))
+            }
+            imageTable.append(NRPTImage(kind: kind, path: path,
+                                        unslidVMAddress: image.loadAddress,
+                                        vmSize: UInt32(image.text.vmsize),
+                                        segmentNames: segmentNames,
+                                        sectionNames: sectionNames))
+            return UInt16(imageTable.count - 1)
+        }
         var ruleEvidence: [[String: Any]] = []
         var usedAddresses: Set<UInt64> = []
 
@@ -309,11 +392,55 @@ enum ProfileGenerator {
                         // legacy VADriver 0x85C4000 page).
                         let matchFlags: NRPTMatchFlags = .defaultV1
                         let pageHash = try ProfileCodec.pageHash(page.bytes)
+                        let targetImageIndex = try imageRecord(for: rule.driver)
+                        let targetImageRecord = imageTable[Int(targetImageIndex)]
+                        guard let segment = image.segments.first(where: {
+                            page.pageStart >= $0.vmaddr
+                                && page.pageStart < $0.vmaddr + $0.vmsize
+                                && $0.filesize > 0
+                        }) else {
+                            throw AnalyzerError.validation(
+                                "\(rule.id): no segment contains page \(Hex.value(page.pageStart))")
+                        }
+                        guard page.pageStart >= segment.vmaddr,
+                              (page.pageStart - segment.vmaddr) % 0x1000 == 0 else {
+                            throw AnalyzerError.validation(
+                                "\(rule.id): page is not segment-aligned in \(segment.name)")
+                        }
+                        let pageIndexOfSegment = UInt32((page.pageStart - segment.vmaddr) / 0x1000)
+                        guard let section = image.sections.first(where: {
+                            siteAddress >= $0.addr && siteAddress < $0.addr + $0.size
+                        }) else {
+                            throw AnalyzerError.validation(
+                                "\(rule.id): no section contains site \(Hex.value(siteAddress))")
+                        }
+                        guard targetImageRecord.segmentNames.contains(segment.name),
+                              targetImageRecord.sectionNames.contains(section.sectname) else {
+                            throw AnalyzerError.validation(
+                                "\(rule.id): parsed segment/section names are not represented in the "
+                                    + "image metadata table")
+                        }
+                        guard page.pageStart >= image.loadAddress else {
+                            throw AnalyzerError.validation(
+                                "\(rule.id): page precedes the image load address")
+                        }
+                        let vmOffset = page.pageStart - image.loadAddress
+                        guard vmOffset % 0x1000 == 0,
+                              vmOffset <= UInt64(UInt32.max),
+                              vmOffset + 0x1000 <= UInt64(targetImageRecord.vmSize) else {
+                            throw AnalyzerError.validation(
+                                "\(rule.id): derived pageVmOffset \(Hex.value(vmOffset)) is invalid")
+                        }
                         sites.append(GeneratedSite(ruleID: rule.id, driver: rule.driver, match: match,
                                                    siteAddress: siteAddress, siteInPage: UInt16(inPage),
                                                    pageStart: page.pageStart, pageFileOffset: pageFileOffset,
                                                    pageHash: pageHash, matchFlags: matchFlags,
-                                                   pageBytes: page.bytes))
+                                                   pageBytes: page.bytes,
+                                                   imageIndex: targetImageIndex,
+                                                   pageVmOffset: UInt32(vmOffset),
+                                                   pageIndex: pageIndexOfSegment,
+                                                   segmentName: segment.name,
+                                                   sectionName: section.sectname))
                         ruleSiteCount += 1
                         var siteEvidence: [String: Any] = [
                             "function": analysis.functionName,
@@ -377,8 +504,21 @@ enum ProfileGenerator {
             guard records.count >= 1, records.count <= NRPTFormat.maxSitesPerPage else {
                 throw AnalyzerError.validation("invalid sites-per-page count \(records.count)")
             }
+            for site in group {
+                guard site.imageIndex == first.imageIndex,
+                      site.pageVmOffset == first.pageVmOffset,
+                      site.pageIndex == first.pageIndex,
+                      site.segmentName == first.segmentName,
+                      site.sectionName == first.sectionName else {
+                    throw AnalyzerError.validation(
+                        "inconsistent target-image metadata for page \(Hex.value(first.pageStart))")
+                }
+            }
             pages.append(NRPTPage(pageFileOffset: first.pageFileOffset, pageHash: first.pageHash,
-                                  matchFlags: first.matchFlags, sites: records))
+                                  matchFlags: first.matchFlags, sites: records,
+                                  imageIndex: first.imageIndex,
+                                  pageVmOffset: first.pageVmOffset))
+            let targetImage = imageTable[Int(first.imageIndex)]
             pageEvidence.append([
                 "driver": first.driver.rawValue,
                 "pageStart": Hex.value(first.pageStart),
@@ -388,6 +528,16 @@ enum ProfileGenerator {
                 "offsetNamespaceProven": true,
                 "offsetNamespace": first.driver.isStandaloneFile
                     ? "standalone-file-offset" : "subcache-file-offset",
+                "imageIndex": Int(first.imageIndex),
+                "imagePath": targetImage.path,
+                "imageKind": targetImage.kind == .standaloneFile ? "standalone-file" : "dyld-shared-cache",
+                "segment": first.segmentName,
+                "section": first.sectionName,
+                "pageIndexInSegment": Int(first.pageIndex),
+                "pageVmOffset": Hex.value(UInt64(first.pageVmOffset)),
+                "pageVA": Hex.value(first.pageStart),
+                "imageUnslidVmaddr": Hex.value(targetImage.unslidVMAddress),
+                "imageVmSize": Hex.value(UInt64(targetImage.vmSize)),
                 "sites": records.count
             ])
         }
@@ -396,7 +546,16 @@ enum ProfileGenerator {
         let header = NRPTHeader(build: environment.build, apuMask: environment.apuMask,
                                 deviceID: deviceID ?? 0,
                                 flags: deviceID != nil ? .requireDeviceID : [])
-        let profile = NRPTProfile(header: header, pages: pages)
+        let imageEvidence = imageTable.map { image -> [String: Any] in
+            ["kind": image.kind == .standaloneFile ? "standalone-file" : "dyld-shared-cache",
+             "path": image.path,
+             "unslidVmaddr": Hex.value(image.unslidVMAddress),
+             "vmSize": Hex.value(UInt64(image.vmSize)),
+             "segments": image.segmentNames,
+             "sections": image.sectionNames,
+             "entrySize": image.entrySize]
+        }
+        let profile = NRPTProfile(header: header, images: imageTable, pages: pages)
         let profileData: Data
         do {
             profileData = try ProfileCodec.encode(profile)
@@ -413,7 +572,8 @@ enum ProfileGenerator {
                                                        environment: environment, images: images)
 
         var evidence: [String: Any] = [
-            "schema": 1,
+            "schema": 2,
+            "profileVersion": Int(NRPTFormat.version),
             "generator": generatorVersion,
             "decoder": X86Decoder.shared.libraryPath ?? "unavailable",
             "fixtureRoot": environment.root.path,
@@ -429,6 +589,7 @@ enum ProfileGenerator {
                 "checksum": Hex.value(UInt64(ProfileCodec.fnv1a32(profileData.subdata(in: 64..<profileData.count)))),
                 "sha256": sha256(profileData)
             ],
+            "images": imageEvidence,
             "rules": ruleEvidence,
             "pages": pageEvidence,
             "identityCollisionScan": collisionScan,
@@ -539,6 +700,15 @@ enum OfflineValidator {
         }
 
         let allImages = try images.allImages()
+        // Known fixture images keyed by the same canonical path the profile stores, so the
+        // v2 target-image metadata can be re-resolved against the parsed images.
+        var knownImages: [String: (driver: DriverImage, image: AnalyzedImage, kind: NRPTImageKind)] = [:]
+        for driver in DriverImage.allCases {
+            guard let image = allImages[driver] else { continue }
+            let path = try images.canonicalPath(for: driver)
+            knownImages[path] = (driver, image, images.kind(for: driver))
+        }
+        var metadataPageReports: [[String: Any]] = []
         var matchedPages: [Int: [(driver: DriverImage, pageFileOffset: UInt64, pageStart: UInt64, data: Data)]] = [:]
         var pageReports: [[String: Any]] = []
         var totalPagesScanned = 0
@@ -583,6 +753,75 @@ enum OfflineValidator {
                 throw AnalyzerError.validation(
                     "page record \(index) matched \(matches.count) fixture pages; expected exactly one")
             }
+            // Verify the v2 target-image metadata re-resolves to exactly this page.
+            guard Int(record.imageIndex) < profile.images.count else {
+                throw AnalyzerError.validation("page record \(index) imageIndex out of range")
+            }
+            let targetImage = profile.images[Int(record.imageIndex)]
+            guard let known = knownImages[targetImage.path], known.kind == targetImage.kind else {
+                throw AnalyzerError.validation(
+                    "page record \(index) target image \(targetImage.path) does not resolve in the fixture")
+            }
+            guard known.driver == match.driver else {
+                throw AnalyzerError.validation(
+                    "page record \(index) metadata image \(targetImage.path) does not match the "
+                        + "fixture image \(match.driver.rawValue) the page was found in")
+            }
+            guard targetImage.unslidVMAddress == known.image.loadAddress,
+                  targetImage.vmSize == UInt32(known.image.text.vmsize) else {
+                throw AnalyzerError.validation(
+                    "page record \(index) image geometry \(Hex.value(targetImage.unslidVMAddress))/"
+                        + "\(Hex.value(UInt64(targetImage.vmSize))) disagrees with the parsed image "
+                        + "\(Hex.value(known.image.loadAddress))/\(Hex.value(known.image.text.vmsize))")
+            }
+            guard match.pageStart >= targetImage.unslidVMAddress else {
+                throw AnalyzerError.validation("page record \(index) page precedes the image base")
+            }
+            let expectedVmOffset = match.pageStart - targetImage.unslidVMAddress
+            guard UInt64(record.pageVmOffset) == expectedVmOffset,
+                  record.pageVmOffset & 0x0FFF == 0,
+                  UInt64(record.pageVmOffset) + 0x1000 <= UInt64(targetImage.vmSize) else {
+                throw AnalyzerError.validation(
+                    "page record \(index) pageVmOffset \(Hex.value(UInt64(record.pageVmOffset))) "
+                        + "does not resolve to fixture page \(Hex.value(match.pageStart))")
+            }
+            guard let segment = known.image.segments.first(where: {
+                match.pageStart >= $0.vmaddr && match.pageStart < $0.vmaddr &+ $0.vmsize
+            }), targetImage.segmentNames.contains(segment.name) else {
+                throw AnalyzerError.validation(
+                    "page record \(index) page is not covered by a stored segment name")
+            }
+            var sectionNamesUsed: Set<String> = []
+            for site in record.sites {
+                let siteAddress = match.pageStart &+ UInt64(site.siteInPage)
+                guard let section = known.image.sections.first(where: {
+                    siteAddress >= $0.addr && siteAddress < $0.addr &+ $0.size
+                }), targetImage.sectionNames.contains(section.sectname) else {
+                    throw AnalyzerError.validation(
+                        "page record \(index) site \(site.siteInPage) is not covered by a stored "
+                            + "section name")
+                }
+                sectionNamesUsed.insert(section.sectname)
+            }
+            let metadataFileOffset = try known.image.fileOffset(address: match.pageStart)
+            guard metadataFileOffset == record.pageFileOffset,
+                  metadataFileOffset == match.pageFileOffset else {
+                throw AnalyzerError.validation(
+                    "page record \(index) pageFileOffset disagrees with the target-image translation")
+            }
+            metadataPageReports.append([
+                "pageIndex": index,
+                "imagePath": targetImage.path,
+                "imageKind": targetImage.kind == .standaloneFile ? "standalone-file" : "dyld-shared-cache",
+                "imageUnslidVmaddr": Hex.value(targetImage.unslidVMAddress),
+                "imageVmSize": Hex.value(UInt64(targetImage.vmSize)),
+                "segment": segment.name,
+                "sectionNames": sectionNamesUsed.sorted(),
+                "pageVmOffset": Hex.value(UInt64(record.pageVmOffset)),
+                "pageStart": Hex.value(match.pageStart),
+                "pageFileOffset": Hex.value(record.pageFileOffset),
+                "result": "PASS"
+            ])
             let original = try allImages[match.driver]!.read(address: match.pageStart, size: 0x1000)
             let resultingHash = ProfileCodec.fnv1a64(match.data)
             pageReports.append([
@@ -590,6 +829,13 @@ enum OfflineValidator {
                 "driver": match.driver.rawValue,
                 "pageFileOffset": Hex.value(match.pageFileOffset),
                 "pageStart": Hex.value(match.pageStart),
+                "imagePath": targetImage.path,
+                "imageKind": targetImage.kind == .standaloneFile ? "standalone-file" : "dyld-shared-cache",
+                "imageUnslidVmaddr": Hex.value(targetImage.unslidVMAddress),
+                "pageVmOffset": Hex.value(UInt64(record.pageVmOffset)),
+                "segments": targetImage.segmentNames.count,
+                "sections": targetImage.sectionNames.count,
+                "metadataVerified": true,
                 "offsetGate": record.matchFlags.contains(.requireOffset) ? "required" : "cleared",
                 "hashMatch": true,
                 "sitesMatched": record.sites.count,
@@ -614,9 +860,16 @@ enum OfflineValidator {
         }
         return [
             "result": "PASS",
+            "profileVersion": Int(NRPTFormat.version),
             "pagesScanned": totalPagesScanned,
             "pagesMatched": matchedPageCount,
             "pages": pageReports,
+            "targetImageMetadata": [
+                "images": profile.images.count,
+                "pagesVerified": metadataPageReports.count,
+                "pages": metadataPageReports,
+                "result": "PASS"
+            ],
             "appliedPages": matchedPageCount,
             "findMismatches": 0,
             "falsePositives": 0
@@ -692,10 +945,11 @@ enum ProfileCLI {
             throw AnalyzerError.io("cannot write output: \(error.localizedDescription)")
         }
         let lines = [
-            "PASS: generated NRPT v1 profile",
+            "PASS: generated NRPT v\(NRPTFormat.version) profile",
             "build: \(environment.build)",
             "device: \(environment.deviceID.map { Hex.value(UInt64($0)) } ?? "unknown") apuMask: \(Hex.value(UInt64(environment.apuMask)))",
-            "pages: \(output.profile.pageCount) sites: \(output.profile.siteCount) size: \(output.profileData.count)",
+            "images: \(output.profile.images.count) pages: \(output.profile.pageCount) "
+                + "sites: \(output.profile.siteCount) size: \(output.profileData.count)",
             "sha256: \(ProfileGenerator.sha256(output.profileData))",
             "profile: \(profileURL.path)",
             "evidence: \(evidenceURL.path)",
@@ -718,9 +972,15 @@ enum ProfileCLI {
         let profile = try ProfileCodec.decode(data)
         var lines: [String] = []
         lines.append("PASS: profile validated offline")
-        lines.append("build: \(profile.header.build) pages: \(profile.pageCount) sites: \(profile.siteCount) bytes: \(data.count)")
+        lines.append("build: \(profile.header.build) version: v\(NRPTFormat.version) "
+            + "images: \(profile.images.count) pages: \(profile.pageCount) "
+            + "sites: \(profile.siteCount) bytes: \(data.count)")
         lines.append("sha256: \(ProfileGenerator.sha256(data))")
         lines.append("pages scanned: \(report["pagesScanned"] ?? "?") matched: \(report["pagesMatched"] ?? "?")")
+        if let metadata = report["targetImageMetadata"] as? [String: Any] {
+            lines.append("target image metadata: images="
+                + "\(metadata["images"] ?? "?") pagesVerified=\(metadata["pagesVerified"] ?? "?")")
+        }
         if let pages = report["pages"] as? [[String: Any]] {
             for page in pages {
                 let index = page["pageIndex"] as? Int ?? -1

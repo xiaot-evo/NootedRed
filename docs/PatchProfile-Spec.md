@@ -1,7 +1,12 @@
-# NRPT Patch Profile Specification — v1
+# NRPT Patch Profile Specification — v2
 
-Status: **frozen** (2026-10-29). Normative contract for the stage-1 profile-driven user-space patch
-engine on branch `feature/profile-driven-userpatch`, base commit `10d4ef9`.
+Status: **frozen v2** (2026-10-29). Normative contract for the profile-driven user-space patch
+engine on branch `feature/profile-driven-userpatch`. Revision v2 adds the target-image metadata
+used by the hook-side vnode gate (the earlier direct-map consumer was removed for safety; the wire
+format below is unchanged and remains frozen); §2.1, §4.1a, §3, §7, §11, §12 and §15 are extended by the
+"NRPT v2 (normative)" section immediately below. The rest of this document (v1 matching, page/site
+semantics, fail-closed rules) remains normative and is unchanged by v2; the kext consumer may also
+keep accepting v1 profiles as hook-only.
 
 This document is normative for four implementations. They must agree byte for byte:
 
@@ -21,6 +26,133 @@ expected build string `NRedSystemBuild`. A missing, mismatched or malformed prof
 NRPT is not `NRPD` (`docs/UserPatch-Data-Format.md`, embedded exact-page tables) and it replaces the
 host-generated `NRPF`/NRP2/NRP3 experiments. It carries page identity and site records only; it does
 **not** embed full 4 KiB page images.
+
+## 0. NRPT v2 (normative); v1 sections below remain the matching contract
+
+NRPT v2 keeps every v1 matching and fail-closed rule and adds **target-image metadata** so a
+consumer can associate each page with its owning driver image/vnode without guessing addresses or
+scanning for bytes. Version `2` replaces version `1`; a v2 parser MUST reject version `1` unless it
+explicitly implements the documented v1 hook-only subset, and a v1 parser MUST reject version `2`.
+
+### 0.1 Overall layout
+
+```
+offset 0                     Header (64 bytes)
+offset 64                    Page table   (pageCount × 32 bytes)
+offset 64 + pageTableSize    Site table   (siteCount × 40 bytes)
+offset size - imageTableSize Image table  (imageTableSize bytes, imageCount variable entries)
+```
+
+```
+size = 64 + pageCount * 32 + siteCount * 40 + imageTableSize
+```
+
+`pageTableSize` is exactly `pageCount * 32`; `siteTableSize` is exactly `siteCount * 40`;
+`imageTableSize` is exactly the sum of the variable image-table entries (§0.4) and MUST equal the
+value derived from the entries. The profile remains at most 65536 bytes and
+`payloadChecksum = FNV-1a-32(bytes[64, size))` now covers the page table, the site table **and**
+the image table, in that order.
+
+### 0.2 Header changes (everything else from §3 is unchanged)
+
+| Offset | Size | Type | Field | Required value |
+| --- | --- | --- | --- | --- |
+| 4 | 2 | u16 | `version` | `2` |
+| 32 | 2 | u16 | `pageCount` | `1...256` |
+| 34 | 2 | u16 | `siteCount` | `1...1024` |
+| 36 | 4 | u32 | `pageTableSize` | `pageCount * 32` |
+| 40 | 4 | u32 | `siteTableSize` | `siteCount * 40` |
+| 44 | 4 | u32 | `payloadChecksum` | FNV-1a-32 over page+site+image tables |
+| 48 | 4 | u32 | `flags` | v1 header flags (bit 0 only) |
+| 52 | 2 | u16 | `imageCount` | `1...16` |
+| 54 | 4 | u32 | `imageTableSize` | exact sum of §0.4 entry sizes |
+| 58 | 6 | u8[6] | `reserved` | all zero |
+
+All other header fields keep their v1 offsets and rules (`magic` @0, `headerSize` @6 = 64,
+`build` @8, `apuMask` @24, `deviceID` @28).
+
+### 0.3 Page record (32 bytes; replaces the v1 24-byte record)
+
+| Offset | Size | Type | Field | Meaning |
+| --- | --- | --- | --- | --- |
+| 0 | 8 | u64 | `pageFileOffset` | unchanged v1 field, 4 KiB aligned |
+| 8 | 8 | u64 | `pageHash` | unchanged v1 field |
+| 16 | 4 | u32 | `firstSite` | unchanged v1 canonical ordering |
+| 20 | 2 | u16 | `siteCount` | unchanged v1 |
+| 22 | 2 | u16 | `matchFlags` | unchanged v1 (bits 1|2 mandatory) |
+| 24 | 2 | u16 | `imageIndex` | index into the image table |
+| 26 | 2 | u16 | `reserved` | MUST be 0 |
+| 28 | 4 | u32 | `pageVmOffset` | 4 KiB aligned page offset from the image's unslid mach-header VM address |
+
+`pageVmOffset` MUST equal `pageStartVMAddress - image.imageUnslidVmaddr` and MUST satisfy
+`pageVmOffset & 0xFFF == 0` and `pageVmOffset + 4096 <= image.imageVmSize`; violations are `E040`.
+The consumer computes the live page address as `dyldImageLoadAddress + pageVmOffset`, which works
+identically for standalone file-backed dylibs and dyld-shared-cache images. Every page's
+`imageIndex` MUST be `< imageCount` (`E038`).
+
+### 0.4 Image table entries (`imageCount` variable-size entries, in generator order)
+
+```
+ImageEntryHeader (20 bytes)
+  0   u8   kind           0 = standalone file-backed dylib, 1 = dyld shared cache image
+  1   u8   flags          bit 0 = match `path` by suffix; every other bit reserved (0)
+  2   u16  pathLength     path byte count, 1...200 (NUL terminator is not counted)
+  4   u64  imageUnslidVmaddr  unslid VM address of the image's mach header / __TEXT segment
+  12  u32  imageVmSize    __TEXT vmsize: bound for pageVmOffset, > 0 and <= 0xFFFFF000
+  16  u8   segmentCount   1...16
+  17  u8   sectionCount   0...16
+  18  u16  reserved       MUST be 0
+then
+  path bytes (exactly pathLength printable ASCII bytes, first byte '/'),
+  zero padding to a 4-byte boundary (it must contain the NUL terminator and be all zero),
+  segmentCount × 16-byte NUL-padded segment names,
+  sectionCount × 16-byte NUL-padded section names.
+```
+
+Rules: entry size is `20 + roundUp4(pathLength + 1) + segmentCount*16 + sectionCount*16` and the
+whole table is the exact sum of the entries (`E035`/`E036`). Paths are absolute canonical
+installed paths derived from the parsed target image (compression to the same path on every host:
+the generator strips fixture-root prefixes); duplicates of `(kind, path)` are rejected (`E039`).
+Names are 1...15 printable ASCII bytes each, unique within their table, and are validated then
+ignored by the runtime (evidence only). `kind = 1` requires `imageUnslidVmaddr != 0`; `kind = 0`
+uses the path suffix and normally stores 0; invalid geometry is `E041`. The image table is
+deterministic: entries appear in the generator's first-discovery order and identical inputs produce
+byte-identical image tables.
+
+### 0.5 New error codes (stable diagnostics; whole-profile rejection)
+
+| Code | Name | Rule |
+| --- | --- | --- |
+| `E034` | `invalidImageCount` | `imageCount` outside `1...16`, or image table larger than the format bound |
+| `E035` | `invalidImageEntry` | malformed entry header/counts/padding/name table |
+| `E036` | `imageTableSizeMismatch` | `imageTableSize` differs from the size derived from the entries |
+| `E037` | `invalidImagePath` | empty/too long/non-printable/non-absolute image path |
+| `E038` | `invalidPageMetadata` | page `imageIndex` out of range or page record reserved bytes non-zero |
+| `E039` | `duplicateImagePath` | two image entries share `(kind, path)` |
+| `E040` | `invalidPageVmOffset` | `pageVmOffset` unaligned or page leaves the image extent |
+| `E041` | `invalidImageGeometry` | invalid unslid address / `imageVmSize` / segment-section name tables |
+
+### 0.6 v2 producer and validator obligations
+
+- The generator derives `kind`, canonical `path`, `imageUnslidVmaddr`, `imageVmSize`, segment and
+  section names, and each page's `pageVmOffset` exclusively from the parsed Mach-O / dyld-cache
+  image; it fails generation if any page has no resolvable image/segment/section. No path, address
+  or offset is hardcoded.
+- The generator MUST run the offline validator on the clean fixture. The offline validator MUST
+  re-resolve every page's `(imageIndex, pageVmOffset)` to the exact fixture page start, segment,
+  section, page-file offset and page hash, and report that resolution in its evidence. The
+  fixture used for generation MUST be a clean on-disk extraction (`F_NOCACHE` or equivalent when it
+  was collected from a running system whose pages are already patched).
+- v2 matching remains exactly v1 §8: offset (when required) + full-page FNV-1a-64 hash + every
+  site `find`, with the first identity-matching record authoritative and no partial page writes.
+  The image metadata is used only to associate the page with its owning image/vnode (hook-side
+  vnode-name gate, offline tooling); it never replaces the page identity gates.
+- Codec model delta (§15): `NRPTProfile` gains `images: [NRPTImage]`; `NRPTImage` has
+  `kind`, `path`, `unslidVMAddress`, `vmSize`, `segmentNames`, `sectionNames`; `NRPTPage` replaces
+  the v1 24-byte fields plus `imageIndex: UInt16, pageVmOffset: UInt32`; `NRPTFormat` gains the v2
+  header/page/image constants and `encodedSize(pageCount:siteCount:imageTableSize:)`;
+  `ProfileCodecError` gains `E034...E041`. Encode/decode remain all-or-nothing; the pure matching
+  helpers (`pageHash`, `pageMatches`, `applySites`, `applyPage`, `fnv1a32/64`) are unchanged.
 
 ## 1. Conventions
 

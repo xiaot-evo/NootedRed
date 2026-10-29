@@ -12,7 +12,8 @@
 #   test/run-validation.sh [profile.nrpt]
 #
 # Environment:
-#   NRPT_PROFILE         profile path (alternative to $1)
+#   NRPT_PROFILE         profile path (alternative to $1); NRPT v1 and v2 are auto-detected
+#                        (v2 profiles additionally need FIXTURES pointing at the clean fixture tree)
 #   FIXTURES             fixture root (default: /)
 #   NRPT_REPORT          JSON report path (default: <repo>/build/validation-report.json)
 #   NRPT_EXPECTED_BUILD  expected build string (default: sw_vers -buildVersion)

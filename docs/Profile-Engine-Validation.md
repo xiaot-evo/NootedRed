@@ -67,7 +67,84 @@ byte-identical output. `NootedRedTool --self-test` PASS (25 checks; the working-
 | AppleGVA page (`.02` `0x6696000`, hash `0xBF4200EAD854986D`, site `0x41B`) | matches the pinned mainline `VDAGVAData.hpp` derivation: `0f84d6030000` → `0f842a000000` (`je` empty-return → AMD-insertion tail in `AVDGetGPUAccelerators`) |
 | Content-duplicate page (VADriver2 `.03` `0x867D000` vs legacy VADriver `.03` `0x85C4000`, hash `0xF5B85AA3986640B6`) | byte-identical content elsewhere in the fixture; offset-gated identity makes this **not** a false positive; recorded as warning/evidence in the report |
 
-### 1.3 Package and binary audit (final)
+### 1.3 NRPT v2 validation (task-15)
+
+The frozen v2 contract (`docs/PatchProfile-Spec.md` §0) adds the target-image table and 32-byte page
+records used by the direct-patch coverage path. The independent validator now decodes v1 **and** v2,
+and for v2 re-resolves every page's `(imageIndex, pageVmOffset)` against the clean fixture instead of
+trusting the profile metadata (spec §0.6).
+
+| Item | Value |
+| --- | --- |
+| Official v2 profile | `build/profile-24H232-v2/nred-24H232-v2.nrpt`, 2,776 B, SHA-256 `56afabe0b7f77346057108ba1b458bbdecc5f436a720f5915484f579257bc3f4` |
+| Structure | NRPT v2; build `24H232`; apuMask `0x28`; deviceID `0x1638`; **4 images / 13 pages / 18 sites**; all pages `matchFlags 0x0007`; payload FNV-1a-32 `0x018AB32E` |
+| Clean fixture | `version-fixtures/15.8.2` (extracted with `F_NOCACHE`; manifest + SHA-256s present, no Apple binaries committed) |
+| v2 validation | `python3 test/nrpt_validator.py --profile build/profile-24H232-v2/nred-24H232-v2.nrpt --fixtures version-fixtures/15.8.2 --expected-build 24H232 --device-id 0x1638 --report build/validation-report-24H232-v2.json --mutation-sweep` → **PASS** |
+| v2 report | SHA-256 `661737d0331d061b6b03be8fb0be4902dba7a7d78ac478d076eea029fbc833ba` |
+| v1 back-compat (same fixture) | canonical v1 profile `fddf26a5…` → **PASS** (13/13 pages, 18/18 sites); report SHA-256 `b77d66ee4c235626068202aff31d78c3be8e0e2101afcc39ac5bd48be03e73ed` |
+| Cross-implementation v2 golden | `test/golden/synthetic-2page-v2.nrpt`, 520 B, SHA-256 `6a36b368f1c03d1e3205eb274e455dde99d52b9d6cb49155153612c346671e85`; reference Swift `ProfileCodec.encode` and this Python encoder produce **byte-identical** bytes |
+
+v2 metadata re-resolution result (reported per page by the validator):
+
+| Image | Kind | Unslid VM address | vmSize | Segments | Sections | Verified |
+| --- | --- | --- | --- | --- | --- | --- |
+| AMDRadeonX5000GLDriver | standalone file | `0x0` | `0x14D000` | 4 | 12 | yes |
+| AMDRadeonX5000MTLDriver | dyld shared cache (`.03`) | `0x7FFB08757000` | `0x44FC11` | 4 | 16 | yes |
+| AMDRadeonVADriver2 | dyld shared cache (`.03`) | `0x7FFB08606000` | `0xB8268` | 4 | 11 | yes |
+| AppleGVA | dyld shared cache (`.02`) | `0x7FFA06672000` | `0xEE2CF` | 4 | 16 | yes |
+
+- Every page was re-resolved to a real fixture page: `pageStartVA = imageUnslidVmaddr + pageVmOffset`
+  located in a parsed `LC_SEGMENT_64`/section (all pages `__TEXT`/`__text`), the recorded
+  `pageFileOffset` recomputed from the segment file offset (standalone) or cache mapping table
+  (split-cache subfile offset), and the full 4 KiB FNV page hash + all site finds verified before
+  applying the v1 matching algorithm.
+- AppleGVA page re-resolved to `.02` file offset `0x6696000` (hash `0xBF4200EAD854986D`, site `0x41B`,
+  `0f84d6030000` → `0f842a000000`), matching the pinned mainline derivation.
+- Mutation sweep: 13/13 records rejected with zero writes; range simulations pass (GL 7 chunks, `.03`
+  490 chunks); content-duplicate analysis reports the VADriver2/legacy-VADriver page as an
+  offset-gated warning only (not a false positive).
+- v2 stable error coverage: `E034`–`E041` each have a crafted-byte unit vector (image count/entry,
+  table size, path, page metadata, duplicate path, page vm offset, image geometry) plus model-level
+  encode rejection tests. The scanner tool `tools/find_nrpt_page_origin.py` now reads v2 image
+  metadata and prints each expected hash's target image/pageVmOffset next to the found origin.
+- **Limitation:** the offline validator proves the v2 metadata *reaches* the correct clean fixture
+  page; it cannot exercise the runtime direct-patch `vm_map_read_user`/write path (hardware
+  validation remains Lead-owned).
+
+### 1.4 Frozen hook-only hardware candidate (task-23)
+
+The hook-only candidate was frozen and fully validated offline (full report:
+`build/task23-freeze-validation.md`):
+
+| Item | Value |
+| --- | --- |
+| Frozen commit | `1627fd723814bab7f71f51aade7c598da6e8435b` (`1627fd7`); working-tree kext sources identical (`git diff 1627fd7 -- NootedRedUserPatch/` empty) |
+| Package | `build/packages/NootedRedUserPatch-nrpt-hookonly/{release,debug}` |
+| Release exe | `c8a5131b28ca38a9b8b828dacb49f3e84360cb6b13abfabf94707d557917be76`, 139,272 B |
+| Debug exe | `e40bc0b14b622d0744cae41f58194f7e6f40f8f3540605dc0ef1aa6ba9d1f187`, 182,192 B (diagnosis only) |
+| Injected profile | official NRPT v2 `56afabe0…257bc3f4` (extracted bytes identical); injected `Info.plist` SHA-256 `7b1170f8…e0213c5e` both matrices |
+| Zips | release `fd8dd77a168805a80c1fb818e03d963b8aa7a54a55796c8bbe871a7e1d080e30`, debug `c3693b94221f55f41a2ffc8c600bf87c55883ec43b2477badb344c79856e50ca` |
+| Build provenance | clean rebuild from `1627fd7` is content-identical to the packaged release exe except the 16-byte Mach-O `LC_UUID` |
+
+Verification result: **PASS / so FROZEN for the hardware reboot.** `SHA256SUMS` verify; v2 and v1
+profiles both PASS the strict offline matrix on `version-fixtures/15.8.2` (v2 report
+`661737d0…833ba`, v1 report `b77d66ee…73ed`); direct-patch artifacts are absent from both binaries
+(no `DirectPatch`/`vm_map_read_user`/`vm_map_write_user`/`task_for_pid`/worker symbols); the
+7-arg/6-arg hook ABI, `_cs_validate_page`/`_cs_validate_range` routes and the `_vnode_getname`/
+`_vnode_putname` vnode gate are present. Correction to the round's expectation wording:
+`thread_call_allocate/enter/free` imports remain, but only for the bounded identity-discovery retry
+and the diagnostics refresh timer — there is no direct-patch worker.
+
+Expected hook-only runtime behaviour with the injected v2 profile: vnode gate `active` (wrong-vnode
+pages rejected and counted), full-page FNV content hash alone identifies pages (no pager-offset
+requirement; different-offset content matches are recorded as `HashOnlyAppliedPages`), all site
+`find` bytes must match before an atomic write, already-patched pages are marked applied without a
+rewrite (`AlreadyPatchedPages`), and v1 profiles / missing vnode resolvers keep the legacy
+fail-closed offset gate (`VnodeGate=legacy-offset`). Hardware assertions (`AppliedPages→13`,
+`FindMismatches=0`, `WriteFailures=0`, `VnodeGate=active`, full ioreg block on failure) are
+Lead-owned; see `build/task23-freeze-validation.md` §6.
+
+### 1.5 Package and binary audit (final)
 
 - Both kext matrices built cleanly from frozen HEAD; release is bit-reproducible, debug embeds an
   AppleForge build-date tag and is diagnosis-only.
