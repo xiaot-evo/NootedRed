@@ -8,7 +8,7 @@ struct DyldCacheMapping {
 }
 
 final class DyldCacheReader {
-    static let defaultDirectory = URL(fileURLWithPath: "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld")
+    static let defaultDirectory = FixturePaths.dyldDirectory
 
     private let directory: URL
     private var mappings: [DyldCacheMapping] = []
@@ -122,7 +122,7 @@ final class DyldCacheReader {
         let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         for file in files where file.lastPathComponent.hasPrefix("dyld_shared_cache_x86_64h") {
             if file.pathExtension == "map" || file.pathExtension == "atlas" { continue }
-            guard let handle = try? FileHandle(forReadingFrom: file) else { continue }
+            guard let handle = try? UncachedFile.openHandle(file) else { continue }
             let header = try handle.read(upToCount: 0x68) ?? Data()
             guard header.count >= 0x68, String(data: header.prefix(8), encoding: .ascii)?.hasPrefix("dyld_v1") == true else {
                 try? handle.close()

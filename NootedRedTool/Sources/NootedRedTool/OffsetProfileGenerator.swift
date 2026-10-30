@@ -14,6 +14,7 @@ struct OffsetPage: Codable, Identifiable {
     let driver: String
     let pageVM: UInt64
     let pageFileOffset: UInt64
+    let pageHash: UInt64?
     let sites: [OffsetSite]
 }
 
@@ -43,13 +44,13 @@ struct InstalledProfileSummary {
     let modifiedAt: Date?
 }
 
-private struct SiteSpec {
+struct SiteSpec {
     let offset: UInt32
     let find: String
     let replace: String
 }
 
-private struct PageSpec {
+struct PageSpec {
     enum Source {
         case file(String)
         case cache(String)
@@ -61,7 +62,15 @@ private struct PageSpec {
 }
 
 enum OffsetProfileGenerator {
-    static let parserVersion = "1.0"
+    static let parserVersion = "2.0"
+    static let profileMagic = Data("NRP3".utf8)
+    static let profileVersion: UInt16 = 3
+    static let profileHeaderSize: UInt16 = 64
+    static let profilePageEntrySize: UInt16 = 24
+    static let profileSiteEntrySize: UInt16 = 40
+    static let profileMaxPages: UInt16 = 64
+    static let profileMaxSites: UInt16 = 256
+    static let profileMaxPatchBytes = 16
 
     static func generate(build: String) async throws -> OffsetProfile {
         try await Task.detached(priority: .userInitiated) {
@@ -70,12 +79,15 @@ enum OffsetProfileGenerator {
     }
 
     static func currentBuild() async -> String {
+        if let fixtureBuild = FixturePaths.buildVersion {
+            return fixtureBuild
+        }
         let result = await CommandRunner.run("/usr/bin/sw_vers", ["-buildVersion"])
         return result.output.isEmpty ? "unknown" : result.output
     }
 
     private static func generateSync(build: String) throws -> OffsetProfile {
-        let specs = pageSpecs()
+        let specs = try SiteDiscovery.discover()
         var pages: [OffsetPage] = []
         var fileCache: [String: Data] = [:]
         var cacheReader: DyldCacheReader?
@@ -88,13 +100,13 @@ enum OffsetProfileGenerator {
             let pageFileOffset: UInt64
 
             switch spec.source {
-            case .file(let name):
+            case .file:
                 let url = URL(fileURLWithPath: "\(glDriverPath)")
                 if fileCache[url.path] == nil {
-                    fileCache[url.path] = try Data(contentsOf: url)
+                    fileCache[url.path] = try UncachedFile.read(url)
                 }
                 let data = fileCache[url.path]!
-                image = try MachOParser.parseFile(at: url)
+                image = try MachOParser.parse(data: data)
                 let text = image.segments.first { $0.name == "__TEXT" }!
                 pageVM = image.textStart + spec.pageOffset
                 pageFileOffset = text.fileoff + spec.pageOffset
@@ -115,6 +127,7 @@ enum OffsetProfileGenerator {
             }
 
             let pageData = try readPage(pageVM, 0x1000)
+            let pageHash = fnv1a64(pageData)
             var siteResults: [OffsetSite] = []
 
             for site in spec.sites {
@@ -142,6 +155,7 @@ enum OffsetProfileGenerator {
                 driver: spec.driver,
                 pageVM: pageVM,
                 pageFileOffset: pageFileOffset,
+                pageHash: pageHash,
                 sites: siteResults
             ))
         }
@@ -170,23 +184,67 @@ enum OffsetProfileGenerator {
     }
 
     static func binaryData(_ profile: OffsetProfile) -> Data {
-        var data = Data()
-        data.append(contentsOf: Array("NRPF".utf8))
-        appendLE(UInt16(1), to: &data)                        // version
-        appendLE(UInt16(32), to: &data)                       // header size
-        appendLE(UInt16(profile.pages.count), to: &data)      // page count
-        appendLE(UInt16(0), to: &data)                        // reserved
+        let pages = profile.pages.filter { !$0.sites.isEmpty }
+        let pageCount = pages.count
+        let siteCount = pages.reduce(0) { $0 + $1.sites.count }
+        guard pageCount > 0,
+              pageCount <= Int(profileMaxPages),
+              siteCount > 0,
+              siteCount <= Int(profileMaxSites) else { return Data() }
+
+        var pageTable = Data()
+        var siteTable = Data()
+        var firstSite = 0
+
+        for page in pages {
+            appendLE(page.pageFileOffset, to: &pageTable)
+            appendLE(page.pageHash ?? 0, to: &pageTable)
+            appendLE(UInt32(firstSite), to: &pageTable)
+            appendLE(UInt16(page.sites.count), to: &pageTable)
+            appendLE(UInt16(0), to: &pageTable) // flags
+
+            for site in page.sites {
+                let find = data(fromHex: site.find)
+                let replace = data(fromHex: site.replace)
+                guard find.count > 0,
+                      find.count <= profileMaxPatchBytes,
+                      replace.count == find.count,
+                      site.siteInPage + UInt32(find.count) <= 0x1000 else { return Data() }
+
+                appendLE(UInt16(site.siteInPage), to: &siteTable)
+                siteTable.append(UInt8(find.count))
+                siteTable.append(UInt8(replace.count))
+                siteTable.append(contentsOf: find)
+                siteTable.append(contentsOf: [UInt8](repeating: 0, count: profileMaxPatchBytes - find.count))
+                siteTable.append(contentsOf: replace)
+                siteTable.append(contentsOf: [UInt8](repeating: 0, count: profileMaxPatchBytes - replace.count))
+                siteTable.append(contentsOf: [UInt8](repeating: 0, count: 4)) // reserved
+                firstSite += 1
+            }
+        }
+
+        var payload = Data()
+        payload.append(pageTable)
+        payload.append(siteTable)
 
         var build = Array(profile.build.utf8.prefix(16))
         build.append(contentsOf: [UInt8](repeating: 0, count: 16 - build.count))
-        data.append(contentsOf: build)
 
-        var offsets = Data()
-        for page in profile.pages {
-            appendLE(page.pageFileOffset, to: &offsets)
-        }
-        appendLE(fnv1a32(offsets), to: &data)
-        data.append(offsets)
+        var data = Data()
+        data.append(profileMagic)
+        appendLE(profileVersion, to: &data)
+        appendLE(profileHeaderSize, to: &data)
+        appendLE(UInt16(pageCount), to: &data)
+        appendLE(UInt16(siteCount), to: &data)
+        data.append(contentsOf: build)
+        appendLE(profilePageEntrySize, to: &data)
+        appendLE(profileSiteEntrySize, to: &data)
+        appendLE(UInt32(pageTable.count), to: &data)
+        appendLE(UInt32(siteTable.count), to: &data)
+        appendLE(fnv1a32(payload), to: &data)
+        appendLE(UInt32(0), to: &data) // flags
+        data.append(contentsOf: [UInt8](repeating: 0, count: 16)) // reserved
+        data.append(payload)
         return data
     }
 
@@ -295,8 +353,8 @@ enum OffsetProfileGenerator {
               let personalities = root["IOKitPersonalities"] as? [String: Any],
               let personality = personalities["org.ChefKiss.NootedRedUserPatch"] as? [String: Any],
               let data = personality["NRedOffsetProfile"] as? Data,
-              data.count >= 32,
-              data.prefix(4) == Data("NRPF".utf8)
+              data.count >= 64,
+              data.prefix(4) == profileMagic
         else { return nil }
 
         let bytes = [UInt8](data)
@@ -316,6 +374,15 @@ enum OffsetProfileGenerator {
         for byte in data {
             hash ^= UInt32(byte)
             hash = hash &* 16777619
+        }
+        return hash
+    }
+
+    static func fnv1a64(_ data: Data) -> UInt64 {
+        var hash: UInt64 = 14695981039346656037
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash = hash &* 1099511628211
         }
         return hash
     }
@@ -361,61 +428,17 @@ enum OffsetProfileGenerator {
         return Data(bytes)
     }
 
-    private static let glDriverPath = "/System/Library/Extensions/AMDRadeonX5000GLDriver.bundle/Contents/MacOS/AMDRadeonX5000GLDriver"
+    private static let glDriverPath = FixturePaths.glDriverPath
 
-    private static func pageSpecs() -> [PageSpec] {
-        [
-            PageSpec(driver: "GL HwInfo", source: .file("GL"), pageOffset: 0xE000, sites: [
-                SiteSpec(offset: 0x81, find: "c7477804000000", replace: "c7477801000000")
-            ]),
-            PageSpec(driver: "GL DualQuad", source: .file("GL"), pageOffset: 0x8000, sites: [
-                SiteSpec(offset: 0x160, find: "83e0fe", replace: "83c801")
-            ]),
-            PageSpec(driver: "MTLControl", source: .cache("AMDRadeonX5000MTLDriver"), pageOffset: 0x5C000, sites: [
-                SiteSpec(offset: 0x164, find: "750b", replace: "eb0b"),
-                SiteSpec(offset: 0x198, find: "0f94c0", replace: "31c990")
-            ]),
-            PageSpec(driver: "MTL HwInfo", source: .cache("AMDRadeonX5000MTLDriver"), pageOffset: 0x98000, sites: [
-                SiteSpec(offset: 0x51D, find: "c7477804000000", replace: "c7477801000000")
-            ]),
-            PageSpec(driver: "VDA page0", source: .cache("AMDRadeonVADriver2"), pageOffset: 0x0, sites: [
-                SiteSpec(offset: 0xB96, find: "bb0b000000e991feffff", replace: "bb05000000e991feffff")
-            ]),
-            PageSpec(driver: "VDA page1", source: .cache("AMDRadeonVADriver2"), pageOffset: 0x2000, sites: [
-                SiteSpec(offset: 0x449, find: "4181fc8d000000", replace: "4181fc8e000000")
-            ]),
-            PageSpec(driver: "VDA page2", source: .cache("AMDRadeonVADriver2"), pageOffset: 0x9000, sites: [
-                SiteSpec(offset: 0x987, find: "8d46ff83f802721f", replace: "8d46ff83f802eb1f"),
-                SiteSpec(offset: 0xA49, find: "8d46ff83f802721f", replace: "8d46ff83f802eb1f"),
-                SiteSpec(offset: 0xACB, find: "8d46ff83f802721f", replace: "8d46ff83f802eb1f"),
-                SiteSpec(offset: 0xBD0, find: "488b86600400008b400c8d48ff83", replace: "b80200000090909090908d48ff83"),
-                SiteSpec(offset: 0xC69, find: "488b86600400008b400c8d48ff83", replace: "b80200000090909090908d48ff83")
-            ]),
-            PageSpec(driver: "VDA page3", source: .cache("AMDRadeonVADriver2"), pageOffset: 0x47000, sites: [
-                SiteSpec(offset: 0xF88, find: "b8a40000005dc3", replace: "b8300000005dc3")
-            ]),
-            PageSpec(driver: "VDA page4", source: .cache("AMDRadeonVADriver2"), pageOffset: 0x49000, sites: [
-                SiteSpec(offset: 0x626, find: "4869c0a4000000", replace: "4869c030000000")
-            ]),
-            PageSpec(driver: "VDA page5", source: .cache("AMDRadeonVADriver2"), pageOffset: 0x4A000, sites: [
-                SiteSpec(offset: 0x82C, find: "4869c0a4000000", replace: "4869c030000000")
-            ]),
-            PageSpec(driver: "VDA page6", source: .cache("AMDRadeonVADriver2"), pageOffset: 0x61000, sites: [
-                SiteSpec(offset: 0xC65, find: "3d8d0000000f85", replace: "3d8e0000000f85")
-            ]),
-            PageSpec(driver: "VDA page7", source: .cache("AMDRadeonVADriver2"), pageOffset: 0x77000, sites: [
-                SiteSpec(offset: 0x770, find: "81fe8d0000000f8588000000", replace: "81fe8e0000000f8588000000")
-            ]),
-            PageSpec(driver: "AppleGVA", source: .cache("AppleGVA"), pageOffset: 0x24000, sites: [
-                SiteSpec(offset: 0x41B, find: "0f84d6030000", replace: "0f842a000000")
-            ])
-        ]
-    }
 }
 
 enum GeneratorError: LocalizedError {
     case siteOutOfRange(String, UInt32)
     case findMismatch(String, UInt32, String)
+    case symbolNotFound(String)
+    case patternMissing(String)
+    case replacementLengthMismatch(String)
+    case pageOffsetMismatch(String)
 
     var errorDescription: String? {
         switch self {
@@ -423,6 +446,14 @@ enum GeneratorError: LocalizedError {
             return "\(driver): site offset \(String(format: "0x%X", offset)) 超出页范围"
         case .findMismatch(let driver, let offset, let find):
             return "\(driver): page offset \(String(format: "0x%X", offset)) find 不匹配（期望 \(find)）"
+        case .symbolNotFound(let symbol):
+            return "找不到驱动符号 \(symbol)"
+        case .patternMissing(let detail):
+            return "无法定位补丁指令：\(detail)"
+        case .replacementLengthMismatch(let driver):
+            return "\(driver): replacement 长度与 find 不一致"
+        case .pageOffsetMismatch(let driver):
+            return "\(driver): 同组站点落在不同页面"
         }
     }
 }

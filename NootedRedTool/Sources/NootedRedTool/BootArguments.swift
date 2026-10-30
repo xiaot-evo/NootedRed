@@ -38,7 +38,6 @@ enum BootArgumentManager {
         if value.isEmpty {
             return await CommandRunner.runAsAdmin("/usr/sbin/nvram -d boot-args")
         }
-        let escaped = value.replacingOccurrences(of: "'", with: "'\\''")
-        return await CommandRunner.runAsAdmin("/usr/sbin/nvram boot-args='\(escaped)'")
+        return await CommandRunner.runAsAdmin("/usr/sbin/nvram boot-args=\(CommandRunner.shellSingleQuoted(value))")
     }
 }

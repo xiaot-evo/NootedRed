@@ -3,13 +3,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="NootedRedTool"
-BUILD_DIR="$ROOT/.build/release"
+# 默认使用 SwiftPM 的 .build；在受限环境里可以先单独构建到其他目录，
+# 然后通过 SCRATCH_PATH=<scratch> ./build_app.sh 打包。
+SCRATCH="${SCRATCH_PATH:-$ROOT/.build}"
+BUILD_DIR="$SCRATCH/release"
 APP_DIR="$ROOT/build/$APP_NAME.app"
 MACOS_DIR="$APP_DIR/Contents/MacOS"
 RESOURCES_DIR="$APP_DIR/Contents/Resources"
 
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$BUILD_DIR/$APP_NAME" "$MACOS_DIR/$APP_NAME"
+# App 图标（Dock / Finder / 菜单栏）；由 Scripts/generate-app-icon.swift 生成。
+cp "$ROOT/Assets/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -22,6 +27,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
     <string>NootedRedTool</string>
     <key>CFBundleIdentifier</key>
     <string>com.chefkiss.nootedred.tool</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -31,9 +38,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
     <key>NSHighResolutionCapable</key>

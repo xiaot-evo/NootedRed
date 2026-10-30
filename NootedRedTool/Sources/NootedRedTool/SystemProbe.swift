@@ -1,7 +1,7 @@
 import Foundation
 
 enum SystemProbe {
-    static func snapshot() async -> MachineInfo {
+    static func snapshot(efi: EFIDiscovery, openCore: OpenCoreInfo?) async -> MachineInfo {
         var info = MachineInfo()
 
         async let version = CommandRunner.run("/usr/bin/sw_vers", ["-productVersion"])
@@ -58,36 +58,89 @@ enum SystemProbe {
         info.appliedPages = parseIoregValue(userPatchText, key: "NRedUserPatchAppliedPages") ?? "—"
         info.appliedSites = parseIoregValue(userPatchText, key: "NRedUserPatchSites") ?? "—"
 
-        let efiConfig = FileManager.default.fileExists(atPath: "/Volumes/NO NAME/EFI/OC/config.plist")
-        info.efiState = efiConfig ? "已挂载" : "未挂载"
-        info.efiConfig = efiConfig ? "/Volumes/NO NAME/EFI/OC/config.plist" : "—"
+        info.efiPartitionCount = efi.partitions.count
+        if let mounted = efi.mounted {
+            info.efiState = "已挂载"
+            info.efiDevice = mounted.partition.deviceIdentifier
+            info.efiVolumeName = mounted.partition.displayName
+            info.efiConfig = openCore?.configPath ?? "—"
+        } else if efi.partitions.isEmpty {
+            info.efiState = "未检测到 EFI 分区"
+        } else {
+            info.efiState = "未挂载"
+        }
 
         info.gpuHang = await lastGPUHang()
 
         return info
     }
 
-    static func currentKexts() async -> [KextFileInfo] {
-        let base = URL(fileURLWithPath: "/Volumes/NO NAME/EFI/OC/Kexts")
-        guard FileManager.default.fileExists(atPath: base.path) else {
-            return [
-                KextFileInfo(name: "NootedRed.kext", version: "—", path: "EFI 未挂载", enabled: false, symbol: "shippingbox"),
-                KextFileInfo(name: "NootedRedUserPatch.kext", version: "—", path: "EFI 未挂载", enabled: false, symbol: "shippingbox")
-            ]
+    /// 读取 EFI/OC/Kexts 中的 kext 与 config.plist 的 Kernel > Add 条目并交叉比对。
+    static func currentKexts(efi: EFIDiscovery, openCore: OpenCoreInfo?) async -> [KextFileInfo] {
+        guard let mounted = efi.mounted else { return [] }
+
+        let kextsDirectory = mounted.kextsDirectoryURL
+        let fileManager = FileManager.default
+        let entries = (try? fileManager.contentsOfDirectory(atPath: kextsDirectory.path)) ?? []
+
+        let configEntries = openCore?.kextEntries ?? []
+        var configByPath: [String: OpenCoreKextEntry] = [:]
+        for entry in configEntries {
+            configByPath[entry.bundlePath.lowercased()] = entry
         }
 
         var result: [KextFileInfo] = []
-        let config = NSDictionary(contentsOfFile: "/Volumes/NO NAME/EFI/OC/config.plist")
-        let kernel = config?["Kernel"] as? [String: Any]
-        let addEntries = kernel?["Add"] as? [[String: Any]] ?? []
-        for name in ["NootedRed.kext", "NootedRedUserPatch.kext"] {
-            let path = base.appendingPathComponent(name)
-            let info = path.appendingPathComponent("Contents/Info.plist")
-            let version = (NSDictionary(contentsOf: info)?["CFBundleVersion"] as? String) ?? "—"
-            let entry = addEntries.first { ($0["BundlePath"] as? String) == name }
-            let enabled = (entry?["Enabled"] as? Bool) ?? false
-            result.append(KextFileInfo(name: name, version: version, path: path.path, enabled: enabled,
-                                       symbol: name.contains("UserPatch") ? "square.stack.3d.up" : "cpu"))
+        var seenConfigPaths = Set<String>()
+
+        for name in entries.sorted() where name.hasSuffix(".kext") {
+            let kextURL = kextsDirectory.appendingPathComponent(name)
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: kextURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                continue
+            }
+            let infoPlist = kextURL.appendingPathComponent("Contents/Info.plist")
+            let plist = NSDictionary(contentsOf: infoPlist)
+            let version = (plist?["CFBundleVersion"] as? String)
+                ?? (plist?["CFBundleShortVersionString"] as? String)
+                ?? "—"
+            let configEntry = configByPath[name.lowercased()]
+            if configEntry != nil { seenConfigPaths.insert(name.lowercased()) }
+            let isNootedRed = name.localizedCaseInsensitiveContains("NootedRed")
+            let symbol = name.localizedCaseInsensitiveContains("UserPatch")
+                ? "square.stack.3d.up"
+                : (isNootedRed ? "cpu" : "shippingbox")
+            result.append(KextFileInfo(id: name,
+                                       name: name,
+                                       bundlePath: name,
+                                       version: version,
+                                       path: kextURL.path,
+                                       enabled: configEntry?.enabled ?? false,
+                                       inConfig: configEntry != nil,
+                                       fileExists: true,
+                                       isNootedRed: isNootedRed,
+                                       symbol: symbol))
+        }
+
+        // config 中登记但磁盘上不存在的条目也要显示出来，方便发现配置与文件不一致。
+        for entry in configEntries where !seenConfigPaths.contains(entry.bundlePath.lowercased()) {
+            let isNootedRed = entry.bundlePath.localizedCaseInsensitiveContains("NootedRed")
+            result.append(KextFileInfo(id: entry.bundlePath,
+                                       name: entry.bundlePath,
+                                       bundlePath: entry.bundlePath,
+                                       version: "—",
+                                       path: kextsDirectory.appendingPathComponent(entry.bundlePath).path,
+                                       enabled: entry.enabled,
+                                       inConfig: true,
+                                       fileExists: false,
+                                       isNootedRed: isNootedRed,
+                                       symbol: isNootedRed ? "cpu" : "shippingbox"))
+        }
+
+        result.sort { lhs, rhs in
+            let lhsRank = lhs.isNootedRed ? 0 : 1
+            let rhsRank = rhs.isNootedRed ? 0 : 1
+            if lhsRank != rhsRank { return lhsRank < rhsRank }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
         }
         return result
     }
