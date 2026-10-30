@@ -70,14 +70,24 @@ armed so a later validation of that page can still apply it.  `NRedUserPatchCove
 ## Build / packaging
 
 ```sh
-xmake f -m release -y && xmake -y     # also -m debug
+# from the repository root; needs a sibling AppleForge checkout or $AppleForgePath
+xmake f -m release -y && xmake build --project=. -y NootedRedUserPatch
 ```
 
-Requires Xcode CLT, `xmake` and a sibling AppleForge checkout with Lilu + MacKernelSDK.  Profiles and
-the `NRedProfiles` bundle are produced by the NootedRedTool generator and injected into the kext
+Requires Xcode CLT, `xmake` and a sibling AppleForge checkout with Lilu + MacKernelSDK. The kext lands
+under `build/branches/<branch>/<platform>/<arch>/userpatch/<mode>/` when built through
+`tools/build-branch.sh` (see `../docs/Build-Artifacts.md`); a bare `xmake` uses
+`build/branches/shared/...`. Profiles and the `NRedProfiles` bundle are produced by
+`NootedRedTool --generate-profile`, checked with `test/nrpt_validator.py` and injected into the kext
 `Info.plist` at deploy time (`test/inject_profile.py`); the kext never reads files, boot arguments or
-the IORegistry for patch data.  A new macOS build needs a new generated profile, not a new kext binary.
-Packages are built under `build/packages/`.  **No EFI deployment is done from this directory.**
+the IORegistry for patch data. A new macOS build needs a new generated profile, not a new kext binary.
+
+Supported macOS range is Catalina → Tahoe (`NRedBeta` is required outside the declared range). Session
+control: `-NRedUserPatchOff` disables this kext while leaving the main kext intact;
+`-NRedUserPatchDebug` enables logging; `-NRedUserPatchBeta` allows beta builds. **No EFI deployment is
+done from this directory** — that belongs to the Lead.
+
+User-facing docs: `../docs/INSTALLATION.md`. Contract: `../docs/PatchProfile-Spec.md`.
 
 ## Source layout
 

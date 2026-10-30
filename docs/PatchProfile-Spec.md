@@ -515,11 +515,16 @@ Contract properties:
   hook; contributes the `DYLD` matching domain. Only whole chunks are processed; a trailing partial
   chunk is ignored.
 - The vnode name gate is **defense in depth**, not identity: when the consumer can resolve the hook's
-  vnode name, it MUST enforce mode-consistent acceptance — a PAGE record's image must be a
+  vnode name, it SHOULD enforce mode-consistent acceptance — a PAGE record's image must be a
   standalone image whose path basename appears in the vnode name; a DYLD record's vnode must be a
   dyld-shared-cache vnode (name contains `dyld_shared_cache` or `dyld`). When the resolver is not
   available, matching proceeds with the mandatory hash+site identity and the consumer reports
   `VnodeGate = 0`; absence of the gate never weakens the content check.
+
+  **Shipped consumer:** the released `NootedRedUserPatch` does not implement this gate at all (see the
+  Consumer note at the end) — real deliveries do not guarantee a resolvable vnode name, and identity
+  is already the full page content. `test/nrpt_validator.py` can still simulate the stricter gate, so a
+  green validator run is not evidence that the kext routes identically.
 - Both hooks may run in memory-object/code-signing context: the profile MUST already be copied into
   static memory; no hook may touch the original injected `OSData` bytes.
 
@@ -844,11 +849,13 @@ driver binary needs to be committed):
 ## 19. References
 
 - `analysis/lilu-dyld-shared-cache-profile-engine.md` — target architecture, page-identity rationale
-  and kext safety constraints.
+  and kext safety constraints (local research notes; `analysis/` is untracked).
 - `analysis/xnu-lilu-page-validation.md` — macOS 15 `_cs_validate_page` / `_cs_validate_range` ABI
-  and the 7-argument hook (kept in the working tree under `build/revert-backup/` if absent from
+  and the 7-argument hook (untracked; also kept under `build/revert-backup/` if absent from
   `analysis/`).
-- `docs/Profile-Engine-Validation.md` — offline validation report of the current profile.
+- `research/Profile-Engine-Validation.md` — offline validation record of the current profile (local,
+  untracked; index in `research/README.md`).
+- `docs/COMPATIBILITY.md` — what is actually hardware-validated.
 - Apple TN3126, *Inside Code Signing: Hashes* — code-directory page hashes and 4 KiB page slots.
 - FNV reference: Fowler–Noll–Vo hash function, FNV-1a 32/64 variants (offset basis `0x811C9DC5` /
   `0xCBF29CE484222325`, prime `0x01000193` / `0x100000001B3`).

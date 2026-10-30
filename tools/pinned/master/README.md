@@ -1,5 +1,9 @@
 # Pinned master table sources
 
+> **Legacy v1 data (retired 2026-10-29).** Nothing here is a build input: the deployed profile is
+> generated per macOS build by `NootedRedTool` and injected as `NRedProfiles`. Kept for provenance;
+> see [`RETIRED.md`](../../RETIRED.md).
+
 The satellite branch removes the mainline user-space patch code and its exact-page tables from
 `NootedRed/`. The host tools need those exact source bytes to derive the checked-in fixtures, the
 deployment specs and `PatchData/`, so this directory is a byte-for-byte snapshot of the relevant

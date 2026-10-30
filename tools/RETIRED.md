@@ -1,42 +1,59 @@
-# Retired tooling (satellite split)
+# Retired tooling
 
-The `research/satellite-userpatch` branch removed the in-memory user-space patcher (GLFIX/Metal/VDA)
-from `NootedRed.kext`. The satellite kext now applies embedded PatchData in `NootedRedUserPatch/`, and
-the host pipeline generates/validates/embeds that data as documented in
-[`tools/README-userpatch-data.md`](README-userpatch-data.md).
+Two retirement waves. **Their failures are expected; do not treat them as regressions.** Everything
+here is recoverable from git history.
 
-These files were retired with that change. They are recoverable from git history, but running them at
-HEAD fails because they parse `NootedRed/UserPatches.cpp`, `GLFixSemanticData.hpp`,
-`VDAVAData*.hpp` / `VDAGVAData*.hpp` or other files that no longer exist. **They are expected to be
-obsolete; do not treat their failures as regressions.**
+- **Wave 1 (satellite split, 2026-10-23):** the in-memory user-space patcher was removed from
+  `NootedRed.kext` and moved into `NootedRedUserPatch`. Tools that generated or tested C++ page arrays
+  for the main kext died with it.
+- **Wave 2 (NRPT v3, 2026-10-29):** the embedded NRPD v1 `PatchData` blob was replaced by an injected
+  v3 profile bundle. The whole blob pipeline stopped being a build input.
 
-| Retired file | What it did | Current replacement |
+## Wave 1 — deleted files
+
+| Retired file | What it did | Replacement |
 | --- | --- | --- |
-| `tools/test_gl_semantic_data.py` (deleted) | validated semantic GL/Metal contexts from removed `GLFixSemanticData.hpp` | exact-page data in `PatchData/`, validated by `tools/test_userpatch_data.py` |
-| `tools/test_patch_data.py` (deleted) | validated `UserPatches.cpp` page arrays and patch-set table | `tools/test_userpatch_data.py` (format + `PatchData/`), `tools/convert_master_patchdata.py --check` |
-| `tools/test_patchset_selection.py` (deleted) | reimplemented the deleted `UserPatches::selectPatchSet()` and tested only itself (false green) | — |
-| `gen_patch_data.py` (deleted) | emitted C++ page arrays / `PagePatch` rows for the removed in-memory patcher | `tools/userpatch_data.py` (binary `manifest.bin`/`pages.bin`), `tools/convert_master_patchdata.py` (derivation) |
-| `gen_vda_va_data.py`, `gen_vda_gva_data.py` (deleted) | emitted `VDAVAData*.hpp` / `VDAGVAData*.hpp` C++ headers | pinned master tables + `tools/convert_master_patchdata.py` → `PatchData/` kinds 3/4 |
-| `collect_compat_data.py` (deleted) | rebuilt mainline patch tables/C++ headers from a target machine | `tools/collect_platform_data.py` (generic hardware/driver data); `PatchData/` + pinned master for patch tables |
-| `collect_target_data.py`, `README-collect-target-data.md` (deleted) | archived GL/MTL-only target collector before the generic platform collector | `tools/collect_platform_data.py` + `tools/adaptation_info.py` |
-| `tools/gen_vcn_kernel_data.py` (deleted) | generated the static `VCNData/24H*.hpp` call-site table | `NootedRed/VCNRuntimeResolver.cpp` (live Mach-O symbol/vtable parsing) |
-| `tools/test_vcn_data.py` (deleted) | tested the removed static VCNData table and build selector | `tools/collect_validation_fixtures.py` plus the runtime resolver's own validation |
-| `tools/vda_preflight.sh` (deleted) | checked the removed 15.8.1-only static VDA/VCN data and old generators | runtime resolver diagnostics and `tools/collect_validation_fixtures.py` |
+| `tools/test_gl_semantic_data.py` | validated semantic GL/Metal contexts from `GLFixSemanticData.hpp` | NRPT v3 profile, validated by `test/nrpt_validator.py` |
+| `tools/test_patch_data.py` | validated `UserPatches.cpp` page arrays and the patch-set table | `test/nrpt_validator.py` |
+| `tools/test_patchset_selection.py` | reimplemented the deleted `UserPatches::selectPatchSet()` and tested only itself (false green) | profile selection in `PatchProfile.cpp`, simulated by the validator |
+| `gen_patch_data.py` | emitted C++ page arrays / `PagePatch` rows for the in-memory patcher | `NootedRedTool --generate-profile` |
+| `gen_vda_va_data.py`, `gen_vda_gva_data.py` | emitted `VDAVAData*.hpp` / `VDAGVAData*.hpp` | VDA sites resolved by `SemanticRules.swift` |
+| `collect_compat_data.py` | rebuilt mainline patch tables/C++ headers from a target machine | `collect_platform_data.py` + `NootedRedTool` |
+| `collect_target_data.py`, `README-collect-target-data.md` | GL/MTL-only target collector before the generic one | `collect_platform_data.py`, `collect_validation_fixtures.py` |
+| `tools/gen_vcn_kernel_data.py` | generated the static `VCNData/24H*.hpp` call-site table | `NootedRed/VCNRuntimeResolver.cpp` (live symbol/vtable parsing) |
+| `tools/test_vcn_data.py` | tested the removed static VCNData table and build selector | runtime resolver diagnostics |
+| `tools/vda_preflight.sh` | checked the removed 15.8.1-only static VDA/VCN data | `vda_selftest.sh`, `vda_hwtest.sh` |
 
-Kept because they are still valid:
+## Wave 2 — present but superseded
 
-- `tools/collect_validation_fixtures.py` — collects kernel collections and dyld caches from installers /
-  mounted images for offline version validation.
-- `tools/test_userpatch_data.py` — format, generator/validator, pinned-source and generated-data tests.
-- `tools/test_build_artifacts.py` — guards the CI/build-branch globs for the main and satellite zips.
-- `tools/embed_patchdata.py`, `tools/test_embedded_patchdata.py` — deterministic embedding of
-  `PatchData/` into `NootedRedUserPatch/PatchDataBlob.{hpp,cpp}` and its host validation (the satellite
-  no longer reads external data at runtime).
-- `tools/master_source.py`, `tools/master_tables.py`, `tools/convert_master_patchdata.py`,
-  `tools/userpatch_data.py`, `tools/extract_userpatch_fixture.py` — the current data pipeline.
-- `tools/collect_platform_data.py`, `import_platform_data.py`, `adaptation_info.py`, `hwinfo_probe.c`,
-  `gl_blend_probe.c`, the VDA/Firefox shell helpers and their READMEs — independent of the removed
-  in-memory backend (some still target the main kext VCN bridge or collection workflows).
+These files still exist because they are cheap to keep and occasionally useful for archaeology. None
+of them is on the current path: the kext parses only `NRedProfiles` (`PatchProfile.cpp`), and
+`xmake.lua` compiles no generated data.
 
-Historical descriptions live under [`docs/archive/`](../docs/archive/README.md); they are not
-implementation guidance.
+| File / directory | Why it is dead |
+| --- | --- |
+| `PatchData/` (data + `README.md`) | NRPD v1 sets (`24H32`). No consumer: `PatchDataBlob.*` was deleted with the v3 move. |
+| `userpatch_data.py`, `test_userpatch_data.py` | NRPD v1 codec and its tests |
+| `convert_master_patchdata.py`, `master_source.py`, `master_tables.py` | derive `PatchData/` from the pinned master snapshot |
+| `extract_userpatch_fixture.py` | builds v1 fixtures for the above |
+| `embed_patchdata.py`, `test_embedded_patchdata.py` | generate/validate the `PatchDataBlob.*` C++ arrays |
+| `specs/`, `fixtures/`, `pinned/master/`, `sources/` | v1 inputs, test vectors and provenance |
+
+Replacement for all of the above: `NootedRedTool --generate-profile` →
+`test/nrpt_validator.py` → `test/inject_profile.py`. Contract:
+`../docs/PatchProfile-Spec.md`. Format history: `../research/legacy/NRPD-v1-Format.md`.
+
+> **Hazard:** `embed_patchdata.py --write` still emits `NootedRedUserPatch/PatchDataBlob.cpp`, and
+> `xmake.lua` globs `NootedRedUserPatch/**.cpp`. Running it silently adds the dead blob to the kext and
+> it will be compiled and signed. Don't run it unless you are deliberately reviving v1, and delete the
+> generated files afterwards.
+
+## Still current
+
+- `build-branch.sh`, `build.sh`, `test_build_artifacts.py` — build entry points and artifact guards.
+- `collect_validation_fixtures.py`, `collect_platform_data.py`, `import_platform_data.py`,
+  `adaptation_info.py` — collection and triage; version-independent.
+- `find_nrpt_page_origin.py` — maps delivered page hashes back to images (v3).
+- `gl_blend_probe.c`, `hwinfo_probe.c` — GPU diagnostics.
+- `set_vda_bootarg.sh`, `vda_selftest.sh`, `vda_hwtest.sh`, `deploy_vda.sh` — VDA opt-in and validation.
+- `firefox-hwdecode-launcher.sh`, `Firefox-HW-Decode.command` — browser HW-decode launcher.

@@ -40,12 +40,15 @@ venv/
 # Local workspace / agent instructions
 # ---------------------------------------------------------------------------
 /AGENTS.md
+/CLAUDE.md
 /.agents/
+/.dsh-meow/
 
 # ---------------------------------------------------------------------------
 # Local research notes (kept on the developer machine, not tracked)
 # ---------------------------------------------------------------------------
 /analysis/
+/research/
 /Chromium-OpenGL-Issue-Report.md
 
 # ---------------------------------------------------------------------------

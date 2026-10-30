@@ -26,7 +26,7 @@
 
 // A single source of truth for per-device graphics and media capabilities.
 //
-// This is the hardware half of the compatibility model described in docs/Compatibility-Architecture.md:
+// This is the hardware half of the per-device capability model: see docs/COMPATIBILITY.md and
 // the other half is the identity of the Apple binary being patched.  A profile answers "what can this APU
 // do" (graphics policy, media policy, validation level); it deliberately does not contain patch bytes or
 // per macOS build data, so adding an APU never duplicates patch data and adding a macOS build never
@@ -51,9 +51,8 @@ public:
         kBarcelo,
     };
 
-    // Coarse validation roll-up for a profile.  The authoritative per-feature level is generated from the
-    // compatibility manifest (docs/Compatibility-Architecture.md, Milestone 4); until then this only
-    // controls logging and diagnostics.
+    // Coarse validation roll-up for a profile.  The authoritative per-feature level is tracked in
+    // docs/COMPATIBILITY.md; this only controls logging and diagnostics.
     enum SupportLevel : UInt8 {
         kUnavailable = 0,
         kExperimental,

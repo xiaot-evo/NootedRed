@@ -1,9 +1,15 @@
 # UserPatch source data
 
+> **Retired (2026-10-29).** This is the NRPD v1 data set. The satellite no longer compiles or reads it —
+> profiles are now generated per build by `NootedRedTool` and injected as the `NRedProfiles`
+> personality property. Nothing in `xmake.lua` or CI touches this directory; keep it only as
+> provenance. Live contract: [`docs/PatchProfile-Spec.md`](../docs/PatchProfile-Spec.md); retirement
+> ledger: [`tools/RETIRED.md`](../tools/RETIRED.md).
+
 Build-time source data for the embedded tables in `NootedRedUserPatch.kext`, in the format defined by
-[`docs/UserPatch-Data-Format.md`](../docs/UserPatch-Data-Format.md). Each subdirectory is one exact
-macOS build; it is compiled into the kext through `tools/embed_patchdata.py` and is **not** copied to
-`/Library/Application Support` at runtime.
+`research/legacy/NRPD-v1-Format.md`. Each subdirectory is one exact macOS build; it was compiled into
+the kext through `tools/embed_patchdata.py` and is **not** copied to `/Library/Application Support` at
+runtime.
 
 **Do not edit these binaries by hand.** They are derived deterministically from the pinned master
 snapshot (`tools/pinned/master` at commit `0efa6f4`) plus the explicitly pinned supplementary source
@@ -29,17 +35,14 @@ pinned from the research branch's `MTLHwInfoData.hpp`. Its source bytes are chec
 hardware-validated for the 15.8.1 / `0x1638` wallpaper and `sips` HEIC conversion workload; the
 other 15.8.1 pages remain master's stock arrays.
 
-## Embed / install
+## Embed / install (no longer used)
 
-```sh
-python3 tools/embed_patchdata.py --write    # regenerate PatchDataBlob.*
-python3 tools/embed_patchdata.py --check    # fail if generated blob is stale
-# rebuild and re-sign NootedRedUserPatch.kext, then install it through OpenCore
-```
+The historical commands were `python3 tools/embed_patchdata.py --write` followed by re-signing the
+kext. **Do not run them**: the generated `NootedRedUserPatch/PatchDataBlob.cpp` would be picked up by
+the `NootedRedUserPatch/**.cpp` glob and compiled into the kext. Current deployment is
+`NootedRedTool --generate-profile` + `test/inject_profile.py`.
 
-The satellite selects the exact embedded build whose `kern.osversion` matches. There is no runtime
-data directory to copy or remove; a mismatched build or checksum is a fail-closed `NoOp`. Adding a
-build requires regenerating the blob and rebuilding/re-signing the kext.
+Adding a new macOS build means generating a new NRPT v3 profile, not touching this directory.
 
 ## Regenerate / verify
 

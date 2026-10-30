@@ -178,7 +178,7 @@ void NRed::processPatcher(KernelPatcher&)
     this->deviceID = static_cast<UInt16>(WIOKit::readPCIConfigValue(this->iGPU, WIOKit::kIOPCIConfigDeviceID));
     // Legacy attribute mapping kept for the existing hardware paths (X5000/HWLibs).  The compatibility
     // layer's source of truth for family and capability is DeviceProfile, which distinguishes Cezanne and
-    // Barcelo explicitly (see docs/Compatibility-Architecture.md).
+    // Barcelo explicitly (see docs/COMPATIBILITY.md).
     switch (this->deviceID) {
         case 0x15D8: {
             this->attributes.setPicasso();

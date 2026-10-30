@@ -97,11 +97,15 @@ namespace
     }
 
     // Readiness contract with the NootedRedUserPatch satellite kext: while VCNBridge::loadReady() is true,
-    // publish a 32-bit non-zero `NRedVCNBridgeReady` on the AMD iGPU IOPCIDevice.  The satellite reads that
-    // property before applying VDA/AppleGVA user-space pages, so it is refreshed on every readiness
-    // transition (X6000 load completion, accelerator start rollback, failed engine allocation, failed
-    // initHardware and accelerator stop), not only when the engine is allocated.  Absent or zero means
-    // "not ready" and leaves VDA pages unpatched.  The main kext itself does not read this property.
+    // publish a 32-bit non-zero `NRedVCNBridgeReady` on the AMD iGPU IOPCIDevice.  It is refreshed on every
+    // readiness transition (X6000 load completion, accelerator start rollback, failed engine allocation,
+    // failed initHardware and accelerator stop), not only when the engine is allocated.  Absent or zero
+    // means "not ready".
+    //
+    // Diagnostic only: the satellite no longer reads this property.  VDA user-space pages are gated by the
+    // profile identity and page content, because AppleGVA/VADriver pages are often validated before the
+    // bridge can be ready.  The property exists so a human can tell whether the kernel bridge is up.
+    // The main kext itself does not read it.
     const char* const kBridgeReadyProperty = "NRedVCNBridgeReady";
 
     // acceleratorStop() withdraws readiness because no accelerator exists while stopped.  The X6000 kext

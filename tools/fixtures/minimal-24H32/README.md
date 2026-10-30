@@ -1,5 +1,9 @@
 # Fixture: minimal 24H32 loader test vector
 
+> **Legacy v1 data (retired 2026-10-29).** Nothing here is a build input: the deployed profile is
+> generated per macOS build by `NootedRedTool` and injected as `NRedProfiles`. Kept for provenance;
+> see [`RETIRED.md`](../../RETIRED.md).
+
 One GL table, one page, one site, `apuMask` bit 5 (GreenSardine), for Darwin 24.6.0 / build `24H32`.
 This is the smallest valid manifest the generator can emit (188-byte `manifest.bin`, 4096-byte
 `pages.bin`) and is meant to let the satellite loader/selection tests exercise the format with a

@@ -8,7 +8,8 @@ directory per macOS build that can be dropped into a PatchData root:
     <out>/<build>/pages.bin
     <out>/<build>/manifest.json   # human-readable copy, ignored by the kext
 
-The binary layout is defined in ``docs/UserPatch-Data-Format.md``. Adding a new
+The binary layout is defined in ``research/legacy/NRPD-v1-Format.md`` (local research copy of the
+retired v1 contract; see tools/RETIRED.md). Adding a new
 build means writing a new spec (plus page images); no tool source changes and no
 kext rebuild are needed.
 
@@ -46,7 +47,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# --- Format constants (must match docs/UserPatch-Data-Format.md) -------------------------------
+# --- Format constants (must match research/legacy/NRPD-v1-Format.md) ---------------------------
 
 PAGE_SIZE = 0x1000
 MAGIC = b"NRPD"

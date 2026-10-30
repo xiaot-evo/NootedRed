@@ -1,154 +1,79 @@
-# NootedRed current modules and support matrix
+# 模块职责与支持范围
 
-Status date: 2026-10-23. This document describes the tree as it actually builds and boots after the
-satellite split and the embedded-PatchData change.
+状态日期：2026-10-30。本文按当前代码树描述模块边界（谁做什么、谁不许做什么）、硬件档位和开关。
+架构与数据流见 [ARCHITECTURE.md](ARCHITECTURE.md)，逐 build/APU 状态见
+[COMPATIBILITY.md](COMPATIBILITY.md)。
 
-## 1. Module architecture
+## 1. 模块职责
 
-```
-Lilu
- ├── NootedRed.kext
- │     kernel-side AMD iGPU enablement only
- │     - X5000/X6000/HWLibs/AGDP/Backlight/AppleGFXHDA kernel patches
- │     - framebuffer, DC, power management, SMU/PSP
- │     - VCN kernel bridge/firmware
- │     - publishes NRedVCNBridgeReady on the AMD iGPU IOPCIDevice
- │     - no user-space GL/Metal/VDA page tables or _cs_validate_* hooks
- │
- └── NootedRedUserPatch.kext
-       satellite Lilu plugin, auto-loaded only when NootedRed is present
-       - exact 4 KiB page backend for _cs_validate_page/_cs_validate_range
-       - embedded PatchData arrays (no runtime VFS)
-       - exact build + APU-mask selection
-       - VDA/AppleGVA gated on NRedVCNBridgeReady
-       - no semantic scanner, no deferred page pointers
-```
-
-### Data flow
-
-```
-PatchData/<build>/manifest.bin + pages.bin        (build-time source, checked in)
-        │ tools/embed_patchdata.py
-        ▼
-NootedRedUserPatch/PatchDataBlob.cpp/.hpp           (generated static const arrays)
-        │ linked into kext
-        ▼
-NootedRedUserPatch.kext
-        │ load embedded set -> exact 4 KiB page match
-        ▼
-_cs_validate_page/_cs_validate_range
-        │ complete 4 KiB compare -> verify site find -> write replace
-        ▼
-user-space GL/Metal/VDA pages patched
-```
-
-`PatchData/` is no longer copied to `/Library/Application Support`. It is build-time input only.
-
-## 2. Boot flow
-
-1. OpenCore loads Lilu, then `NootedRed.kext` and `NootedRedUserPatch.kext`. The satellite's
-   `OSBundleLibraries` declares `org.ChefKiss.NootedRed`, so it only loads when the main kext exists.
-2. Satellite `pluginStart` registers `onPatcherLoadForce`; it does no filesystem work.
-3. At Lilu patcher load, the satellite installs `_cs_validate_page`/`_cs_validate_range`
-   unconditionally, then loads the embedded data set for exact `kern.osversion`.
-4. No match/validation failure = `NoOp`; no page is written.
-5. Main kext brings up the VCN bridge; after `VCNBridge::loadReady()` it publishes
-   `NRedVCNBridgeReady=1` on the iGPU as a status/diagnostic signal. `acceleratorStop`/failure
-   publishes `0`; the next successful start republishes `1`.
-6. VDA/AppleGVA pages are applied only when the user passed `-NRedVDA`; the satellite no longer reads
-   the readiness property for page gating. GL/Metal pages do not depend on the flag.
-7. The hooks compare complete pages; on exact match they verify `find` at the recorded offset and write
-   `replace` under the kernel write lock. A mismatched page is left untouched.
-
-## 3. Module responsibilities
-
-| Module | Responsibility | Must not do |
+| 模块 | 职责 | 不许做 |
 | --- | --- | --- |
-| `NootedRed.kext` | kernel patching, FB/DC/PM/SMU, VCN bridge, readiness publication | user-space page patching, VFS reads at boot |
-| `NootedRedUserPatch.kext` | user-space exact-page GL/Metal/VDA patches, embedded data | kernel kext patching, runtime VFS/plist reads, semantic scans |
-| `PatchData/` + `tools/embed_patchdata.py` | source data and deterministic embedding | runtime loading |
-| `tools/convert_master_patchdata.py` | derive PatchData from pinned master exact tables | hand-editing page bytes |
-| `VCNData/` | exact 24H32 kernel VCN call-site/guard data | user-space page data |
+| `NootedRed.kext` | 内核补丁、FB/DC/PM/SMU/PSP、VCN 内核桥、发布 `NRedVCNBridgeReady` 状态属性 | 用户态页补丁、启动期 VFS 读取 |
+| `NootedRed/X5000.cpp` `X6000FB.cpp` `HWLibs.cpp` `AGDP.cpp` `Backlight.cpp` `AppleGFXHDA.cpp` | 各 Apple kext 的字节模式补丁与 vtable 修正 | 生成或携带用户态页数据 |
+| `NootedRed/VCNRuntimeResolver.cpp` | 运行时解析 X5000/X6000 的符号与 vtable | 依赖写死的 build 字符串或静态表 |
+| `NootedRed/DeviceProfile.*` | 设备 ID → 家族/VCN/媒体能力；`GraphicsPolicy`/`MediaPolicy` | 猜测未知设备（未知即 panic，见 §3） |
+| `NootedRedUserPatch.kext` | `_cs_validate_page`/`_cs_validate_range` 上的整页内容补丁 | 内核 kext 补丁、运行时读文件/读 plist、语义扫描 |
+| `NootedRedTool` | 从干净 fixture 生成/校验/注入 NRPT v3 profile | 在卫星已加载的系统上生成 profile |
+| `test/nrpt_validator.py` `test/inject_profile.py` | 独立校验与注入 | 参与构建产物 |
 
-## 4. macOS support
+`NootedRed/Kexts.cpp` 是「要打哪些 Apple kext」的唯一清单（`KernelPatcher::KextInfo` + 磁盘路径）。
+新增 patcher 模块时同时更新它，否则补丁永远不会被投递。
 
-`NootedRed.kext` declares Catalina through Tahoe. Actual kernel data is build-specific; the tables
-below describe what is present, not a promise that every combination is hardware validated.
+## 2. 硬件档位（DeviceProfile）
 
-| macOS | Darwin | Main kernel/VCN | Satellite embedded data |
-| --- | --- | --- | --- |
-| 15.8.1 (`24H32`) | 24.6 | VCN 2.x bridge, validated target | GL + Metal + VDA/VA + AppleGVA |
-| other builds | other | kernel patches only; no VCN data | no embedded data (fail-closed no-op) |
+`MediaPolicy` 描述每个设备的媒体能力，字段与固件对应关系如下：
 
-The satellite has **no semantic or nearest-build fallback**. A build without an embedded directory is
-a terminal `BuildUnsupported` NoOp.
+| device ID | 家族 | VCN | 版本码 | 固件 | H.264 | HEVC | 内核媒体 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `0x1636` | Renoir | 2.2 | `0x0202` | `ativvaxy_nv.dat` | 启用 | 启用 | 开 |
+| `0x1638` | Renoir / Green Sardine | 2.2 | `0x0202` | `ativvaxy_nv.dat` | 启用 | 启用 | 开（硬件验证目标机） |
+| `0x164C` | Cezanne | 2.2 | `0x0202` | `ativvaxy_nv.dat` | 启用 | 启用 | 开 |
+| `0x15E7` | Barcelo | 2.2 | `0x0202` | `ativvaxy_nv.dat` | 启用 | 启用 | 开 |
+| `0x15DD` | Raven | 1.0-class | `0x0100` | `ativvaxy_rv.dat` | 启用 | 启用 | 关（无 VCN 2.x 路径） |
+| `0x15D8` | Raven2 / Picasso | 1.0-class | `0x0100` | `ativvaxy_rv.dat` | 启用 | 启用 | 关（无 VCN 2.x 路径） |
 
-## 5. APU support
+`ring`/`fence` 尺寸对 VCN 2.2 是 `0x10000`/`0x1000`；`av1` 恒为 0。启动日志形如：
 
-### Device profiles in the main kext
+```text
+media{gate=0 vcn=0x0202 fw=ativvaxy_nv.dat ring=0x10000 fence=0x1000 h264=1 hevc=1 av1=0}
+```
 
-| Device ID | Family | Graphics kernel path | VCN generation | Kernel media |
-| --- | --- | --- | --- | --- |
-| `0x1636` | Renoir | supported (experimental) | VCN 2.2 | enabled |
-| `0x1638` | Renoir / Green Sardine | supported (experimental) | VCN 2.2 | enabled (hardware-validated target) |
-| `0x164C` | Cezanne | supported (experimental) | VCN 2.2 | enabled |
-| `0x15E7` | Barcelo | supported (experimental) | VCN 2.2 | enabled |
-| `0x15DD` | Raven | supported (experimental) | VCN 1.0 | disabled (no VCN1 path) |
-| `0x15D8` | Raven2 / Picasso | supported (experimental) | VCN 1.0 | disabled (no VCN1 path) |
+## 3. 未知设备
 
-### Satellite data coverage
+`DeviceProfile::forDevice()` 对未登记的 device ID 返回空，但 `NRed::processPatcher()` 在此之前就会
+**panic**（Barcelo 的显式分支之后没有通用回落）。所以「未知设备 = 安全降级」这条路径实际不可达：
+新增 APU 必须先登记 `DeviceProfile`，再谈用户态数据。
 
-| APU | Data APU mask bits | 24H32 GL/Metal | 24H32 VDA |
-| --- | --- | --- | --- |
-| Raven `0x15DD` | bit 0 | data selectable, not hardware-validated | gated off (main media disabled) |
-| Raven2/Picasso `0x15D8` | bits 1/2 | data selectable, not hardware-validated | gated off (main media disabled) |
-| Renoir `0x1636` / Cezanne `0x164C` | bits 3/4 | data selectable; not hardware-validated | ready-gated; not hardware-validated |
-| Green Sardine `0x1638` | bits 3/5 | applied on current machine (24H32) | ready-gated; VCN ready observed |
-| Barcelo `0x15E7` | bits 3/5 | data selectable; not hardware-validated | ready-gated; not hardware-validated |
+## 4. 内核侧启动顺序
 
-Important distinctions:
+1. OpenCore 加载 Lilu，然后 `NootedRed.kext`；卫星因 `OSBundleLibraries` 依赖随后加载。
+2. 主 kext `processPatcher()` 按 `Kexts.cpp` 表完成内核补丁，登记 IBM 加速器 personality。
+3. 加速器 start 时按 `-NRedVDA` 决定是否请求 VCN 桥；桥就绪后发布 `NRedVCNBridgeReady=1`。
+4. 卫星在 Lilu patcher load 阶段装钩子、选 profile；主 kext 的 readiness 属性只作状态/诊断，
+   **不再是卫星的页面开关**。
 
-- "data selectable" means the exact embedded build contains a table whose mask intersects the APU;
-  it does not mean the feature was tested on that APU.
-- `0x15DD`/`0x15D8` have no VCN 2.x media path; the satellite may select GL/Metal data but VDA pages
-  remain unapplied because `NRedVCNBridgeReady` is never published.
-- Current hardware validation is `0x1638` / macOS 15.8.1. The satellite loads and applies the embedded
-  24H32 page set; feature-level Chrome/Zen/QQ/VDA tests remain a separate checklist.
+## 5. 启动参数
 
-## 6. Feature status summary
-
-| Feature | Main kext | Satellite | Status |
-| --- | --- | --- | --- |
-| AMD iGPU framebuffer/DC/PM/SMU | yes | no | experimental |
-| VCN 2.2 kernel bridge | yes | no | experimental; 0x1638 validated target |
-| GL dual-quad / HwInfo exact pages | no | yes (24H32) | runtime loaded/applied on 0x1638/24H32; feature tests pending |
-| Metal gate/allow/HwInfo exact pages | no | yes (24H32) | 0x1638/24H32: gate/allow + supplementary HwInfo A1 applied; wallpaper/sips compute no longer resets |
-| VDA/VA + AppleGVA user pages | no | yes (24H32) | data present; VDA decode needs hardware checklist |
-| VCN 1.x media | no path | no | unsupported |
-| X5000 compute-submit GFXOFF hook | yes | no | vtable fix hardware-observed on 0x1638/24H32; GFXOFF reset alone is not sufficient for the wallpaper compute reset |
-
-`24H32` now carries 13 pages / 18 sites: the master GL/Metal/VDA pages plus the supplementary Metal
-HwInfo A1 page (`numShaderEngines 4 -> 1`, pinned in `tools/sources/24H32/metal-hwinfo-page.bin`).
-On 15.8.1 / `0x1638` the satellite applied all five expected pages (aggregate
-`NRedUserPatchAppliedPages=5`); two controlled `sips` HEIC conversions completed without new GPU
-restarts.
-
-The X5000 compute-submit hook resets the GFXOFF idle timer before PM4 compute submissions so idle
-power gating cannot stall a compute queue. The upstream implementation applied the version-specific
-`ObjectField` offset to the `__ZTV` symbol instead of the vtable address point, which targeted the
-wrong virtual-function slot; the restored implementation adds the two Itanium C++ ABI header slots,
-verifies the slot still equals the resolved `AMDPM4HWChannel::submitCommandBuffer`, and skips
-installation instead of corrupting the vtable when the layout does not match.
-
-## 7. Boot arguments and rollback
-
-| Argument | Effect |
+| 参数 | 作用 |
 | --- | --- |
-| `-NRedVDA` | enable the kernel VCN bridge; required for satellite VDA data to become applicable |
-| `-NRedUserPatchOff` | disable the satellite plugin |
+| `-NRedOff` | 完全关闭 NootedRed（救援用） |
+| `-NRedNoAccel` | 只做 FB，不加载加速器（调试用） |
+| `-NRedVDA` | 请求 VCN 内核桥（硬解/硬编实验路径） |
+| `-NRedBeta` | 允许在不支持的 macOS 版本上加载（内部） |
+| `-NRedDebug` | 打开 `DBGLOG` 输出 |
+| `-NRedUserPatchOff` | 关闭卫星，保留主 kext |
+| `-NRedUserPatchDebug` | 卫星日志 |
+| `-NRedUserPatchBeta` | 卫星允许 beta 版本（内部） |
 
-Rollback:
+另有若干诊断用参数（`-NRedDelayPanic`、`-NRedDebugUltra`、`-NRedDPDelay`、`-NRedCursorDebug`），
+只供排查单点问题，不要写进日常配置。
 
-- remove `NootedRedUserPatch.kext` from OpenCore and reboot: main kext remains functional;
-- the main kext has no user-space hooks and builds/runs with the satellite absent;
-- `PatchData/` is only build input; there is no runtime directory to remove.
+把 `-NRedNoAccel` 和 `-NRedVDA` 一起加没有意义：前者根本不启动加速器。
+
+## 6. 支持范围与回滚
+
+- 主 kext 声明支持 Catalina → Tahoe；内核补丁按版本门控，没有对应版本的补丁就是不匹配而非崩溃。
+- 卫星的 profile 只覆盖生成它的那一个 build，其余 build fail-closed no-op。
+- 回滚顺序：`-NRedUserPatchOff` → 从 EFI 移除卫星 kext → `-NRedOff` → 换回备份的 EFI。
+- 用户态页一旦写入共享缓存页缓存，到重启前都保持已打补丁状态，无法可靠回退；此时关闭补丁
+  只能阻止后续页被写。

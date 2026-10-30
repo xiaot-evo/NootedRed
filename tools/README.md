@@ -1,149 +1,55 @@
-# tools/ — offscreen OpenGL blending probe (NootedRed #158)
+# tools/ — 工具索引
 
-For offline multi-version validation fixtures, see
-[`README-validation-fixtures.md`](README-validation-fixtures.md) and
-`collect_validation_fixtures.py`.
+脚本都从仓库根目录运行。当前补丁流水线是 **NRPT v3 profile**：生成在 `NootedRedTool`，校验和注入在
+`test/`，本目录只放采集、诊断和部署辅助工具。
 
-`gl_blend_probe` is a small, self-contained CGL/OpenGL 4.1-core harness used to
-investigate **NootedRed issue #158**: Chromium/Electron hardware acceleration
-corruption and GPU resets caused by the user-space `AMDRadeonX5000GLDriver`
-using Vega dGPU values on an AMD iGPU.
+## 1. 当前流水线
 
-It renders into an FBO, reads the pixels back and compares them with a CPU
-reference. It never edits files, never injects code, never opens a window and
-never takes over the display. **It is still a GPU test on a machine whose GPU is
-currently misbehaving — read the safety section before running it.**
-
-Related local documents: `analysis/repro-plan.md` (full evidence + repro plan),
-`Chromium-OpenGL-Issue-Report.md` (prior analysis, repository root).
-
-## Files
-
-| File | Purpose |
+| 工具 | 用途 |
 | --- | --- |
-| `gl_blend_probe.c` | the probe (inspect / link / render modes) |
-| `build.sh` | compiles it to `build/tools/gl_blend_probe` with `xcrun clang` |
-| `README.md` | this document |
+| `NootedRedTool --generate-profile` | 从干净 fixture 语义解析目标驱动，生成 `nred-<build>.nrpt`（见 `../NootedRedTool/README.md`） |
+| `../test/nrpt_validator.py` | 独立的 NRPT v3 校验器，字节级拒绝任何可能打错页的 profile |
+| `../test/inject_profile.py` | 注入/检查/提取 `Info.plist` 里的 `NRedProfiles` bundle |
+| `find_nrpt_page_origin.py` | 把运行时交付的页哈希映射回源镜像与偏移（v3 mode/image 元数据） |
 
-## Safety (read first)
+## 2. 构建与产物
 
-Verified on the target machine (macOS 15.8.1, Renoir `0x1638`, NootedRed 0.9.0
-loaded), 2026-10-18:
+| 工具 | 用途 |
+| --- | --- |
+| `build-branch.sh` | 受支持的构建入口：按分支隔离产物、给 zip 加时间戳（见 `../docs/Build-Artifacts.md`） |
+| `build.sh` | 单独编译 `gl_blend_probe`（不碰 GPU） |
+| `test_build_artifacts.py` | 检查 `build/branches/...` 下两个产物 glob 是否都齐 |
 
-- a minimal CGL/FBO program **SIGSEGV'd on its first `glClear()`** in
-  `AMDRadeonX5000GLDriver` at
-  `glrAMD_GFX9_UpdateHwExportBlockState ← glrAMD_GFX9_UpdateDrawBufferInfo ←
-  glrATI_Hwl_DrawableChanged ← glrBindContextDrawFramebuffer ←
-  gldUpdateDrawFramebuffer ← gleUpdateDrawFramebufferState ← glClear_Exec`
-  (`~/Library/Logs/DiagnosticReports/glblend2-2026-10-18-211253.ips`,
-  and `glblend4-2026-10-18-211622.ips` with the identical stack);
-- around the same time the system logged **12+ WindowServer / Electron GPU
-  resets** in `/Library/Logs/DiagnosticReports/Kernel_*.gpuRestart`
-  (AMD Radeon RX Renoir Graphics, `DID=0x1638`, restart channel 13/23 GFX).
+## 3. 目标机采集
 
-The earlier probes created a GL context but no drawable; the crash happens in
-the draw-framebuffer update path while `glClear` touches the *default* (invalid)
-drawable. `gl_blend_probe --render` therefore attaches a **PBuffer drawable**
-before clearing/drawing. That is safer, but not proven safe.
+| 工具 | 用途 |
+| --- | --- |
+| `collect_validation_fixtures.py` | 收集副本树（`.kc`、驱动 bundle、`.map`），供离线校验；输出路径与 `nrpt_validator.py` 的 `DEFAULT_IMAGE_GLOBS` 对齐 |
+| `collect_platform_data.py` / `import_platform_data.py` | 采集与归档平台数据（`/platform-data/`，不进 git）；`--full` 才带完整驱动 |
+| `adaptation_info.py` | 只读生成一份兼容性报告（系统、kext、GPU、boot-args、EFI 状态），用于 triage |
 
-Rules:
+VDA 专项：`set_vda_bootarg.sh`（读写 `-NRedVDA`，改 config 前自动备份）、`vda_selftest.sh`（只读状态
+汇总）、`vda_hwtest.sh`（生成样本、解码比对、抓 reset 报告）、`deploy_vda.sh`（按当前分支产物部署）。
+整套流程见 `../docs/VDA-TESTING.md`。
 
-1. `--inspect` (default) is the only mode allowed without Lead approval:
-   CGL context + `glGetString` only. It has been run here without a new
-   GPU-reset report being logged.
-2. `--link` compiles and links shaders but submits no draw calls. It was run
-   here without a new reset, but it does exercise the driver's compiler/state
-   path; treat it as low-risk, not zero-risk.
-3. `--render` refuses to start unless `--yes` is passed. Do not pass `--yes`
-   without the Lead's explicit approval, a fresh reboot and a recovery plan.
-4. On any GPU reset (new `*.gpuRestart` file), a display corruption event, a
-   freeze, or a watchdog/SIGSEGV message: **stop**. Do not immediately retry.
-   Reboot to a known-good state before continuing.
+## 4. GPU 诊断探针
 
-## Build
+| 工具 | 用途 |
+| --- | --- |
+| `gl_blend_probe.c` | 离屏 CGL/OpenGL 混合测试，用于复现 Chromium/Electron 花屏（issue #158）。**有风险，先读 [`gl_blend_probe.md`](gl_blend_probe.md)** |
+| `hwinfo_probe.c` | 从 IOAccelerator 读出 selector `0x100` 的 `0x204` 字节 HwInfo blob（`+0x20` 头、`+0xa0` 起为数据）；`Renoir` 上可直接看出 `GB_ADDR_CONFIG`/CU 数，结果可写 `/tmp/ubm_kernel_blob.bin` 留档 |
 
-```sh
-./tools/build.sh
-```
+## 5. Firefox/Zen 硬解启动器
 
-Requirements: Xcode command line tools (`xcrun clang`, SDK with
-`OpenGL.framework`), no Homebrew packages. The build does not touch the GPU.
-`build/` is git-ignored.
+`firefox-hwdecode-launcher.sh` + `Firefox-HW-Decode.command`：生成带 `MOZ_DISABLE_RDD_SANDBOX=1` 的
+桌面启动器，并写入硬解 prefs。用法与安全权衡见 `../docs/FIREFOX-HW-DECODE.md`。
 
-## Usage
+## 6. 已退休的 v1 数据流水线
 
-```sh
-build/tools/gl_blend_probe --inspect            # safe: context + GL strings/extensions
-build/tools/gl_blend_probe --exts               # inspect + full extension list
-build/tools/gl_blend_probe --link               # + compile/link shaders, no draw calls
-build/tools/gl_blend_probe --render --yes       # RISKY: FBO clear/draw/readback + CPU compare
-build/tools/gl_blend_probe --render --yes --timeout 30
-```
+`userpatch_data.py`、`convert_master_patchdata.py`、`master_source.py`、`master_tables.py`、
+`embed_patchdata.py`、`extract_userpatch_fixture.py` 及对应的 `test_*.py`、`specs/`、`fixtures/`、
+`pinned/master/`、仓库根的 `PatchData/` 都属于 NRPD v1 时代。kext 已经不读它们，`PatchData/` 也不再
+被任何构建步骤使用。清单与替代关系见 [`RETIRED.md`](RETIRED.md)。
 
-Exit codes: `0` success/all PASS (or only SKIPs), `1` no CGL pixel format/context,
-`2` shader compile/link failure, `3` FBO incomplete, `10` rendered pixel mismatch,
-`11` PBuffer drawable unavailable (no draw was attempted), `12` render refused
-without `--yes`, `124` watchdog, `128+N` killed by signal N.
-
-## Tests and expected values
-
-Blue `(0,0,1,1)` is the FBO clear colour; a full-screen triangle is drawn.
-
-| Case | Blend state | Fragment output | Expected pixel (RGBA8) |
-| --- | --- | --- | --- |
-| solid, no blend | blending off | `(1,0,0,1)` | `(255,0,0,255)` |
-| classic alpha | `SRC_ALPHA / 1-SRC_ALPHA` | `(1,0,0,0.5)` | `(128,0,128,255)` |
-| dual-source `SRC1_COLOR` | `SRC1_COLOR / 1-SRC1_COLOR` | `c0=(1,0,0,1)`, `c1=(0.25,0.5,0.75,1)` | `(64,0,64,255)` |
-| dual-source `SRC1_ALPHA` | `SRC1_ALPHA / 1-SRC1_ALPHA` | `c0=(0.5,0.25,0.75,1)`, `c1=(0.25,0.5,0.75,0.5)` | `(64,32,223,255)` |
-
-Tolerance is ±2 per channel. The dual-source cases are skipped when the driver
-does not advertise `GL_ARB/EXT_blend_func_extended` or reports
-`GL_MAX_DUAL_SOURCE_DRAW_BUFFERS == 0`.
-
-A **dual-source mismatch** on the target machine is a strong repro signal: a
-driver that silently ignores the index-1 output blends with `c0.a` instead
-(for the `SRC1_ALPHA` case that yields `(128,64,191)` instead of `(64,32,223)`).
-
-## Baseline on the target machine (2026-10-18, inspect + link only)
-
-```
-GL_VENDOR   = ATI Technologies Inc.
-GL_RENDERER = AMD Radeon RX Renoir Graphics OpenGL Engine
-GL_VERSION  = 4.1 ATI-7.0.25
-GLSL        = 4.10
-GL_ARB_blend_func_extended = present
-GL_EXT_blend_func_extended = MISSING
-GL_MAX_DRAW_BUFFERS = 8, GL_MAX_DUAL_SOURCE_DRAW_BUFFERS = 1, GL_MAX_COLOR_ATTACHMENTS = 8
-extension count = 46
-c1 bound to frag data index 1: yes
-dual-source shaded linked: SRC1_COLOR ok, SRC1_ALPHA ok
-```
-
-Notes:
-
-- `GL_ARB_blend_func_extended` present but `GL_EXT_blend_func_extended` missing
-  independently reproduces the GLEW observation recorded in issue #158
-  (2023-12-10 comment): the ARB entry points exist, the EXT alias does not.
-- 46 extensions is tiny for a GL 4.1 driver; GLEngine filters what the AMD
-  driver reports.
-- **A PASS does not exonerate the driver.** This probe submits a simple
-  single-draw sequence; Chromium reaches the same driver through ANGLE
-  (`libGLESv2`/`libEGL`) with a very different pipeline/command pattern.
-  A FAIL (crash, reset, or pixel mismatch) is much more informative than a PASS.
-
-## What this harness does not do
-
-- It does not run Chromium/ANGLE; use a real Electron/Chromium app for that
-  (see the local `analysis/repro-plan.md` §4.8 for the app-level ladder).
-- It does not patch or validate any candidate fix. Patch validation is
-  approval-gated and should start with the user-space interposer described in
-  local `analysis/repro-plan.md` §4.7.
-- It does not read or write system files, kexts or the dyld shared cache.
-
-## Recovery notes
-
-If a run hangs, the shell may stay blocked inside the GL driver. Use another
-terminal (or ssh) to kill it; if the display is corrupted, force-restart
-WindowServer by logging out, or reboot with the power button as a last resort.
-The GPU-reset reports in `/Library/Logs/DiagnosticReports` are the first thing to
-collect after an incident (`*.gpuRestart`, `gl_blend_probe*.ips`).
+> 隐患：`embed_patchdata.py` 仍会生成 `NootedRedUserPatch/PatchDataBlob.cpp`，而 `xmake.lua` 用
+> `NootedRedUserPatch/**.cpp` 通配源文件——谁跑一次就会把它编进 kext。除非在复活 v1，否则不要运行。

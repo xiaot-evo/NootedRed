@@ -1,5 +1,9 @@
 # Fixture: master 15.8.1 exact UserPatch data
 
+> **Legacy v1 data (retired 2026-10-29).** Nothing here is a build input: the deployed profile is
+> generated per macOS build by `NootedRedTool` and injected as `NRedProfiles`. Kept for provenance;
+> see [`RETIRED.md`](../../RETIRED.md).
+
 This directory is a small, real, deterministic fixture for the host-side UserPatch data tooling. It
 lets `tools/test_userpatch_data.py` exercise the generator and the binary manifest parser without any
 private Apple driver image or a live macOS install.
@@ -10,7 +14,7 @@ machine it was collected on beyond what the master source already records.
 ## Provenance
 
 The three 4 KiB page images and the four patch sites are decoded from the exact-page tables in
-[`NootedRed/UserPatches.cpp`](../../../NootedRed/UserPatches.cpp), the same tables the mainline kext
+`NootedRed/UserPatches.cpp`, the same tables the mainline kext
 uses for its exact-page user-space backend:
 
 | Fixture page | Master array | Driver build recorded in master |

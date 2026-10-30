@@ -26,7 +26,7 @@
 
 // Identity of an Apple binary that NootedRed patches.
 //
-// This is the version-axis half of the compatibility model in docs/Compatibility-Architecture.md: patch
+// This is the version-axis half of the target-identity model (see docs/COMPATIBILITY.md): patch
 // data belongs to a binary build (Mach-O `LC_UUID`), not to a macOS version string.  The type and the
 // parser are in place, but capture is deferred to the target-identity milestone: reading the driver file
 // through the VFS during Lilu's patcher-load phase is not safe enough for the boot path, so the boot-time

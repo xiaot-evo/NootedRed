@@ -1,7 +1,12 @@
 # PatchAnalyzer — host-side Mach-O / dyld-cache function analysis and NRPT generation
 
 Status: implementation notes for `NootedRedTool/Sources/NootedRedTool/PatchAnalyzer/`.
-Contract: `docs/PatchProfile-Spec.md` (NRPT v1) and `analysis/lilu-dyld-shared-cache-profile-engine.md`.
+Contract: `../../docs/PatchProfile-Spec.md` (NRPT v3, frozen 2026-10-29). Design background:
+`../../analysis/lilu-dyld-shared-cache-profile-engine.md` (local, untracked).
+
+> This pipeline is CLI-only. The SwiftUI 「驱动解码」page still writes the retired
+> `NRedOffsetProfile`/`NRP3` blob, which the satellite does not read — see `../README.md`
+> 「已知缺口」. Only `--generate-profile` / `--bundle-profiles` produce a profile the kext accepts.
 
 The analyzer replaces the fixed page/find/replace tables with **semantic discovery from the
 target image**: every value written into the NRPT profile is derived from the clean driver
@@ -50,7 +55,8 @@ driver bundle, applied from `_cs_validate_page`) and `DYLD` (2) for a page of a 
 image (Metal/VADriver2/AppleGVA, applied from `_cs_validate_range`). The mode is derived from the
 parsed image kind and is never guessed from addresses; v3 also rejects a mode/image-kind mismatch.
 There is no offset identity and no matchFlags: page identity is the full-page FNV-1a-64 hash plus
-every site `find`, scoped by mode. `pageFileOffset` (best pager/file evidence) and `pageVmOffset`
+every site `find`, scoped by mode. `pageFileOffset` (derived from the parsed dyld-cache mapping, for
+human cross-reference only) and `pageVmOffset`
 (`pageStart - image mach-header unslid VM address`) remain 4 KiB-aligned diagnostic evidence only.
 Image entries are the simplified v3 form: kind, canonical absolute path derived from the parsed
 image (fixture-root prefix stripped, so fixtures and the live system produce the same bytes),
@@ -139,5 +145,18 @@ one Intel-slot null guard whose fall-through path also converges on the same emp
 The candidate function address, both branch targets and the insertion instruction are recorded in
 the evidence. Two remaining deliberate semantic choices (Metal RB+ allow `31 C0 90` from the
 mainline source instead of the old table's `31 C9 90`; VDA family sites derived from the 24H232
-images rather than first-occurrence byte order) are documented in the rule descriptions and
-evidence.
+images rather than first-occurrence byte order) are evidence.
+
+## 被否决的补丁形态
+
+新增语义规则时不要走这些路，它们都在真机上失败过：
+
+- **源码层 `0x4D -> 0x4F` 的 HwInfo 补丁换 RB+**：它会打开 RB+ 寄存器编程，而对应 tiling 表并不
+  建模 Renoir，结果是黑块和缩略图缺失。Metal 侧固定用 gate/allow 两个 site。
+- **与其它用户态 GL/Metal 补丁器混用**（例如 BFixup）：同一批页会被两个实现写。
+- **把 APU 数据套到 Vega 独显**：HwInfo 模型与 RB+ 支持都不同。
+- **写 `/System/Library/Extensions` 或 dyld 共享缓存**：补丁只存在于内存页缓存，重启即失效。
+- **匹配失败当成错误处理**：必须是 no-op；panic 或强制写入已经在审计中被判定为不可接受。
+
+生成器必须继续 fail closed：缺 Capstone、函数解析不唯一、语义规则零匹配或多匹配、函数体无法
+完整解码、页面短读、非目标页命中同一身份，任一情况都不写 profile。

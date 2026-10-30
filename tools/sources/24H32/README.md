@@ -1,5 +1,9 @@
 # Supplementary 24H32 sources
 
+> **Legacy v1 data (retired 2026-10-29).** Nothing here is a build input: the deployed profile is
+> generated per macOS build by `NootedRedTool` and injected as `NRedProfiles`. Kept for provenance;
+> see [`RETIRED.md`](../../RETIRED.md).
+
 These are exact-page sources that are not part of the pinned master snapshot. They are appended to
 the master-derived 24H32 spec by `tools/convert_master_patchdata.py` and pinned by SHA-256.
 

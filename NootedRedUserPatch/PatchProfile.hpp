@@ -25,7 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Generic consumer for the NRPT v1 profile format (docs/PatchProfile-Spec.md).
+// Generic consumer for the NRPT v3 profile format (docs/PatchProfile-Spec.md).
 //
 // The class owns only generic engine state: the parsed and fully validated page/site records copied
 // out of the selected `NRedProfiles` bundle profile, the running-system identity gates and the

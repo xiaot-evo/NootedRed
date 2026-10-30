@@ -3,7 +3,7 @@
 
 This file deliberately re-implements the binary parser instead of importing one from
 ``tools/userpatch_data.py``: the generator and the validator must agree only through
-``docs/UserPatch-Data-Format.md``. It checks, on generated data:
+``research/legacy/NRPD-v1-Format.md``. It checks, on generated data:
 
 * magic / version / header size / reserved fields / build and Darwin identity;
 * ``manifestSize`` formula and exact file length, ``pagesSize`` and both checksums;

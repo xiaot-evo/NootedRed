@@ -6,7 +6,7 @@
 #   tools/deploy_vda.sh --list-backups --esp /Volumes/EFI
 #
 # This script never reboots and never edits the OpenCore config/boot-args. Add -NRedVDA yourself (see
-# docs/VDA-Deployment.md). Run it from the repository root; it needs sudo for the ESP writes.
+# docs/VDA-TESTING.md). Run it from the repository root; it needs sudo for the ESP writes.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

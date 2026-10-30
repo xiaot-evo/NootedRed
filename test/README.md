@@ -28,9 +28,12 @@ parity is pinned by a synthetic golden profile.
 - **Identity without offsets.** Identity is the full-page FNV-1a-64 plus **all** site `find` bytes.
   `pageFileOffset`, `pageVmOffset` and the kernel-reported chunk base are diagnostic only and never
   used for matching; a different chunk base still matches, and the evidence offsets are reported.
-- **Vnode gate model.** Standalone images require the target dylib basename in the vnode name;
-  dyld-shared-cache images require a `dyld`/`dyld_shared_cache` vnode. Wrong-vnode deliveries are
-  rejected without hashing or writing; the gate can also be simulated as unavailable.
+- **Vnode gate (validator only).** The validator can model a vnode-name gate: standalone images
+  require the target dylib basename, dyld-shared-cache images require a `dyld`/`dyld_shared_cache`
+  vnode. **The shipped engine does not implement it** (`UserPatchBackend.cpp` ignores the vnode) —
+  real deliveries do not guarantee a resolvable vnode name. `docs/PatchProfile-Spec.md` §9.1 still
+  describes the gate as defense in depth; treat the engine as authoritative and the validator's gate
+  as a stricter model.
 - **Applied-once / already-patched.** A record applies once per boot; a delivery that already
   carries every `replace` byte is marked applied with **no** write. Site mismatches abort with
   zero writes.
@@ -57,7 +60,6 @@ parity is pinned by a synthetic golden profile.
 | `test_inject_profile.py` | 7 injection-tool tests: round trip, determinism, legacy-key removal, manifest, rejection cases |
 | `hash_scan.c` | native 4 KiB page FNV scanner used by the fixture false-positive scan and the origin tool |
 | `golden/synthetic-2page-v3.nrpt` | synthetic v3 golden; reference Swift `ProfileCodec.encode` and this Python encoder produce byte-identical bytes |
-| `golden/engine-crosscheck/` | independent C++ engine vectors from earlier rounds |
 | `find_nrpt_page_origin.py` (in `tools/`) | maps runtime-delivered page hashes back to the source image/offset with v3 mode/image metadata |
 | `run-validation.sh` | convenience wrapper around the validator CLI |
 

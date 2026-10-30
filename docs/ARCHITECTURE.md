@@ -1,102 +1,86 @@
-# NootedRed architecture
+# NootedRed 架构
 
-Status: **current architecture** (2026-10-23). This document describes the satellite split that the
-branch actually implements. The old in-memory root-patch plans are archived:
-[`archive/Root-Patch-Architecture.md`](archive/Root-Patch-Architecture.md) (superseded two-plane
-root-patch design), [`ROOT-PATCH-PIPELINE.md`](ROOT-PATCH-PIPELINE.md) (historical pipeline notes,
-superseded — see the banner in that file) and the other files in [`archive/`](archive/README.md). They are kept for history and are **not**
-implementation guidance.
+状态：2026-10-30，对应 NRPT v3 profile 引擎（`feature/profile-driven-userpatch`）。本文只描述当前代码
+实际执行的路径；历史上的 embedded PatchData、offset 身份、root patch 方案见 `../research/legacy/`。
 
-Related current documents:
-
-- [Modules and support](MODULES-AND-SUPPORT.md) — module responsibilities and full APU/build matrix;
-- [Satellite UserPatch plan](Satellite-UserPatch-Plan.md) — decisions, phases, validation matrix;
-- [UserPatch data format](UserPatch-Data-Format.md) — source-data contract and embedded generation;
-- [`PatchData/README.md`](../PatchData/README.md) — source data sets and gaps;
-- [Compatibility matrix](COMPATIBILITY.md) — per-build/APU status.
-
-## 1. Components
+## 1. 三个组件
 
 ```
 Lilu
- ├── NootedRed.kext             kernel plane: X5000/HWLibs/AGDP/Backlight/AppleGFXHDA,
- │                              Framebuffer/DC/PM/SMU, VCN kernel bridge, VCNData tables.
- │                              Publishes NRedVCNBridgeReady on the AMD iGPU IOPCIDevice.
- └── NootedRedUserPatch.kext   satellite: exact-page user-space patches for GL/Metal/VDA/AppleGVA.
-        └── PatchDataBlob.*    embedded build-time data (generated from PatchData/)
-              manifest/pages const arrays, selected by exact kern.osversion
+ ├── NootedRed.kext              内核侧：X5000/X6000/HWLibs/AGDP/Backlight/AppleGFXHDA 补丁，
+ │                               FB/DC/PM/SMU/PSP，VCN 内核桥
+ │                               └── 发布 NRedVCNBridgeReady（状态量，非卫星页面的开关）
+ └── NootedRedUserPatch.kext     卫星：_cs_validate_page/_cs_validate_range 上的用户态页内容补丁
+        └── NRedProfiles        personality 属性里注入的 NRPT v3 bundle（部署时写入，无需重编 kext）
+
+NootedRedTool（宿主侧，macOS 15+） 从干净 fixture 语义解析目标驱动，生成/校验/注入 NRPT v3 profile
 ```
 
-Adding/changing a build means regenerating `PatchDataBlob.*` and rebuilding/re-signing the satellite;
-there is no runtime data directory. The satellite auto-loads when `NootedRed.kext` is present
-(OpenCore `OSBundleLibraries` dependency); `-NRedUserPatchOff` disables it for debugging.
+卫星通过 `OSBundleLibraries` 依赖 `org.ChefKiss.NootedRed`，主 kext 存在时自动加载；
+`-NRedUserPatchOff` 可单独关掉它。主 kext 必须在卫星缺席时正常构建与运行，这是首要回滚路径。
 
-## 2. What runs where
+## 2. 数据流
 
-**`NootedRed.kext` (kernel plane)** — kernel/kext patches only. It contains no
-`_cs_validate_page`/`_cs_validate_range` routing, no GL/Metal/VDA user-space tables and no VFS I/O in
-patcher-load. It publishes the single main↔satellite coordination fact:
+```
+干净的目标系统镜像（version-fixtures/<build> 或未被打补丁的本机）
+        │ NootedRedTool --generate-profile：13 条语义规则 → 20 个 site
+        ▼
+nred-<build>.nrpt  +  nred-<build>-evidence.json        （14 页 / 20 sites / 4 个目标镜像）
+        │ test/inject_profile.py 或 NootedRedTool --profile-inject-binary
+        ▼
+NootedRedUserPatch.kext/Contents/Info.plist  personality 的 NRedProfiles 数组
+        │ 内核在首次 code-signing 校验时调用钩子
+        ▼
+_cs_validate_page / _cs_validate_range
+        │ 完整 4 KiB 页内容比对 + 每个 site 的 find 字节
+        ▼
+写入 replace 字节（内核写保护下），该页记为已打补丁
+```
 
-- `NRedVCNBridgeReady` — 32-bit IOPCIDevice property, value `1` while
-  `VCNBridge::loadReady()` (`requested && x5000Prepared && x6000Prepared && loadCompleted`) is true,
-  `0` after readiness is withdrawn (accelerator stop, engine-allocation failure, `initHardware`
-  failure). Absent means "not ready".
+profile 生成必须来自干净镜像。卫星加载后的内核页缓存写入会让在线系统看起来"已打补丁"，
+用它生成会把补丁当成原文，因此工具在检测到卫星已加载时拒绝从 `/` 生成。
 
-The main kext must build and run with the satellite absent; that is the primary rollback path.
+## 3. 页面身份与匹配
 
-**`NootedRedUserPatch.kext` (satellite)** — a Lilu plugin that installs
-`_cs_validate_page`/`_cs_validate_range` hooks and, for every validated page, compares the complete
-4 KiB page image against the embedded page bytes before writing any site bytes. It:
+- **身份**：整页 4 KiB 内容的 FNV-1a-64 哈希，加上该页每个 site 的 `find` 字节。页偏移
+  （`pageFileOffset`/`pageVmOffset`）、镜像序号、`mode` 都不参与身份判定，只用于路由和诊断。
+- **没有 vnode 名门控**：卫星拿不到也不使用 vnode 名，实际交付路径不保证 vnode 名可用。
+- **deferred 不是错误**：尚未交付到校验钩子的页记为 deferred，钩子保持挂载，不做进程扫描、
+  不做 `vm_map_write_user` 强制写入、不用 watchdog 或内核 worker 兜底（这些路径在 panic 风险
+  审计后已删除）。
+- **不重写**：已打过补丁的页能被识别，永远不重复写。
+- **fail closed**：bundle 缺失/畸形、build、APU mask 或 deviceID 不匹配、页哈希不匹配、site
+  find 不匹配，都是 `NoOp`，绝不回落到"最接近的 build"或语义扫描。
 
-- selects the exact embedded build whose `kern.osversion` matches, then validates magic/version/header,
-  `manifestSize`, FNV-1a checksums, canonical table layout, limits, page/site bounds and site `find`
-  bytes at their recorded offsets;
-- applies tables of kind 1 GL and 2 Metal independently of the main kext; kinds 3 VDA/VA and
-  4 VDA/AppleGVA only when the user passed `-NRedVDA` (AppleGVA/VADriver pages are validated too early
-  to wait for the main kext's readiness property);
-- requires an exact full-page match and the site's `find` bytes at the declared offset; there is no
-  semantic scan, no page search and no nearest-build fallback;
-- fails closed (`NoOp`) on a missing/mismatched embedded build, build/Darwin/APU mismatch or page
-  mismatch, while the plugin stays loaded and the routes stay inert;
-- retries transient identity/data-selection failures from the Lilu patcher-load callback,
-  `IOService::start` and a bounded `thread_call` timer; it performs no file I/O in any of them.
+## 4. 不变量
 
-The parser/loader contract is defined in [UserPatch-Data-Format.md](UserPatch-Data-Format.md).
+1. **能力 ≤ 实际应用**：补丁/引擎真正就位之前，不向系统宣称该能力。
+2. **失败即关闭**：身份未知或存在歧义时 no-op 并留一行日志。
+3. **不做半套补丁**：一个特性的所有目标要么全应用，要么全不应用。
+4. **永不修改未校验的页**：没有整页内容匹配就不写。
+5. **身份漂移即停用**：build/驱动身份变化后重新验证，不沿用上一份结论。
 
-## 3. Data plane
+## 5. 非目标
 
-`PatchData/` is generated deterministically from the pinned master-branch exact-page tables
-(`tools/pinned/master`, master commit `0efa6f4`) by `tools/convert_master_patchdata.py`; readable
-inputs live under `tools/specs/`. `tools/embed_patchdata.py` then emits
-`NootedRedUserPatch/PatchDataBlob.*`, which is compiled into the kext. Host validation is
-`tools/test_userpatch_data.py` plus `tools/convert_master_patchdata.py --check` and
-`tools/test_embedded_patchdata.py`. Committed sets:
+- 不用语义指令扫描作为发布路径：发布用的是整页内容哈希 + site find。
+- 不做跨 build 的页复用：一个 profile 只服务它生成的那个 build。
+- 不在 `NootedRed.kext` 内做用户态页补丁。
+- 不做 APFS root patch、dyld 缓存重写、kext 替换（见 `../research/legacy/Root-Patch-Pipeline.md`）。
+- 不做运行时文件 I/O：profile 在部署时进入 `Info.plist`，kext 里没有 profile 路径、没有 vnode 名
+  校验、没有页偏移表。
 
-| Build | Darwin | Kinds | Notes |
-| --- | --- | --- | --- |
-| `24H32` | 24.6.0 | 1 GL, 2 Metal, 3 VDA/VA, 4 VDA/AppleGVA | complete 15.8.1 set |
+## 6. 代码地图
 
-The running kext has no data directory and performs no VFS/read of these files; `PatchData/` is
-build-time input only. See [`PatchData/README.md`](../PatchData/README.md) for regeneration/embedding
-commands and gaps.
+| 路径 | 职责 |
+| --- | --- |
+| `NootedRed/` | 主 kext 源码；`NRed.cpp` 主逻辑，每个 patcher 模块一个文件，`PenguinWizardry/` 是打补丁 SDK |
+| `NootedRed/GPUDriversAMD/` | AMD 驱动 ABI 的重新实现（CAIL/Accel/FB/DC/SMU/PSP…） |
+| `NootedRed/Regs/` | 各 IP 块的 MMIO 寄存器定义 |
+| `NootedRedUserPatch/PatchProfile.*` | NRPT v3 解析、身份门控、页匹配 |
+| `NootedRedUserPatch/UserPatchBackend.*` | 只有 `_cs_validate_page`/`_cs_validate_range` 两条路由 |
+| `NootedRedUserPatch/Plugin.cpp` | 服务生命周期与诊断，不做匹配 |
+| `NootedRedTool/Sources/NootedRedTool/PatchAnalyzer/` | Mach-O/dyld 缓存/函数/CFG 解析与 profile 生成 |
+| `test/nrpt_validator.py` `test/inject_profile.py` | 独立的校验器与注入器 |
 
-## 4. Selection, patching and rollback
-
-1. Select and validate the embedded build (exact `kern.osversion`, Darwin, APU mask intersection,
-   checksums, canonical layout).
-2. For a page validation event, compare the live 4 KiB page with the embedded image for the selected
-   table; on exact equality verify every site's `find` at its offset.
-3. Write all site `replace` bytes under kernel write protection, and remember the page as patched.
-4. VDA kinds require the cached `NRedVCNBridgeReady` value; GL/Metal do not.
-5. A mismatch or any validation failure is a normal no-op, never a fallback.
-6. Rollback: remove `NootedRedUserPatch.kext` from OpenCore (main kext unaffected) or boot
-   `-NRedUserPatchOff`.
-
-## 5. Non-goals
-
-- No semantic instruction scanning as a release path; exact 4 KiB page images only.
-- No broad cross-build page reuse: a manifest is selected by exact build identity and every page must
-  match byte-for-byte.
-- No user-space patching inside `NootedRed.kext`.
-- No APFS root patching, dyld-cache rewriting or kext replacement in this design (those were the
-  archived root-patch plan, not the approved satellite split).
+规范见 [PatchProfile-Spec.md](PatchProfile-Spec.md)；模块职责与支持范围见
+[MODULES-AND-SUPPORT.md](MODULES-AND-SUPPORT.md)。
