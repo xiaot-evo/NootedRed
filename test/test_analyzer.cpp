@@ -68,6 +68,20 @@ namespace
             check(NRedUserPatch::parseMachO(glSource, 0, 0, 0x14D000U, image), "parse GL Mach-O");
             check(image.nsyms == 8384U, "GL nsyms");
             check(image.functionStartsOffset == 0x157BC0U, "GL function starts offset");
+
+            uint64_t symbol = 0;
+            check(NRedUserPatch::findSymbol(glSource, image, "_glrAMD_GFX9_UpdateHwCbDualQuadMode", symbol),
+                  "find GL UpdateHwCb symbol");
+            check(symbol == 0x8134U, "GL UpdateHwCb symbol address");
+            check(NRedUserPatch::findSymbol(glSource, image, "_gfx9_HwInfoInitData", symbol),
+                  "find GL HwInfoInitData symbol");
+            check(symbol == 0xDF40U, "GL HwInfoInitData symbol address");
+
+            uint64_t funcStart = 0;
+            uint64_t funcEnd = 0;
+            check(NRedUserPatch::functionRange(glSource, image, 0x8160U, funcStart, funcEnd),
+                  "GL function range");
+            check(funcStart == 0x8134U && funcEnd == 0x81C2U, "GL function range bounds");
         }
 
         makePath(path, sizeof(path), root,
@@ -82,6 +96,32 @@ namespace
             check(image.nsyms == 19870U, "MTL nsyms");
             check(image.functionStartsOffset == 0x23BA3918U, "MTL function starts offset");
             check(image.textFileOffset == 0x8757000U, "MTL __TEXT file offset");
+
+            // Local symbol: not in the export trie, so this exercises the nlist scan.
+            uint64_t symbol = 0;
+            check(NRedUserPatch::findSymbol(mtlSource, image,
+                                            "__Z19gfx9_HwInfoInitDataP14GFX9_HwInfoRecP24_sAMD_GET_HW_INFO_VALUESj",
+                                            symbol),
+                  "find MTL local gfx9_HwInfoInitData symbol");
+            check(symbol == 0x7FFB087EF3DCULL, "MTL local symbol address");
+
+            uint64_t funcStart = 0;
+            uint64_t funcEnd = 0;
+            check(NRedUserPatch::functionRange(mtlSource, image, 0x7FFB087EF51DULL, funcStart, funcEnd),
+                  "MTL function range");
+            check(funcStart == 0x7FFB087EF3DCULL && funcEnd > 0x7FFB087EF51DULL, "MTL function range bounds");
+
+            NRedUserPatch::MachOImage vaImage{};
+            check(NRedUserPatch::parseMachO(mtlSource, 0x8606000U, 0x7FFB08606000ULL, 0xB8268U, vaImage),
+                  "parse VADriver2 Mach-O from subcache");
+            uint64_t vaSymbol = 0;
+            check(NRedUserPatch::findSymbol(mtlSource, vaImage, "__ZN17VAAcceleratorInfo8identifyEjj", vaSymbol),
+                  "find VADriver2 identify symbol via export trie");
+            check(vaSymbol == 0x7FFB086069E0ULL, "VADriver2 identify symbol address");
+            check(NRedUserPatch::functionRange(mtlSource, vaImage, 0x7FFB08606B96ULL, funcStart, funcEnd),
+                  "VADriver2 function range");
+            check(funcStart == 0x7FFB086069E0ULL && funcEnd > 0x7FFB08606B96ULL,
+                  "VADriver2 function range bounds");
         }
     }
 
