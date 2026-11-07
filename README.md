@@ -47,35 +47,28 @@ along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowled
 | 组件 | 作用 |
 | --- | --- |
 | `NootedRed.kext` | 内核侧：FB/DC/PM/SMU、X5000/X6000/HWLibs/AGDP/Backlight 等补丁 |
-| `NootedRedUserPatch.kext` | 用户态卫星：在 code-signing 校验钩子上做整页内容补丁（GL/Metal/VDA/AppleGVA） |
-| `NootedRedTool` | 宿主侧 macOS 15+ 工具：从干净镜像生成/校验/注入 NRPT v3 profile |
+| `NootedRedUserPatch.kext` | 用户态卫星：启动时解析当前系统的 Mach-O，解析编译进 kext 的规则，在 code-signing 校验钩子上写入（默认 GL/Metal 5 条，`-NRedUserPatchVDA` 打开 14 条 VADriver） |
+| `NootedRedTool` | 宿主侧 macOS 15+ 诊断工具（旧的 profile 生成流水线已退役） |
 
-用户态补丁不含任何写死的页偏移：kext 里只有匹配逻辑，补丁数据是部署时注入 `Info.plist` 的
-profile。换 macOS 小版本需要重新生成 profile，而不是换 kext。
+用户态补丁的定位在运行期完成：kext 解析当前镜像的符号和函数结构；规则表很小且不按 build
+增长。系统小版本更新通常不需要改 kext；只有 Apple 改变函数结构时才更新对应规则。
 
 ## 快速开始
 
 1. 备份 EFI，准备好可用的救援引导。
 2. 把两个 kext 放进 `EFI/OC/Kexts/`，按 `Lilu` → `NootedRed` → `NootedRedUserPatch` 顺序加入
    `config.plist` 的 `Kernel > Add`。
-3. 为目标 build 生成并注入 profile（或用随发布提供的 profile）。
-4. 重启，用 `ioreg`/`log show` 核对状态。
+3. VDA 用户态补丁默认关闭；需要时在 `boot-args` 加 `-NRedUserPatchVDA`。
+4. 重启，用 `log show`（DEBUG Lilu）核对 analyzer 的 resolved 汇总。
 
 细节与回滚见 [安装与使用](docs/INSTALLATION.md)。
 
 ## 文档
 
-- [文档索引](docs/README.md) — 全部文档的分类入口。
-- [安装与使用](docs/INSTALLATION.md) — 安装、profile 注入、boot-args、验证、回滚、排障。
-- [架构](docs/ARCHITECTURE.md) — 组件边界、数据流、页面身份与不变量。
-- [兼容性矩阵](docs/COMPATIBILITY.md) — 逐 build / 逐 APU 状态与新增 build 的流程。
-- [模块与支持](docs/MODULES-AND-SUPPORT.md) — 模块职责、硬件档位、启动参数。
-- [构建产物](docs/Build-Artifacts.md) — 按分支隔离的产物布局。
+- [安装与使用](docs/INSTALLATION.md) — 安装、boot-args、验证、回滚、排障。
+- [用户态补丁架构](docs/USERSPACE-PATCHING.md) — 运行期解析、规则模型、写入路径与不变量。
 - [VDA 测试](docs/VDA-TESTING.md) — 硬解/硬编真机验证流程。
-- [Firefox 硬解](docs/FIREFOX-HW-DECODE.md) — 浏览器硬解启动器。
-- [Profile 规范](docs/PatchProfile-Spec.md) — NRPT v3 格式（英文）。
-- 组件文档：[卫星](NootedRedUserPatch/README.md)、[工具](NootedRedTool/README.md)、
-  [校验器](test/README.md)、[工具脚本](tools/README.md)。
+- 组件文档：[卫星](NootedRedUserPatch/README.md)、[工具脚本](tools/README.md)。
 
 研究记录（设计取舍、验证证据、已被取代的方案）在本地 `research/`，不进版本库；
 工作约定见 `AGENTS.md`。

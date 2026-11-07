@@ -28,6 +28,25 @@ ANALYZER_SOURCES: list[pathlib.Path] = [
     ROOT / "NootedRedUserPatch" / "Analyzer" / "RuleTable.cpp",
     ROOT / "NootedRedUserPatch" / "Analyzer" / "RuleResolver.cpp",
 ]
+FORBIDDEN_LEGACY_TOKENS = ("NRedProfiles", "PatchProfile", "NRPT", "warmCallback", "identityRetry")
+LEGACY_SUFFIXES = {".cpp", ".hpp", ".md", ".plist", ".lua"}
+
+
+def check_no_legacy_tokens() -> int:
+    offenders: list[str] = []
+    for path in (ROOT / "NootedRedUserPatch").rglob("*"):
+        if not path.is_file() or path.suffix not in LEGACY_SUFFIXES:
+            continue
+        text = path.read_text(errors="ignore")
+        for token in FORBIDDEN_LEGACY_TOKENS:
+            if token in text:
+                offenders.append(f"{path.relative_to(ROOT)}: {token}")
+    if offenders:
+        print("error: legacy profile/identity tokens remain:", file=sys.stderr)
+        for line in offenders:
+            print(f"  {line}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def main() -> int:
@@ -38,6 +57,10 @@ def main() -> int:
         help="fixture root containing 15.8.2/ and 26.7.2/",
     )
     args = parser.parse_args()
+
+    legacy = check_no_legacy_tokens()
+    if legacy != 0:
+        return legacy
 
     fixtures = pathlib.Path(args.fixtures)
     if not (fixtures / "15.8.2").is_dir() or not (fixtures / "26.7.2").is_dir():
