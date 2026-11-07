@@ -63,6 +63,7 @@ namespace NRedUserPatch
         mach_vm_address_t orgVnodePutname_{0};
         mach_vm_address_t orgVnGetpath_{0};
         bool              installed_{false};
+        volatile UInt8    firstCallLogged_{0};
         volatile UInt32   logBudget_{32};
     };
 

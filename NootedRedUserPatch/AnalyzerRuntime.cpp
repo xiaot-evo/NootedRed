@@ -172,8 +172,10 @@ namespace NRedUserPatch
             // Patcher-load is too early for namei: the Cryptex/Data volume namespace is not ready
             // and VFS lookup there panics.  Sleep until the validation hook reports the first dyld
             // shared-cache page; that proves user space is up and the cache volume is mounted.
+            SYSLOG("UserPatch", "analyzer: worker waiting for the first dyld cache validation");
             while (__atomic_load_n(&self->stop_, __ATOMIC_ACQUIRE) == 0U) {
                 if (__atomic_load_n(&self->trigger_, __ATOMIC_ACQUIRE) != 0U) {
+                    SYSLOG("UserPatch", "analyzer: trigger observed, starting VFS phase");
                     self->process();
                     break;
                 }
@@ -219,6 +221,7 @@ namespace NRedUserPatch
 
     void AnalyzerRuntime::process()
     {
+        SYSLOG("UserPatch", "analyzer: VFS phase start");
         KernelFile* mainFile = nullptr;
         for (uint32_t attempt = 0; attempt < kMaxRetries; attempt++) {
             if (__atomic_load_n(&this->stop_, __ATOMIC_ACQUIRE) != 0U) {

@@ -83,6 +83,9 @@ namespace NRedUserPatch
         if (this->orgVnodeGetname_ == 0 && this->orgVnGetpath_ == 0) {
             SYSLOG("UserPatch", "no vnode name resolver; hook matches nothing (fail closed)");
         }
+        SYSLOG("UserPatch", "name resolver: getname %u putname %u getpath %u",
+               static_cast<unsigned>(this->orgVnodeGetname_ != 0), static_cast<unsigned>(this->orgVnodePutname_ != 0),
+               static_cast<unsigned>(this->orgVnGetpath_ != 0));
 
         SiteSet::singleton().setWriter(&ValidationHook::beginWrite, &ValidationHook::endWrite, nullptr);
 
@@ -122,13 +125,22 @@ namespace NRedUserPatch
         if (validated == nullptr || *validated == 0 || data == nullptr) { return; }
 
         char name[64]{};
-        if (!self.nameForVnode(vnode, name, sizeof(name))) { return; }
+        const bool named = self.nameForVnode(vnode, name, sizeof(name));
+        if (__atomic_exchange_n(&self.firstCallLogged_, 1U, __ATOMIC_RELAXED) == 0U) {
+            DBGLOG("UserPatch", "hook: first validation named=%u name='%s' offset=0x%llx", named ? 1U : 0U,
+                   named ? name : "", static_cast<unsigned long long>(pageOffset));
+        }
+        if (!named) { return; }
 
         // The first dyld shared-cache validation is the earliest safe point for the analyzer's VFS
         // phase: user space is up and the Cryptex volume is mounted.  Setting the flag is a single
         // atomic store; the worker (not this hook) does every namei/vnode read.
         if (!SiteSet::singleton().ready() && AnalyzerRuntime::isTriggerVnode(name)) {
             AnalyzerRuntime::singleton().noteTrigger();
+            if (self.takeLogBudget()) {
+                DBGLOG("UserPatch", "hook: analyzer trigger from '%s' page 0x%llx", name,
+                       static_cast<unsigned long long>(pageOffset));
+            }
         }
 
         const uint32_t written = SiteSet::singleton().apply(name, pageOffset, static_cast<const uint8_t*>(data), 0x1000U);

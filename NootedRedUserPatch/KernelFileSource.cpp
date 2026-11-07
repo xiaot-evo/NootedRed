@@ -22,6 +22,8 @@
 
 #include <KernelFileSource.hpp>
 
+#include <Headers/kern_util.hpp>
+
 namespace NRedUserPatch
 {
 
@@ -32,16 +34,22 @@ namespace NRedUserPatch
         strlcpy(this->path_, path, sizeof(this->path_));
 
         this->context_ = vfs_context_create(nullptr);
-        if (this->context_ == nullptr) { return false; }
+        if (this->context_ == nullptr) {
+            SYSLOG("UserPatch", "file: vfs context creation failed for '%s'", path);
+            return false;
+        }
 
         vnode_t resolved = nullptr;
-        if (vnode_lookup(path, 0, &resolved, this->context_) != 0 || resolved == nullptr) {
+        const int lookup = vnode_lookup(path, 0, &resolved, this->context_);
+        if (lookup != 0 || resolved == nullptr) {
+            SYSLOG("UserPatch", "file: lookup '%s' failed %d", path, lookup);
             this->close();
             return false;
         }
         this->vnode_ = resolved;
         this->size_   = FileIO::readFileSize(resolved, this->context_);
         if (this->size_ == 0) {
+            SYSLOG("UserPatch", "file: size of '%s' is zero", path);
             this->close();
             return false;
         }
