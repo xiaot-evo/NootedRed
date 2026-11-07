@@ -25,6 +25,8 @@ TEST_SOURCE = ROOT / "test" / "test_analyzer.cpp"
 ANALYZER_SOURCES: list[pathlib.Path] = [
     ROOT / "NootedRedUserPatch" / "Analyzer" / "MachO.cpp",
     ROOT / "NootedRedUserPatch" / "Analyzer" / "CacheLocator.cpp",
+    ROOT / "NootedRedUserPatch" / "Analyzer" / "RuleTable.cpp",
+    ROOT / "NootedRedUserPatch" / "Analyzer" / "RuleResolver.cpp",
 ]
 
 

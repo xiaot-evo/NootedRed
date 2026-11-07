@@ -63,9 +63,10 @@ namespace NRedUserPatch
     {
         LocalKind      localKind;
         uint32_t       localOffset;     // kOffset: function-relative offset
-        const uint8_t* localPattern;    // kPattern: masked bytes, '?' wildcard is encoded by localMask
+        const uint8_t* localPattern;    // kPattern: masked bytes, wildcard encoded by localMask
         const uint8_t* localMask;       // kPattern: 1 = must match
         uint8_t        localPatternSize;
+        uint8_t        patchOffset;     // offset of `find` inside localPattern
         const uint8_t* find;
         const uint8_t* replace;
         uint8_t        patchSize;
@@ -91,8 +92,8 @@ namespace NRedUserPatch
 
     struct ResolvedSite
     {
-        const char*    vnodeName;    // static string owned by the rule/image table
-        uint64_t       fileOffset;   // offset inside the delivered vnode
+        char           vnodeName[64];  // delivered vnode basename (subcache or standalone file)
+        uint64_t       fileOffset;     // offset inside the delivered vnode
         const uint8_t* find;
         const uint8_t* replace;
         uint8_t        size;
