@@ -22,7 +22,9 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 INCLUDE_DIRS = [ROOT / "NootedRedUserPatch", ROOT / "test" / "support"]
 TEST_SOURCE = ROOT / "test" / "test_analyzer.cpp"
 # Analyzer core sources are appended here as the tasks add them.
-ANALYZER_SOURCES: list[pathlib.Path] = []
+ANALYZER_SOURCES: list[pathlib.Path] = [
+    ROOT / "NootedRedUserPatch" / "Analyzer" / "MachO.cpp",
+]
 
 
 def main() -> int:

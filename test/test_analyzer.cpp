@@ -21,6 +21,7 @@
 // along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowledge/raw/branch/master/LICENSE-v1.md.
 
 #include <Analyzer/ByteSource.hpp>
+#include <Analyzer/MachO.hpp>
 #include <FileByteSource.hpp>
 
 #include <stdint.h>
@@ -48,6 +49,42 @@ namespace
         snprintf(out, size, "%s/%s", root, tail);
     }
 
+    void testMachO(const char* const root)
+    {
+        char path[1024];
+
+        makePath(path, sizeof(path), root,
+                 "System/Library/Extensions/AMDRadeonX5000GLDriver.bundle/Contents/MacOS/AMDRadeonX5000GLDriver");
+        TestSupport::FileSource glFile;
+        check(TestSupport::openFixtureFile(path, glFile), "open standalone GL driver");
+        if (glFile.file != nullptr) {
+            auto glSource = glFile.source();
+            uint8_t magic[4]{};
+            check(glSource.readAt(0, magic, sizeof(magic)), "read Mach-O magic");
+            check(magic[0] == 0xCF && magic[1] == 0xFA && magic[2] == 0xED && magic[3] == 0xFE,
+                  "GL driver has MH_MAGIC_64");
+
+            NRedUserPatch::MachOImage image{};
+            check(NRedUserPatch::parseMachO(glSource, 0, 0, 0x14D000U, image), "parse GL Mach-O");
+            check(image.nsyms == 8384U, "GL nsyms");
+            check(image.functionStartsOffset == 0x157BC0U, "GL function starts offset");
+        }
+
+        makePath(path, sizeof(path), root,
+                 "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h.03");
+        TestSupport::FileSource mtlFile;
+        check(TestSupport::openFixtureFile(path, mtlFile), "open shared-cache subcache .03");
+        if (mtlFile.file != nullptr) {
+            auto mtlSource = mtlFile.source();
+            NRedUserPatch::MachOImage image{};
+            check(NRedUserPatch::parseMachO(mtlSource, 0x8757000U, 0x7FFB08757000ULL, 0x44FC11U, image),
+                  "parse MTL Mach-O from subcache");
+            check(image.nsyms == 19870U, "MTL nsyms");
+            check(image.functionStartsOffset == 0x23BA3918U, "MTL function starts offset");
+            check(image.textFileOffset == 0x8757000U, "MTL __TEXT file offset");
+        }
+    }
+
 }    // namespace
 
 int main(int argc, char** argv)
@@ -57,21 +94,7 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    const char* const root = argv[1];
-    char              path[1024];
-
-    makePath(path, sizeof(path), root,
-             "System/Library/Extensions/AMDRadeonX5000GLDriver.bundle/Contents/MacOS/AMDRadeonX5000GLDriver");
-
-    TestSupport::FileSource file;
-    check(TestSupport::openFixtureFile(path, file), "open standalone GL driver");
-    if (file.file != nullptr) {
-        auto source = file.source();
-        uint8_t magic[4]{};
-        check(source.readAt(0, magic, sizeof(magic)), "read Mach-O magic");
-        check(magic[0] == 0xCF && magic[1] == 0xFA && magic[2] == 0xED && magic[3] == 0xFE,
-              "GL driver has MH_MAGIC_64");
-    }
+    testMachO(argv[1]);
 
     printf("%s: %u failure(s)\n", failures == 0 ? "PASS" : "FAIL", failures);
     return failures == 0 ? 0 : 1;
