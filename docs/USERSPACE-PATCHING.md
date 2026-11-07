@@ -24,7 +24,8 @@
 
 ## 2. 不可变的核心
 
-Apple 的 GL/Metal/VDA/AppleGVA 用户态驱动位于 dyld shared cache（GL driver 是独立 bundle）。
+Apple 的 GL/Metal/VDA 用户态驱动位于 dyld shared cache（GL driver 是独立 bundle）；AppleGVA 在
+v1 退役，不参与解析。
 系统卷密封，AMFI 在页 fault 时校验签名，因此：
 
 1. 不能改磁盘上的二进制。
@@ -92,7 +93,7 @@ Cryptex 已挂载，才是安全的 VFS 起点。
 | 类型 | 例子 | 定位方式 |
 |------|------|----------|
 | standalone | `AMDRadeonX5000GLDriver` | 直接打开文件，Mach-O 的 `__TEXT` / `__LINKEDIT` 都在同一文件 |
-| dyld shared cache | `AMDRadeonX5000MTLDriver`、`AMDRadeonVADriver2`、`AppleGVA` | 从主 cache 的 `imagesText` 表取 `loadAddress`/`textSegmentSize`，再用 subcache 的 mapping 表换算成 `(subcache 文件, fileOffset)` |
+| dyld shared cache | `AMDRadeonX5000MTLDriver`、`AMDRadeonVADriver2` | 从主 cache 的 `imagesText` 表取 `loadAddress`/`textSegmentSize`，再用 subcache 的 mapping 表换算成 `(subcache 文件, fileOffset)` |
 
 ### 5.2 shared cache 的解析步骤
 
@@ -114,6 +115,10 @@ Cryptex 已挂载，才是安全的 VFS 起点。
 不能假设同一文件。字符串表（`stroff`）很大（数十 MB），只在需要时按 `strx` 读取单个字符串，
 不要整表读入。
 
+**内核读取约束**：vnode `ByteSource` 的 16 KiB 块缓存必须处理跨块请求，回退到直接
+`FileIO::readFileData`。24H232 实测，旧实现让跨块的 nlist/path 读取返回 false，符号扫描和镜像
+路径匹配整体失败，日志表现为 `symbol not found` / `image not located`；修复后 19/19 解析成功。
+
 ### 5.3 符号索引
 
 对每个目标镜像：
@@ -128,8 +133,8 @@ Cryptex 已挂载，才是安全的 VFS 起点。
 
 ### 5.4 解析预算
 
-- 目标镜像总量约 7 MB（GL 1.8 MB + MTL 4.5 MB + VADriver 0.75 MB + AppleGVA 1 MB）。
-- nlist 总量约 3 万条（VADriver 3,958 + MTL 19,870 + GL 8,384 + AppleGVA 384）。
+- 目标镜像总量约 7 MB（GL 1.8 MB + MTL 4.5 MB + VADriver 0.75 MB）。
+- nlist 总量约 3.2 万条（VADriver 3,958 + MTL 19,870 + GL 8,384）。
 - 函数起始约 1 万条。
 - 一次启动解析预计 < 100 ms，在专用可睡眠内核线程（`kernel_thread_start`）里完成；不占 hook
   热路径。worker 在 patcher-load 只睡眠，第一次 dyld shared cache 页校验后才开始 VFS。
@@ -156,6 +161,10 @@ Rule {
 
 15.8.2 的实际发布集是 **19 条规则**：default 5 条（GL + MTL），VDA 14 条（VADriver2）。
 `-NRedUserPatchVDA` 打开 VDA 集；AppleGVA 不在发布集，v1 不实现。
+
+规则表里每个 `find`/`replace` 数组的长度由编译期 `static_assert` 校验；写入路径按 `patchSize`
+从两个数组拷贝。生成器曾把规则 13 的 replace 截成 12 字节（find 是 13 字节），第 13 字节越界读到
+相邻静态数组的 `0x55`，实测写入 `90*12 + 55`；已修正为 13 个 NOP。
 
 ### 6.2 锚点类型
 
@@ -270,10 +279,10 @@ for rule in rules:
 - 没有被 fault 的页不需要补丁；它第一次被使用时 fault 会同步进入 hook，补丁在指令执行前完成。
 - 因此不再有主动 page-in / `vm_page_validate_cs` 预热，也不需要 `thread_call` 驱动的逐页完成。
 
-**时序假设**：第一次 dyld cache 校验之后、目标 GPU 驱动加载之前，analyzer 完成解析。这个假设必须
-用硬件日志验证（记录 trigger 时间、analyzer 完成时间 vs 第一次目标 vnode 校验时间）。如果日志显示
-目标页先到，只加一个**有界的 pending 修复**（记录窗口内被校验的目标页，解析完成后对这些页调用一次
-`vm_page_validate_cs`），不恢复整镜像 completion。
+**24H232 硬件结论（2026-11-07）**：第一次 dyld cache 页校验触发后，analyzer 解析出 19/19；随后
+`.03` 的 MTL/VDA 页在各自校验时被 hook 写入，GL 页在 SiteSet ready 后的首次 fault 被写入；私有
+只读映射回读 19/19 为 `replace`。没有观察到目标驱动页先于 SiteSet 校验；当前不需要 pending 修复。
+如果未来系统出现这个窗口，再加上述**有界 pending 修复**，不恢复整镜像 completion。
 
 ### 7.3 诊断与开关
 
@@ -413,14 +422,18 @@ NootedRedUserPatch/
 
 ### 11.5 硬件验证
 
-1. debug 构建 + DEBUG Lilu + `-liludbgall liludump=60`。
-2. SIP + AMFI 全开，正常启动；确认 analyzer 在目标驱动加载前完成。
-3. 日志确认每条规则的 anchor/函数/偏移/匹配数/variant，以及默认 5 次或 VDA 打开后 19 次写入。
-4. 功能验证：GL、Metal；VDA 解码/编码在 `-NRedUserPatchVDA` 下验证（按 `docs/VDA-TESTING.md`）。
-5. 页回读：用一个只读映射 touch 目标页，再读 UBC，确认 `replace` 存在；UBC 回收后再次 touch，
-   确认 hook 重写。
-6. `-NRedUserPatchDry`：确认只记录、不写；`-NRedUserPatchOff`：确认不安装 hook、不写。
-7. 性能：记录 analyzer 耗时、hook 调用数、首次目标校验与 analyzer 完成的时间差。
+2026-11-07 / 24H232 / Renoir `0x1638` / SIP + AMFI 全开：
+
+- 主 kext 0.9.1 `E1F3247A`，卫星 debug `2D1498AC`，Lilu 1.7.3 debug；boot-args
+  `-NRedUserPatchVDA -NRedUserPatchDebug -liludbgall liludump=60`。
+- hook 安装；name resolver `vnode_getname`/`vnode_putname`/`vn_getpath` 全部可用；第一次 dyld
+  shared-cache 页校验触发 worker，日志 `analyzer: 19/19 rules resolved (family 0x28, VDA 1)`。
+- `.03` 的 MTL/VDA 页和 GL 页由 hook 写入；私有只读映射回读 19/19 `PATCHED`（含规则 13 的
+  13 字节 NOP）；无 panic，SIP/AMFI 未关闭。
+- 调试通道：该机 Lilu 1.7.2 debug 的 `liludump` 未落盘，1.7.3 debug 正常；硬件验证用 1.7.3。
+
+待验证：`-NRedUserPatchDry`/`-NRedUserPatchOff`、UBC 回收后的重写、GL/Metal/VDA 功能负载、
+26.7.2 实机启动。
 
 ## 12. 决策与取舍
 
@@ -433,7 +446,7 @@ NootedRedUserPatch/
 | identity | 保留最小 device-id `familyMask` 门控，删除 build/profile 选择 | 卫星仍有少量 IOKit 探测；但不再依赖 kern.osversion |
 | VDA 默认 | 默认关闭，`-NRedUserPatchVDA` 打开 14 条 VADriver 规则 | 保持当前发布行为；用户需要显式开启 VDA |
 | AppleGVA | v1 丢弃 | 少一个 site；它是唯一需要重算相对跳转目标的样本 |
-| image completion | 删除 | 依赖“目标驱动在 analyzer 完成后才加载”的时序；硬件日志验证，必要时加有界 pending 修复 |
+| image completion | 删除 | 24H232 实测 19/19 在目标页校验时写入；若未来出现 analyzer 与目标页的窗口，再加有界 pending 修复 |
 | range hook | 暂不安装 | 如果未来版本走 range 路径，需要再加 |
 | kext 边界 | satellite 独立 | 两个安装物；但主 kext 的版本门不拖住用户态解析 |
 
