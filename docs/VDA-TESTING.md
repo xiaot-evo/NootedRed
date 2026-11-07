@@ -8,7 +8,7 @@
 
 ## 1. 前置
 
-- 主 kext 与卫星都是当前构建，卫星已注入本 build 的 profile；
+- 主 kext 与卫星都是当前构建；卫星在首次 dyld cache 校验后解析规则，无需 profile 注入；
 - Renoir `0x1636` / `0x1638`、Cezanne `0x164C`、Barcelo `0x15E7`（VCN 2.x）；Raven/Raven2/Picasso
   只有 VCN 1.x，媒体路径在内核侧就是关闭的，测不出硬解；
 - 没有外接 AMD 独显占用 X6000 路径。

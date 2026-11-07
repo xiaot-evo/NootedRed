@@ -365,51 +365,11 @@ for rule in rules:
   replace 字节，replace 仍由代码按 rule ID 固定）。默认方案是编译进 kext；外置只作为运维选项，
   并放在 root-only 路径。
 
-## 11. 迁移计划
+## 11. 验证
 
-### 11.1 新文件
+### 11.1 主机侧测试
 
-```
-NootedRedUserPatch/
-  RuleTable.hpp/.cpp       19 条规则：image + familyMask + flags + anchor + variants[] + find/replace
-  ImageAnalyzer.hpp/.cpp   dyld cache 解析、Mach-O 解析、符号/函数索引
-  RuleResolver.hpp/.cpp    anchor/local/variant 解析 -> SiteSet
-  SiteSet.hpp/.cpp         已解析站点数组（只读）
-  ValidationHook.hpp/.cpp  _cs_validate_page route + 写入
-  Plugin.cpp               生命周期、kernel thread、device-id 家族探测、boot args、日志
-  PatchPolicy.hpp          保留 siteFitsChunk
-```
-
-### 11.2 删除
-
-- `NootedRedUserPatch/PatchProfile.hpp/.cpp`（NRPT v4 格式、parser、identity、warm 状态）。
-- `NootedRedUserPatch/UserPatchBackend.hpp/.cpp` 中的 warm 引擎、`ubc_getobject` /
-  `vm_page_lookup` / `vm_page_validate_cs` / `vnode_pagein` 符号解析。
-- `Plugin.cpp` 中的 `NRedProfiles` 解析、build/profile 选择、identity 重试、service start
-  重试、IORegistry 发布。保留一个最小的 `device-id` 探测，只用于 `familyMask` 门控。
-- `-NRedWarmOff`；`NRedProfiles` 属性。新增 `-NRedUserPatchVDA`（默认关闭）。
-- `test/inject_profile.py`、`test/test_inject_profile.py`、`test/test_nrpt_validator.py`、
-  `test/test_kext_profile_harness.py`、`test/nrpt_validator.py`、`test/kext_harness/`。
-- `tools/nrpt4.py`、`tools/import_v3_profile.py`、`tools/verify_v4_cache_patch.py`（用新的
-  analyzer 测试和页回读工具替代）。
-- `NootedRedTool` 的 profile 生成/注入路径（`ProfileCodec.swift`、`PatchAnalyzer/SemanticRules.swift`
-  中仅服务于 profile 的部分）。保留与 profile 无关的系统探测功能。
-
-### 11.3 保留/调整
-
-- `NootedRedUserPatch` 保持独立 kext，不并进主 kext：主 kext 的 kernel-version 门和更新节奏不应
-  拖住用户态解析器。
-- `OSBundleLibraries` 对 `org.ChefKiss.NootedRed` 的依赖保留（主 kext 不在时 satellite 不加载）。
-- `LILU_CUSTOM_IOKIT_INIT` 可以删除：新架构不需要 service start / identity 重试；analyzer 用
-  patcher-load 后创建 kernel thread 即可（不能使用 thread_call：namei/VFS 不允许在该上下文执行）。
-- `_cs_validate_range` 暂不安装：24H232 上没有交付过 cache chunk，保留它只会增加符号解析和
-  失败面。等有硬件证据表明某个系统版本走 range 路径时再加。
-- `test_patch_policy.*` 保留（`siteFitsChunk` 仍用）。
-- `build/profile-24H232-*` 按仓库约定保留为历史证据，不再被运行时读取。
-
-### 11.4 主机侧测试
-
-新增 `test/test_rule_resolver.py`（或 C++ 主机测试）：
+主机的 `test/test_analyzer.py` 和 `test/test_site_set.py`：
 
 1. 对 `version-fixtures/15.8.2` 和 `version-fixtures/26.7.2` 运行同一套 Mach-O 解析 + 规则解析。
 2. 断言 default 5 条、VDA 打开后 19 条全部 resolved；每条解析出的 `find` 字节与 fixture 一致。
@@ -420,7 +380,7 @@ NootedRedUserPatch/
 
 这组测试不需要硬件，也不依赖 UBC 状态，是跨版本适配的主要回归手段。
 
-### 11.5 硬件验证
+### 11.2 硬件验证
 
 2026-11-07 / 24H232 / Renoir `0x1638` / SIP + AMFI 全开：
 
@@ -449,17 +409,6 @@ NootedRedUserPatch/
 | image completion | 删除 | 24H232 实测 19/19 在目标页校验时写入；若未来出现 analyzer 与目标页的窗口，再加有界 pending 修复 |
 | range hook | 暂不安装 | 如果未来版本走 range 路径，需要再加 |
 | kext 边界 | satellite 独立 | 两个安装物；但主 kext 的版本门不拖住用户态解析 |
-
-## 13. 实施顺序
-
-1. **Host analyzer 原型**：用 C++ 在 fixture 上跑通 15.8.2 的 default 5 条和 VDA 14 条，再跑
-   26.7.2；确定每条规则的 anchor/local/variant 表示。这是风险最低、反馈最快的阶段。
-2. **内核解析器**：Mach-O/dyld cache 读取、符号索引、函数起始、subcache 枚举；先在
-   `-NRedUserPatchDry` 下只解析不写，日志打印每条规则的解析结果。
-3. **Hook 接入**：用解析出的 SiteSet 替换 `PatchProfile::applyChunk`；保持原有写入/回读/幂等逻辑。
-4. **删除旧路径**：PatchProfile、profile 选择、warm、注入、工具链；保留最小 device-id 探测。
-5. **硬件验证**：GL/Metal（默认）、VDA（`-NRedUserPatchVDA`）、dry-run、off、页回读、UBC 回收重写。
-6. **26.7.2 验证**：主机 fixture 必过；如果硬件可启动 26.7.2，做一次实机确认。
 
 ## 附录 A：15.8.2 → 26.7.2 站点解析证据
 
