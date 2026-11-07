@@ -35,9 +35,12 @@ namespace NRedUserPatch
     // One-shot boot analyzer.  Opens the live dyld cache and the target images through VFS, resolves
     // the compiled rule table against the running build and publishes the immutable SiteSet.
     //
-    // The VFS phase (namei, vnode reads) must run in a normal sleepable kernel thread: a thread_call
-    // callback is not a valid context for namei.  The worker is created with kernel_thread_start and
-    // exits through IOExitThread; the validation hook never calls into this class.
+    // The VFS phase (namei, vnode reads) must not run at patcher-load: the volume namespace is not
+    // ready then, and namei in an early thread_call/worker panics before user space.  The kernel
+    // thread is created at patcher-load but only sleeps until ValidationHook reports the first dyld
+    // shared-cache page validation.  That event proves user space is up and the Cryptex is mounted;
+    // the worker then performs the whole VFS phase in a normal sleepable kernel thread and exits
+    // through IOExitThread.  The validation hook itself never does VFS.
     class AnalyzerRuntime
     {
     public:
@@ -46,6 +49,14 @@ namespace NRedUserPatch
         void start(KernelPatcher& patcher);
         void stop();
         auto ready() const -> bool;
+
+        // Called from the validation hook (no VFS): the first dyld shared-cache page validation is
+        // the safe point to start the VFS phase.  Idempotent and lock-free.
+        void noteTrigger();
+
+        // True for the dyld shared-cache vnodes and the standalone GL driver.  The hook calls this
+        // before the SiteSet is ready; it must remain allocation-free.
+        static auto isTriggerVnode(const char* name) -> bool;
 
     private:
         static constexpr uint32_t kMaxFiles       = 10U;
@@ -74,6 +85,7 @@ namespace NRedUserPatch
         bool          vdaEnabled_{false};
         volatile uint8_t stop_{0};
         volatile uint8_t started_{0};
+        volatile uint8_t trigger_{0};
     };
 
 }    // namespace NRedUserPatch

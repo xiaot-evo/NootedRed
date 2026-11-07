@@ -22,6 +22,7 @@
 
 #include <ValidationHook.hpp>
 
+#include <AnalyzerRuntime.hpp>
 #include <Headers/kern_mach.hpp>
 #include <SiteSet.hpp>
 
@@ -122,6 +123,13 @@ namespace NRedUserPatch
 
         char name[64]{};
         if (!self.nameForVnode(vnode, name, sizeof(name))) { return; }
+
+        // The first dyld shared-cache validation is the earliest safe point for the analyzer's VFS
+        // phase: user space is up and the Cryptex volume is mounted.  Setting the flag is a single
+        // atomic store; the worker (not this hook) does every namei/vnode read.
+        if (!SiteSet::singleton().ready() && AnalyzerRuntime::isTriggerVnode(name)) {
+            AnalyzerRuntime::singleton().noteTrigger();
+        }
 
         const uint32_t written = SiteSet::singleton().apply(name, pageOffset, static_cast<const uint8_t*>(data), 0x1000U);
         if (written != 0U && self.takeLogBudget()) {

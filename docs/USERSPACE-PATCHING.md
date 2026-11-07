@@ -68,16 +68,22 @@ NootedRedUserPatch.kext
 启动顺序：
   plugin load
     -> 安装 _cs_validate_page route（先装，避免校验窗口）
-    -> 创建 analyzer kernel thread（kernel_thread_start）
-         -> 解析规则表
-         -> 解析目标镜像（重试直到 Cryptex/Data 卷可用）
-         -> 解析每条规则 -> SiteSet ready
+    -> 创建 analyzer kernel thread（kernel_thread_start），线程只睡眠，不做 VFS
+    -> 第一次 dyld shared cache 页校验（用户态已启动、Cryptex 已挂载）
+         -> hook 设置一次性的 trigger（单次 atomic store，不做 VFS）
+         -> worker 唤醒，执行完整的 VFS/namei 解析
+         -> 解析规则表、目标镜像、每条规则 -> SiteSet ready
     -> WindowServer 加载 GPU 用户态驱动
          -> 页面 fault -> hook -> 命中已解析的 site -> 写入
 ```
 
 关键点：**hook 里不做解析**。不做文件 I/O、不分配、不睡眠、不扫描模式。hook 只做
 vnode 名字匹配 + 偏移区间匹配 + 字节比对 + 写入，和当前 `applyChunk` 的热路径相同。
+
+**VFS 时序是硬约束**：patcher-load 时卷命名空间还没就绪，namei 在早期线程（无论 thread_call
+还是普通 kernel thread）里都会 panic（`Taking non-sleepable RW lock with preemption enabled`）。
+所以 worker 在 patcher-load 只启动并睡眠；第一次 dyld shared cache 页校验证明用户态已起来、
+Cryptex 已挂载，才是安全的 VFS 起点。
 
 ## 5. 镜像解析
 
@@ -126,7 +132,8 @@ vnode 名字匹配 + 偏移区间匹配 + 字节比对 + 写入，和当前 `app
 - nlist 总量约 3 万条（VADriver 3,958 + MTL 19,870 + GL 8,384 + AppleGVA 384）。
 - 函数起始约 1 万条。
 - 一次启动解析预计 < 100 ms，在专用可睡眠内核线程（`kernel_thread_start`）里完成；不占 hook
-  热路径。**不能用 `thread_call`**：namei/VFS 文件查找不允许在 thread_call 上下文里执行。
+  热路径。worker 在 patcher-load 只睡眠，第一次 dyld shared cache 页校验后才开始 VFS。
+  **不能用 `thread_call`，也不能在 patcher-load 直接做 VFS**：早期 namei 会 panic。
 
 ## 6. 站点规则
 
@@ -256,13 +263,16 @@ for rule in rules:
 
 新架构下：
 
-- 规则在启动时解析，hook 在解析前就已安装；不存在“profile 未激活”的窗口。
+- hook 在任何目标页之前安装；analyzer worker 等到第一次 dyld shared cache 页校验（用户态已起来）
+  才做 VFS 并解析规则。不存在“profile 未激活”的窗口。
+- 第一次 dyld cache 校验通常是无关 dylib 的页；目标 GPU 驱动由 WindowServer / 视频服务更晚加载，
+  所以 SiteSet 通常在目标页之前 ready。
 - 没有被 fault 的页不需要补丁；它第一次被使用时 fault 会同步进入 hook，补丁在指令执行前完成。
 - 因此不再有主动 page-in / `vm_page_validate_cs` 预热，也不需要 `thread_call` 驱动的逐页完成。
 
-**时序假设**：目标用户态驱动在 WindowServer / 视频服务加载，远晚于 analyzer 完成。这个假设必须
-用硬件日志验证（记录 analyzer 完成时间 vs 第一次目标 vnode 校验时间）。如果日志显示存在窗口，
-只加一个**有界的 pending 修复**（记录窗口内被校验的目标页，解析完成后对这些页调用一次
+**时序假设**：第一次 dyld cache 校验之后、目标 GPU 驱动加载之前，analyzer 完成解析。这个假设必须
+用硬件日志验证（记录 trigger 时间、analyzer 完成时间 vs 第一次目标 vnode 校验时间）。如果日志显示
+目标页先到，只加一个**有界的 pending 修复**（记录窗口内被校验的目标页，解析完成后对这些页调用一次
 `vm_page_validate_cs`），不恢复整镜像 completion。
 
 ### 7.3 诊断与开关

@@ -168,8 +168,47 @@ namespace NRedUserPatch
     void AnalyzerRuntime::threadEntry(void* const parameter, wait_result_t)
     {
         auto* const self = static_cast<AnalyzerRuntime*>(parameter);
-        if (self != nullptr) { self->process(); }
+        if (self != nullptr) {
+            // Patcher-load is too early for namei: the Cryptex/Data volume namespace is not ready
+            // and VFS lookup there panics.  Sleep until the validation hook reports the first dyld
+            // shared-cache page; that proves user space is up and the cache volume is mounted.
+            while (__atomic_load_n(&self->stop_, __ATOMIC_ACQUIRE) == 0U) {
+                if (__atomic_load_n(&self->trigger_, __ATOMIC_ACQUIRE) != 0U) {
+                    self->process();
+                    break;
+                }
+                IOSleep(10);
+            }
+        }
         IOExitThread();
+    }
+
+    void AnalyzerRuntime::noteTrigger() { __atomic_store_n(&this->trigger_, 1U, __ATOMIC_RELEASE); }
+
+    auto AnalyzerRuntime::isTriggerVnode(const char* const name) -> bool
+    {
+        if (name == nullptr) { return false; }
+
+        static constexpr char kMainCache[] = "dyld_shared_cache_x86_64h";
+        if (strcmp(name, kMainCache) == 0) { return true; }
+
+        static constexpr char kSubcachePrefix[] = "dyld_shared_cache_x86_64h.";
+        size_t prefixIndex = 0;
+        while (kSubcachePrefix[prefixIndex] != '\0' && name[prefixIndex] == kSubcachePrefix[prefixIndex]) {
+            prefixIndex += 1U;
+        }
+        if (kSubcachePrefix[prefixIndex] == '\0') { return true; }
+
+        for (uint32_t ruleIndex = 0; ruleIndex < kRuleCount; ruleIndex++) {
+            const Rule& rule = kRules[ruleIndex];
+            if (rule.imageKind != ImageKind::kStandalone) { continue; }
+            const char* base = rule.imagePath;
+            for (const char* cursor = rule.imagePath; *cursor != '\0'; cursor++) {
+                if (*cursor == '/') { base = cursor + 1; }
+            }
+            if (strcmp(name, base) == 0) { return true; }
+        }
+        return false;
     }
 
     void AnalyzerRuntime::closeFiles()

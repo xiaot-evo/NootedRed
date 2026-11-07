@@ -15,7 +15,7 @@
 - ChefKiss Open Knowledge License v1 header on every source file; copyright year 2026; no AI or assistant attribution in files or commits.
 - C++23; no STL containers, exceptions or RTTI; `auto f() -> T` trailing returns; PascalCase types; camelCase methods/locals/members; `k` constants.
 - Hook path (`_cs_validate_page` wrapper): no allocation, sleeping, file I/O, IORegistry, vnode references, or unbounded logging. Only atomics, the immutable `SiteSet`, byte compares and the kernel write lock.
-- Analysis runs in a dedicated sleepable kernel thread (`kernel_thread_start`), never in a `thread_call`: namei/VFS lookup is not allowed in the thread_call context. It may use VFS/`FileIO` and bounded allocations, and retries with `IOSleep` while the Cryptex/Data volume is not yet mounted.
+- Analysis runs in a dedicated sleepable kernel thread (`kernel_thread_start`), never in a `thread_call`: namei/VFS lookup is not allowed in the thread_call context. The worker starts at patcher-load but only sleeps; it must not do VFS there (early namei panics before the volume namespace is ready). The validation hook sets a one-shot trigger on the first dyld shared-cache page validation; only then does the worker use VFS/`FileIO` and bounded allocations. It retries with `IOSleep` if needed.
 - The original validator always runs first and its result is never changed. A site is written only when its complete `find`/`replace` bytes are inside the delivered chunk and `find` matches exactly.
 - No runtime patch-data channel: no `NRedProfiles`, NVRAM, IORegistry or boot-arg-supplied patch bytes. The only boot-arg inputs are enable/disable switches (`-NRedUserPatchOff`, `-NRedUserPatchDry`, `-NRedUserPatchVDA`, `-NRedUserPatchDebug`).
 - AMFI and SIP stay fully enabled; no boot-arg may be required to make the mechanism work.
@@ -346,9 +346,11 @@ git commit -m "analyzer: resolve the user-space patch rules and shape variants"
   class AnalyzerRuntime {
   public:
       static AnalyzerRuntime& singleton();
-      void start(KernelPatcher& patcher);   // patcher-load: install hook, start kernel thread
+      void start(KernelPatcher& patcher);   // patcher-load: start a thread that waits
       void stop();
       bool ready() const;                   // SiteSet is published
+      void noteTrigger();                   // first dyld cache validation, no VFS
+      static bool isTriggerVnode(const char* name);
   private:
       static void threadEntry(void* parameter, wait_result_t result);
       void process();
@@ -356,11 +358,12 @@ git commit -m "analyzer: resolve the user-space patch rules and shape variants"
   ```
   `KernelFileSource` opens a vnode with `vnode_lookup(path, 0, &vp, ctx)` using a context from
   `vfs_context_create(nullptr)` and reads a range with `FileIO::readFileData(buffer, offset, size, vp,
-  ctxt)`; it closes with `vnode_put` and `vfs_context_rele`. This runs in a dedicated kernel thread
-  created with `kernel_thread_start` (the thread exits through `IOExitThread`), never in a
-  `thread_call`. The thread uses the live roots `kLiveCacheDir` and `kSystemCacheDir`, retries with
-  `IOSleep(500)` up to 10 times while the Cryptex is not mounted, and on success calls
-  `SiteSet::publish(...)`.
+  ctxt)`; it closes with `vnode_put` and `vfs_context_rele`. The worker is a dedicated kernel thread
+  created with `kernel_thread_start` (it exits through `IOExitThread`), never a `thread_call`. It
+  sleeps at patcher-load: VFS/namei there panics because the volume namespace is not ready. The
+  validation hook sets `noteTrigger()` on the first dyld shared-cache page validation (user space is
+  up); the worker then uses the live roots `kLiveCacheDir` and `kSystemCacheDir`, retries with
+  `IOSleep(500)` if needed, and on success calls `SiteSet::publish(...)`.
 
 - [ ] **Step 1: Write the failing test**
 
