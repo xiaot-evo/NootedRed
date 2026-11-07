@@ -9,15 +9,12 @@ PatchData 流水线；对应工具已删除。分析器设计见 [`../docs/USERS
 | --- | --- |
 | `build-branch.sh` | 按分支隔离产物并给 zip 加时间戳 |
 | `build.sh` | 单独编译 `gl_blend_probe`（不碰 GPU） |
-| `test_build_artifacts.py` | 检查 `build/branches/...` 下的产物 |
 
-## 目标机采集
+## Fixture 采集
 
 | 工具 | 用途 |
 | --- | --- |
 | `collect_validation_fixtures.py` | 收集干净 fixture 副本树，供 `test/test_analyzer.py` 使用 |
-| `collect_platform_data.py` / `import_platform_data.py` | 采集与归档平台数据（`/platform-data/`，不进 git） |
-| `adaptation_info.py` | 只读兼容性报告（系统、kext、GPU、boot-args、EFI 状态） |
 
 ## VDA 专项与探针
 

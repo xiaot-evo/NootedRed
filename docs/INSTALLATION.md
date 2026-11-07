@@ -80,8 +80,8 @@ M=5，加 `-NRedUserPatchVDA` 后 M=19。解析失败的规则不会写入，也
 | 硬解不工作 | 是否带 `-NRedVDA` 和 `-NRedUserPatchVDA`；按 [VDA-TESTING.md](VDA-TESTING.md) 逐项验证 |
 | 换了 macOS 小版本后部分补丁失效 | 正常：analyzer 按符号/函数结构解析；日志会指出 unresolved 的 rule id，更新对应规则即可 |
 
-提交问题时附上 `NootedRedTool --diagnostics`（或手动的 `sw_vers`、`uname -r`、`ioreg`、
-`kextstat`、`log show` 输出）。
+提交问题时附上 `sw_vers`、`uname -r`、`ioreg -l`、当前 boot-args、`kextstat` 和
+`log show` 输出。
 
 ## 8. 自己构建
 

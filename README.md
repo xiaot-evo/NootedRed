@@ -48,7 +48,6 @@ along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowled
 | --- | --- |
 | `NootedRed.kext` | 内核侧：FB/DC/PM/SMU、X5000/X6000/HWLibs/AGDP/Backlight 等补丁 |
 | `NootedRedUserPatch.kext` | 用户态卫星：启动时解析当前系统的 Mach-O，解析编译进 kext 的规则，在 code-signing 校验钩子上写入（默认 GL/Metal 5 条，`-NRedUserPatchVDA` 打开 14 条 VADriver） |
-| `NootedRedTool` | 宿主侧 macOS 15+ 诊断工具（旧的 profile 生成流水线已退役） |
 
 用户态补丁的定位在运行期完成：kext 解析当前镜像的符号和函数结构；规则表很小且不按 build
 增长。系统小版本更新通常不需要改 kext；只有 Apple 改变函数结构时才更新对应规则。
