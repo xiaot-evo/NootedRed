@@ -69,11 +69,14 @@ namespace NRedUserPatch
 
         this->vdaEnabled_ = checkKernelArgument("-NRedUserPatchVDA");
         this->detectFamily();
+        IOLog("NootedRedUserPatch: analyzer start family=0x%X vda=%u\n", static_cast<unsigned>(this->runningFamily_),
+              this->vdaEnabled_ ? 1U : 0U);
 
         thread_t worker = nullptr;
         const kern_return_t result = kernel_thread_start(threadEntry, this, &worker);
         if (result != KERN_SUCCESS) {
             SYSLOG("UserPatch", "analyzer: kernel thread start failed 0x%X", static_cast<unsigned>(result));
+            IOLog("NootedRedUserPatch: kernel thread start failed 0x%X\n", static_cast<unsigned>(result));
             return;
         }
         thread_deallocate(worker);
@@ -173,9 +176,11 @@ namespace NRedUserPatch
             // and VFS lookup there panics.  Sleep until the validation hook reports the first dyld
             // shared-cache page; that proves user space is up and the cache volume is mounted.
             SYSLOG("UserPatch", "analyzer: worker waiting for the first dyld cache validation");
+            IOLog("NootedRedUserPatch: worker waiting for first dyld cache validation\n");
             while (__atomic_load_n(&self->stop_, __ATOMIC_ACQUIRE) == 0U) {
                 if (__atomic_load_n(&self->trigger_, __ATOMIC_ACQUIRE) != 0U) {
                     SYSLOG("UserPatch", "analyzer: trigger observed, starting VFS phase");
+                    IOLog("NootedRedUserPatch: trigger observed\n");
                     self->process();
                     break;
                 }
@@ -222,6 +227,7 @@ namespace NRedUserPatch
     void AnalyzerRuntime::process()
     {
         SYSLOG("UserPatch", "analyzer: VFS phase start");
+        IOLog("NootedRedUserPatch: VFS phase start\n");
         KernelFile* mainFile = nullptr;
         for (uint32_t attempt = 0; attempt < kMaxRetries; attempt++) {
             if (__atomic_load_n(&this->stop_, __ATOMIC_ACQUIRE) != 0U) {
@@ -244,9 +250,11 @@ namespace NRedUserPatch
         }
         if (mainFile == nullptr) {
             SYSLOG("UserPatch", "analyzer: dyld cache unavailable; no sites resolved");
+            IOLog("NootedRedUserPatch: dyld cache unavailable; no sites resolved\n");
             this->closeFiles();
             return;
         }
+        IOLog("NootedRedUserPatch: main cache open '%s'\n", mainFile->path());
 
         ByteSource mainSource = mainFile->source();
         ResolveContext context{};
@@ -285,6 +293,9 @@ namespace NRedUserPatch
         SYSLOG("UserPatch", "analyzer: %u/%u rules resolved (family 0x%X, VDA %u)",
                static_cast<unsigned>(count), static_cast<unsigned>(enabled),
                static_cast<unsigned>(context.runningFamily), context.vdaEnabled ? 1U : 0U);
+        IOLog("NootedRedUserPatch: %u/%u rules resolved family=0x%X vda=%u\n", static_cast<unsigned>(count),
+              static_cast<unsigned>(enabled), static_cast<unsigned>(context.runningFamily),
+              context.vdaEnabled ? 1U : 0U);
 
         this->closeFiles();
     }

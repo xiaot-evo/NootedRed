@@ -23,6 +23,7 @@
 #include <KernelFileSource.hpp>
 
 #include <Headers/kern_util.hpp>
+#include <IOKit/IOLib.h>
 
 namespace NRedUserPatch
 {
@@ -36,6 +37,7 @@ namespace NRedUserPatch
         this->context_ = vfs_context_create(nullptr);
         if (this->context_ == nullptr) {
             SYSLOG("UserPatch", "file: vfs context creation failed for '%s'", path);
+            IOLog("NootedRedUserPatch: vfs context failed for '%s'\n", path);
             return false;
         }
 
@@ -43,6 +45,7 @@ namespace NRedUserPatch
         const int lookup = vnode_lookup(path, 0, &resolved, this->context_);
         if (lookup != 0 || resolved == nullptr) {
             SYSLOG("UserPatch", "file: lookup '%s' failed %d", path, lookup);
+            IOLog("NootedRedUserPatch: lookup '%s' failed %d\n", path, lookup);
             this->close();
             return false;
         }
@@ -50,6 +53,7 @@ namespace NRedUserPatch
         this->size_   = FileIO::readFileSize(resolved, this->context_);
         if (this->size_ == 0) {
             SYSLOG("UserPatch", "file: size of '%s' is zero", path);
+            IOLog("NootedRedUserPatch: size of '%s' is zero\n", path);
             this->close();
             return false;
         }

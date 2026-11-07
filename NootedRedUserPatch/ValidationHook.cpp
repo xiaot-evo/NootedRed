@@ -24,6 +24,7 @@
 
 #include <AnalyzerRuntime.hpp>
 #include <Headers/kern_mach.hpp>
+#include <IOKit/IOLib.h>
 #include <SiteSet.hpp>
 
 #include <stdint.h>
@@ -86,6 +87,9 @@ namespace NRedUserPatch
         SYSLOG("UserPatch", "name resolver: getname %u putname %u getpath %u",
                static_cast<unsigned>(this->orgVnodeGetname_ != 0), static_cast<unsigned>(this->orgVnodePutname_ != 0),
                static_cast<unsigned>(this->orgVnGetpath_ != 0));
+        IOLog("NootedRedUserPatch: name resolver getname=%u putname=%u getpath=%u\n",
+              static_cast<unsigned>(this->orgVnodeGetname_ != 0), static_cast<unsigned>(this->orgVnodePutname_ != 0),
+              static_cast<unsigned>(this->orgVnGetpath_ != 0));
 
         SiteSet::singleton().setWriter(&ValidationHook::beginWrite, &ValidationHook::endWrite, nullptr);
 
@@ -93,10 +97,12 @@ namespace NRedUserPatch
         if (patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1)) {
             this->installed_ = true;
             SYSLOG("UserPatch", "installed _cs_validate_page route");
+            IOLog("NootedRedUserPatch: installed _cs_validate_page route\n");
         }
         else {
             patcher.clearError();
             SYSLOG("UserPatch", "_cs_validate_page route unavailable; no writes");
+            IOLog("NootedRedUserPatch: _cs_validate_page route unavailable\n");
         }
     }
 

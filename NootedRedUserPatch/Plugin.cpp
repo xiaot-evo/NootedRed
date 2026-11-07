@@ -23,6 +23,7 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <Headers/plugin_start.hpp>
+#include <IOKit/IOLib.h>
 
 #include <AnalyzerRuntime.hpp>
 #include <SiteSet.hpp>
@@ -47,6 +48,7 @@ PluginConfiguration ADDPR(config){
     KernelVersion::Tahoe,
     []() {
         SYSLOG("init", "NootedRedUserPatch %s starting (runtime analyzer)", xStringify(MODULE_VERSION));
+        IOLog("NootedRedUserPatch: init %s (runtime analyzer)\n", xStringify(MODULE_VERSION));
 
         lilu.onPatcherLoadForce(
             [](void* const, KernelPatcher& patcher)
