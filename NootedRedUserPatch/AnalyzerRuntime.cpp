@@ -212,9 +212,9 @@ namespace NRedUserPatch
         context.runningFamily = this->runningFamily_;
         context.vdaEnabled    = this->vdaEnabled_;
 
-        ResolvedSite sites[SiteSet::kMaxSites]{};
-        uint32_t     count = 0;
-        uint32_t     enabled = 0;
+        ResolvedSite* const sites = this->pending_;
+        uint32_t            count = 0;
+        uint32_t            enabled = 0;
         for (uint32_t index = 0; index < kRuleCount; index++) {
             const Rule& rule = kRules[index];
             if (!ruleEnabled(rule, context.runningFamily, context.vdaEnabled)) { continue; }

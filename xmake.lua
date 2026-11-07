@@ -40,13 +40,11 @@ target("NootedRed")
 	end)
 target_end()
 
--- Satellite kext: user-space GL/Metal/VDA exact-page patches.  It is a separate Lilu plugin with its own
--- bundle identifier and deployment target (Catalina..Tahoe, enforced by PluginConfiguration), and is
--- loaded only when NootedRed is present (Info.plist OSBundleLibraries dependency).
---
--- LILU_CUSTOM_IOKIT_INIT is defined for the whole target so Lilu's Library/plugin_start.cpp does not
--- define the IOService subclass; Plugin.cpp defines it instead and uses IOService::start as a later
--- retry point for the kernel build string and IORegistry data.
+-- Satellite kext: runtime analysis of the user-space GL/Metal/VDA drivers.  It is a separate Lilu
+-- plugin with its own bundle identifier and deployment target (Catalina..Tahoe, enforced by
+-- PluginConfiguration), and is loaded only when NootedRed is present (Info.plist OSBundleLibraries
+-- dependency).  The standard Lilu plugin start provides the IOService; the analyzer uses a
+-- pre-allocated thread call and needs no custom IOKit init.
 --
 -- The satellite targetdir is a sibling of the per-mode directories (not nested inside them), because
 -- AppleForge's after_build recursively archives targetdir: nesting made NootedRed's zip scoop up the
@@ -56,7 +54,6 @@ target("NootedRedUserPatch")
 	set_kind("binary")
 	set_languages("cxx23")
 	add_cxflags("-Wno-c23-extensions")
-	add_defines("LILU_CUSTOM_IOKIT_INIT")
 
 	add_files("NootedRedUserPatch/**.cpp")
 	add_includedirs("NootedRedUserPatch")

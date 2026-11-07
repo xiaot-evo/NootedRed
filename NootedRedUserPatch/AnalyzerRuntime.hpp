@@ -25,6 +25,7 @@
 #include <Analyzer/RuleResolver.hpp>
 #include <Headers/kern_patcher.hpp>
 #include <KernelFileSource.hpp>
+#include <SiteSet.hpp>
 #include <kern/thread_call.h>
 #include <stdint.h>
 
@@ -65,6 +66,7 @@ namespace NRedUserPatch
 
         thread_call_t call_{nullptr};
         KernelFile    files_[kMaxFiles]{};
+        ResolvedSite  pending_[SiteSet::kMaxSites]{};
         uint32_t      fileCount_{0};
         uint32_t      runningFamily_{0};
         bool          vdaEnabled_{false};

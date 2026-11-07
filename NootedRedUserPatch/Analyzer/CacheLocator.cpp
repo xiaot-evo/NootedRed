@@ -30,8 +30,8 @@ namespace
 
     static constexpr const char* kMainCacheName  = "dyld_shared_cache_x86_64h";
     static constexpr uint32_t    kMaxImagesText  = 65536U;
-    static constexpr uint32_t    kMaxSubcaches   = 8U;
-    static constexpr uint32_t    kMaxMappings    = 16U;
+    static constexpr uint32_t    kMaxSubcaches   = 7U;
+    static constexpr uint32_t    kMaxMappings    = 4U;
     static constexpr uint32_t    kMaxPathLength  = 400U;
     static constexpr uint32_t    kSubcacheEntry  = 56U;
     static constexpr uint32_t    kMappingEntry   = 32U;
