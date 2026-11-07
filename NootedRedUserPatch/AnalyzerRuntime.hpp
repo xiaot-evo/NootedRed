@@ -26,15 +26,18 @@
 #include <Headers/kern_patcher.hpp>
 #include <KernelFileSource.hpp>
 #include <SiteSet.hpp>
-#include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <stdint.h>
 
 namespace NRedUserPatch
 {
 
     // One-shot boot analyzer.  Opens the live dyld cache and the target images through VFS, resolves
-    // the compiled rule table against the running build and publishes the immutable SiteSet.  Runs
-    // in a sleepable, pre-allocated thread call; the validation hook never calls into this class.
+    // the compiled rule table against the running build and publishes the immutable SiteSet.
+    //
+    // The VFS phase (namei, vnode reads) must run in a normal sleepable kernel thread: a thread_call
+    // callback is not a valid context for namei.  The worker is created with kernel_thread_start and
+    // exits through IOExitThread; the validation hook never calls into this class.
     class AnalyzerRuntime
     {
     public:
@@ -54,23 +57,22 @@ namespace NRedUserPatch
         AnalyzerRuntime(const AnalyzerRuntime&) = delete;
         auto operator=(const AnalyzerRuntime&) -> AnalyzerRuntime& = delete;
 
-        static void callback(thread_call_param_t param0, thread_call_param_t param1);
+        static void threadEntry(void* parameter, wait_result_t result);
         void process();
         void detectFamily();
-        void scheduleRetry();
+        void closeFiles();
 
         static auto openCacheThunk(void* context, const char* name, ByteSource& out) -> bool;
         static auto openImageThunk(void* context, const char* imagePath, ByteSource& out) -> bool;
         auto findOrOpen(const char* path) -> KernelFile*;
         static auto familyForDeviceID(uint16_t deviceID) -> uint32_t;
 
-        thread_call_t call_{nullptr};
         KernelFile    files_[kMaxFiles]{};
         ResolvedSite  pending_[SiteSet::kMaxSites]{};
         uint32_t      fileCount_{0};
         uint32_t      runningFamily_{0};
         bool          vdaEnabled_{false};
-        uint32_t      retries_{0};
+        volatile uint8_t stop_{0};
         volatile uint8_t started_{0};
     };
 

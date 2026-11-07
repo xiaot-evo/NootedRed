@@ -68,7 +68,7 @@ NootedRedUserPatch.kext
 启动顺序：
   plugin load
     -> 安装 _cs_validate_page route（先装，避免校验窗口）
-    -> 提交 analyzer thread call
+    -> 创建 analyzer kernel thread（kernel_thread_start）
          -> 解析规则表
          -> 解析目标镜像（重试直到 Cryptex/Data 卷可用）
          -> 解析每条规则 -> SiteSet ready
@@ -125,7 +125,8 @@ vnode 名字匹配 + 偏移区间匹配 + 字节比对 + 写入，和当前 `app
 - 目标镜像总量约 7 MB（GL 1.8 MB + MTL 4.5 MB + VADriver 0.75 MB + AppleGVA 1 MB）。
 - nlist 总量约 3 万条（VADriver 3,958 + MTL 19,870 + GL 8,384 + AppleGVA 384）。
 - 函数起始约 1 万条。
-- 一次启动解析预计 < 100 ms，在可睡眠的 thread call 里完成；不占 hook 热路径。
+- 一次启动解析预计 < 100 ms，在专用可睡眠内核线程（`kernel_thread_start`）里完成；不占 hook
+  热路径。**不能用 `thread_call`**：namei/VFS 文件查找不允许在 thread_call 上下文里执行。
 
 ## 6. 站点规则
 
@@ -222,7 +223,7 @@ for rule in rules:
 | 条件 | 行为 |
 |------|------|
 | 规则表缺失/格式错误 | 不解析任何规则；satellite 保持 loaded 但不写 |
-| cache 路径暂不可用 | analyzer thread call 重试；期间 hook 不写 |
+| cache 路径暂不可用 | analyzer kernel thread 用 `IOSleep` 重试；期间 hook 不写 |
 | 镜像路径不匹配 | 该规则 unresolved；日志一次 |
 | 符号不存在 | 依次尝试 fingerprint、image-unique；都失败则 unresolved |
 | 函数范围内匹配数不符合 policy | 该 variant 跳过；尝试下一个 variant |
@@ -356,7 +357,7 @@ NootedRedUserPatch/
   RuleResolver.hpp/.cpp    anchor/local/variant 解析 -> SiteSet
   SiteSet.hpp/.cpp         已解析站点数组（只读）
   ValidationHook.hpp/.cpp  _cs_validate_page route + 写入
-  Plugin.cpp               生命周期、thread call、device-id 家族探测、boot args、日志
+  Plugin.cpp               生命周期、kernel thread、device-id 家族探测、boot args、日志
   PatchPolicy.hpp          保留 siteFitsChunk
 ```
 
@@ -381,7 +382,7 @@ NootedRedUserPatch/
   拖住用户态解析器。
 - `OSBundleLibraries` 对 `org.ChefKiss.NootedRed` 的依赖保留（主 kext 不在时 satellite 不加载）。
 - `LILU_CUSTOM_IOKIT_INIT` 可以删除：新架构不需要 service start / identity 重试；analyzer 用
-  patcher-load 后提交的 thread call 即可。
+  patcher-load 后创建 kernel thread 即可（不能使用 thread_call：namei/VFS 不允许在该上下文执行）。
 - `_cs_validate_range` 暂不安装：24H232 上没有交付过 cache chunk，保留它只会增加符号解析和
   失败面。等有硬件证据表明某个系统版本走 range 路径时再加。
 - `test_patch_policy.*` 保留（`siteFitsChunk` 仍用）。

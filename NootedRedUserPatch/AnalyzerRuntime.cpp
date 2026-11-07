@@ -27,7 +27,7 @@
 #include <Headers/kern_util.hpp>
 #include <SiteSet.hpp>
 
-#include <kern/clock.h>
+#include <IOKit/IOLib.h>
 #include <libkern/libkern.h>
 #include <string.h>
 
@@ -70,24 +70,20 @@ namespace NRedUserPatch
         this->vdaEnabled_ = checkKernelArgument("-NRedUserPatchVDA");
         this->detectFamily();
 
-        this->call_ = thread_call_allocate_with_options(callback, nullptr, THREAD_CALL_PRIORITY_KERNEL,
-                                                        THREAD_CALL_OPTIONS_ONCE);
-        if (this->call_ == nullptr) {
-            SYSLOG("UserPatch", "analyzer: thread call unavailable");
+        thread_t worker = nullptr;
+        const kern_return_t result = kernel_thread_start(threadEntry, this, &worker);
+        if (result != KERN_SUCCESS) {
+            SYSLOG("UserPatch", "analyzer: kernel thread start failed 0x%X", static_cast<unsigned>(result));
             return;
         }
-        thread_call_enter(this->call_);
+        thread_deallocate(worker);
     }
 
     void AnalyzerRuntime::stop()
     {
-        if (this->call_ != nullptr) {
-            thread_call_cancel(this->call_);
-            thread_call_free(this->call_);
-            this->call_ = nullptr;
-        }
-        for (uint32_t index = 0; index < this->fileCount_; index++) { this->files_[index].close(); }
-        this->fileCount_ = 0;
+        // The worker owns the open vnodes and exits through IOExitThread; do not close them from a
+        // different thread.  The kext is not unloaded during normal operation, so this is best-effort.
+        __atomic_store_n(&this->stop_, 1U, __ATOMIC_RELEASE);
     }
 
     auto AnalyzerRuntime::ready() const -> bool { return SiteSet::singleton().ready(); }
@@ -169,37 +165,44 @@ namespace NRedUserPatch
         return true;
     }
 
-    void AnalyzerRuntime::scheduleRetry()
+    void AnalyzerRuntime::threadEntry(void* const parameter, wait_result_t)
     {
-        if (this->call_ == nullptr) { return; }
-        UInt64 deadline = 0;
-        clock_interval_to_deadline(kRetryDelayMs, static_cast<uint32_t>(NSEC_PER_MSEC), &deadline);
-        if (thread_call_enter_delayed(this->call_, deadline)) {
-            SYSLOG("UserPatch", "analyzer: retry call was unexpectedly pending");
-        }
+        auto* const self = static_cast<AnalyzerRuntime*>(parameter);
+        if (self != nullptr) { self->process(); }
+        IOExitThread();
     }
 
-    void AnalyzerRuntime::callback(thread_call_param_t, thread_call_param_t) { singleton().process(); }
+    void AnalyzerRuntime::closeFiles()
+    {
+        for (uint32_t index = 0; index < this->fileCount_; index++) { this->files_[index].close(); }
+        this->fileCount_ = 0;
+    }
 
     void AnalyzerRuntime::process()
     {
-        char path[512]{};
-        snprintf(path, sizeof(path), "%s%s", kLiveCacheDir, kMainCacheName);
-        KernelFile* mainFile = this->findOrOpen(path);
-        if (mainFile == nullptr) {
-            snprintf(path, sizeof(path), "%s%s", kSystemCacheDir, kMainCacheName);
+        KernelFile* mainFile = nullptr;
+        for (uint32_t attempt = 0; attempt < kMaxRetries; attempt++) {
+            if (__atomic_load_n(&this->stop_, __ATOMIC_ACQUIRE) != 0U) {
+                this->closeFiles();
+                return;
+            }
+
+            char path[512]{};
+            snprintf(path, sizeof(path), "%s%s", kLiveCacheDir, kMainCacheName);
             mainFile = this->findOrOpen(path);
+            if (mainFile == nullptr) {
+                snprintf(path, sizeof(path), "%s%s", kSystemCacheDir, kMainCacheName);
+                mainFile = this->findOrOpen(path);
+            }
+            if (mainFile != nullptr) { break; }
+
+            SYSLOG("UserPatch", "analyzer: dyld cache not ready, retry %u/%u",
+                   static_cast<unsigned>(attempt + 1U), static_cast<unsigned>(kMaxRetries));
+            IOSleep(kRetryDelayMs);
         }
         if (mainFile == nullptr) {
-            if (this->retries_ < kMaxRetries) {
-                this->retries_ += 1U;
-                SYSLOG("UserPatch", "analyzer: dyld cache not ready, retry %u/%u",
-                       static_cast<unsigned>(this->retries_), static_cast<unsigned>(kMaxRetries));
-                this->scheduleRetry();
-            }
-            else {
-                SYSLOG("UserPatch", "analyzer: dyld cache unavailable; no sites resolved");
-            }
+            SYSLOG("UserPatch", "analyzer: dyld cache unavailable; no sites resolved");
+            this->closeFiles();
             return;
         }
 
@@ -241,8 +244,7 @@ namespace NRedUserPatch
                static_cast<unsigned>(count), static_cast<unsigned>(enabled),
                static_cast<unsigned>(context.runningFamily), context.vdaEnabled ? 1U : 0U);
 
-        for (uint32_t index = 0; index < this->fileCount_; index++) { this->files_[index].close(); }
-        this->fileCount_ = 0;
+        this->closeFiles();
     }
 
 }    // namespace NRedUserPatch

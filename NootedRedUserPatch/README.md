@@ -8,7 +8,8 @@ There is no profile, no injection step and no runtime patch-data channel.
 - Rules: `Analyzer/RuleTable.cpp` — 5 default GL/Metal sites plus 14 VADriver sites enabled with
   `-NRedUserPatchVDA`.
 - Analyzer: `Analyzer/` (dyld cache, Mach-O, symbols, rule resolver) and `AnalyzerRuntime.cpp`
-  (one-shot sleepable thread call).
+  (one-shot sleepable kernel thread created with `kernel_thread_start`; VFS/namei is not allowed in
+  a `thread_call` context).
 - Write path: `ValidationHook.cpp` and `SiteSet.cpp`.
 - Design: [`../docs/USERSPACE-PATCHING.md`](../docs/USERSPACE-PATCHING.md).
 

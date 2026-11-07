@@ -4,7 +4,7 @@
 
 **Goal:** Replace the NRPT profile satellite with a small kext that parses the current macOS image at boot, resolves 5 default (GL/Metal) or 19 (with VDA) user-space patch sites from stable Mach-O symbols, function-local rules and a few shape variants, and applies them only in `_cs_validate_page` after the original validator accepts the page.
 
-**Architecture:** A host-testable analyzer core (byte source → Mach-O parser → symbol/function resolver → rule resolver) is shared by a host test and the kext. The kext adds a VFS-backed byte source and a one-shot thread call; the validation hook only consumes the resolved `SiteSet` and never parses or allocates. The old profile/identity/warm/diagnostic layers are deleted.
+**Architecture:** A host-testable analyzer core (byte source → Mach-O parser → symbol/function resolver → rule resolver) is shared by a host test and the kext. The kext adds a VFS-backed byte source and a one-shot dedicated kernel thread; the validation hook only consumes the resolved `SiteSet` and never parses or allocates. The old profile/identity/warm/diagnostic layers are deleted.
 
 **Tech Stack:** C++23 (no STL, no exceptions, no RTTI), Lilu KernelPatcher/FileIO, xmake + AppleForge, Python 3 host test driver, clean fixtures at `version-fixtures/15.8.2` and `version-fixtures/26.7.2`.
 
@@ -15,7 +15,7 @@
 - ChefKiss Open Knowledge License v1 header on every source file; copyright year 2026; no AI or assistant attribution in files or commits.
 - C++23; no STL containers, exceptions or RTTI; `auto f() -> T` trailing returns; PascalCase types; camelCase methods/locals/members; `k` constants.
 - Hook path (`_cs_validate_page` wrapper): no allocation, sleeping, file I/O, IORegistry, vnode references, or unbounded logging. Only atomics, the immutable `SiteSet`, byte compares and the kernel write lock.
-- Analysis runs in a sleepable, pre-allocated `thread_call`; it may use VFS/`FileIO` and bounded allocations, and must retry while the Cryptex/Data volume is not yet mounted.
+- Analysis runs in a dedicated sleepable kernel thread (`kernel_thread_start`), never in a `thread_call`: namei/VFS lookup is not allowed in the thread_call context. It may use VFS/`FileIO` and bounded allocations, and retries with `IOSleep` while the Cryptex/Data volume is not yet mounted.
 - The original validator always runs first and its result is never changed. A site is written only when its complete `find`/`replace` bytes are inside the delivered chunk and `find` matches exactly.
 - No runtime patch-data channel: no `NRedProfiles`, NVRAM, IORegistry or boot-arg-supplied patch bytes. The only boot-arg inputs are enable/disable switches (`-NRedUserPatchOff`, `-NRedUserPatchDry`, `-NRedUserPatchVDA`, `-NRedUserPatchDebug`).
 - AMFI and SIP stay fully enabled; no boot-arg may be required to make the mechanism work.
@@ -346,15 +346,21 @@ git commit -m "analyzer: resolve the user-space patch rules and shape variants"
   class AnalyzerRuntime {
   public:
       static AnalyzerRuntime& singleton();
-      void start(KernelPatcher& patcher);   // patcher-load: install hook, submit thread call
+      void start(KernelPatcher& patcher);   // patcher-load: install hook, start kernel thread
       void stop();
       bool ready() const;                   // SiteSet is published
   private:
-      static void callback(thread_call_param_t, thread_call_param_t);
+      static void threadEntry(void* parameter, wait_result_t result);
       void process();
   };
   ```
-  `KernelFileSource` opens a vnode with `vnode_lookup(path, 0, &vp, vfs_context_current())` and reads a range with `FileIO::readFileData(buffer, offset, size, vp, ctxt)`; it closes with `vnode_put` and `vfs_context_rele`. The analysis thread uses the live roots `kLiveCacheDir` and `kSystemCacheDir`, retries `thread_call_enter_delayed` up to 10 times at 500 ms, and on success calls `SiteSet::publish(...)`.
+  `KernelFileSource` opens a vnode with `vnode_lookup(path, 0, &vp, ctx)` using a context from
+  `vfs_context_create(nullptr)` and reads a range with `FileIO::readFileData(buffer, offset, size, vp,
+  ctxt)`; it closes with `vnode_put` and `vfs_context_rele`. This runs in a dedicated kernel thread
+  created with `kernel_thread_start` (the thread exits through `IOExitThread`), never in a
+  `thread_call`. The thread uses the live roots `kLiveCacheDir` and `kSystemCacheDir`, retries with
+  `IOSleep(500)` up to 10 times while the Cryptex is not mounted, and on success calls
+  `SiteSet::publish(...)`.
 
 - [ ] **Step 1: Write the failing test**
 
