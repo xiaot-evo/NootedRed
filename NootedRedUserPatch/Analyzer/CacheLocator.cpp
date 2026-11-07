@@ -23,7 +23,6 @@
 #include <Analyzer/CacheLocator.hpp>
 #include <Analyzer/MachO.hpp>
 
-#include <stdio.h>
 #include <string.h>
 
 namespace
@@ -51,6 +50,35 @@ namespace
         return value;
     }
 
+    auto copyText(char* const destination, const size_t capacity, const char* const source) -> void
+    {
+        if (destination == nullptr || capacity == 0U) { return; }
+        size_t index = 0;
+        if (source != nullptr) {
+            for (; source[index] != '\0' && index + 1U < capacity; index++) { destination[index] = source[index]; }
+        }
+        destination[index] = '\0';
+    }
+
+    auto buildName(char* const destination, const size_t capacity, const char* const prefix,
+                   const char* const suffix) -> bool
+    {
+        const size_t prefixLength = strlen(prefix);
+        const size_t suffixLength = strlen(suffix);
+        if (prefixLength + suffixLength + 1U > capacity) { return false; }
+        memcpy(destination, prefix, prefixLength);
+        memcpy(destination + prefixLength, suffix, suffixLength + 1U);
+        return true;
+    }
+
+    auto buildProbeName(char* const destination, const size_t capacity, const char* const prefix,
+                        const uint32_t index) -> bool
+    {
+        char suffix[4]{'.', static_cast<char>('0' + (index / 10U) % 10U),
+                       static_cast<char>('0' + index % 10U), '\0'};
+        return buildName(destination, capacity, prefix, suffix);
+    }
+
     struct Candidate
     {
         char                    name[64]{};
@@ -73,7 +101,7 @@ namespace
         if (mappingCount == 0U || mappingCount > kMaxMappings) { return false; }
 
         Candidate& candidate = candidates[candidateCount];
-        snprintf(candidate.name, sizeof(candidate.name), "%s", name);
+        copyText(candidate.name, sizeof(candidate.name), name);
         candidate.source       = source;
         candidate.mappingCount = mappingCount;
 
@@ -114,10 +142,9 @@ namespace
         uint8_t buffer[kMaxPathLength + 1U]{};
         if (!mainCache.readAt(pathOffset, buffer, kMaxPathLength)) { return false; }
         buffer[kMaxPathLength] = 0;
-        const void* const terminator = memchr(buffer, 0, sizeof(buffer));
-        if (terminator == nullptr) { return false; }
-        const size_t length = static_cast<size_t>(static_cast<const uint8_t*>(terminator) - buffer);
-        if (length + 1U > capacity) { return false; }
+        size_t length = 0;
+        while (length < sizeof(buffer) && buffer[length] != 0U) { length += 1U; }
+        if (length >= sizeof(buffer) || length + 1U > capacity) { return false; }
         memcpy(out, buffer, length + 1U);
         return true;
     }
@@ -172,7 +199,7 @@ namespace
                 if (suffix[0] == '\0') { continue; }
 
                 char name[64]{};
-                snprintf(name, sizeof(name), "%s%s", kMainCacheName, suffix);
+                if (!buildName(name, sizeof(name), kMainCacheName, suffix)) { continue; }
                 NRedUserPatch::ByteSource source{};
                 if (!open(openContext, name, source)) { continue; }
                 addCandidate(candidates, candidateCount, name, source);
@@ -182,7 +209,7 @@ namespace
         if (candidateCount <= 1U) {
             for (uint32_t index = 1; index <= 6; index++) {
                 char name[64]{};
-                snprintf(name, sizeof(name), "%s.%02u", kMainCacheName, static_cast<unsigned>(index));
+                if (!buildProbeName(name, sizeof(name), kMainCacheName, index)) { continue; }
                 NRedUserPatch::ByteSource source{};
                 if (!open(openContext, name, source)) { continue; }
                 addCandidate(candidates, candidateCount, name, source);
@@ -227,8 +254,8 @@ namespace NRedUserPatch
             return false;
         }
 
-        snprintf(out.vnodeName, sizeof(out.vnodeName), "%s", candidates[textCandidate].name);
-        snprintf(out.linkeditVnodeName, sizeof(out.linkeditVnodeName), "%s", candidates[linkeditCandidate].name);
+        copyText(out.vnodeName, sizeof(out.vnodeName), candidates[textCandidate].name);
+        copyText(out.linkeditVnodeName, sizeof(out.linkeditVnodeName), candidates[linkeditCandidate].name);
         out.fileOffset         = textFileOffset;
         out.textSize           = textSize;
         out.loadAddress        = loadAddress;

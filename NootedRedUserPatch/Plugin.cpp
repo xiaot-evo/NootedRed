@@ -44,6 +44,7 @@
 #include <libkern/sysctl.h>
 #include <mach/clock_types.h>
 #include <string.h>
+#include <AnalyzerRuntime.hpp>
 #include <PatchProfile.hpp>
 #include <UserPatchBackend.hpp>
 
@@ -475,6 +476,11 @@ void UserPatchRuntime::onPatcherLoad(KernelPatcher& patcher)
 
         // Unconditional install: a missing or rejected profile must never delay kernel-text routing.
         UserPatchBackend::singleton().install(patcher);
+
+        // Runtime analyzer: resolves the compiled rule table against the live images in a sleepable
+        // thread call and publishes the immutable SiteSet.  The legacy profile hook stays installed
+        // until the migration removes it; with no injected profile it is a no-op.
+        NRedUserPatch::AnalyzerRuntime::singleton().start(patcher);
     }
     IOLockUnlock(this->lock_);
 

@@ -23,22 +23,34 @@
 #include <Analyzer/RuleResolver.hpp>
 #include <Analyzer/MachO.hpp>
 
-#include <stdio.h>
 #include <string.h>
 
 namespace
 {
 
     static constexpr uint32_t kMaxMatches   = 16U;
-    static constexpr size_t   kScanChunk    = 4096U;
+    static constexpr size_t   kScanChunk    = 512U;
     static constexpr size_t   kScanOverlap  = 64U;
     static constexpr size_t   kMaxPattern   = 64U;
 
     auto basenameOf(const char* const path) -> const char*
     {
         if (path == nullptr) { return ""; }
-        const char* const slash = strrchr(path, '/');
-        return slash != nullptr ? slash + 1 : path;
+        const char* base = path;
+        for (const char* cursor = path; *cursor != '\0'; cursor++) {
+            if (*cursor == '/') { base = cursor + 1; }
+        }
+        return base;
+    }
+
+    auto copyText(char* const destination, const size_t capacity, const char* const source) -> void
+    {
+        if (destination == nullptr || capacity == 0U) { return; }
+        size_t index = 0;
+        if (source != nullptr) {
+            for (; source[index] != '\0' && index + 1U < capacity; index++) { destination[index] = source[index]; }
+        }
+        destination[index] = '\0';
     }
 
     auto readExact(const NRedUserPatch::ByteSource& source, const uint64_t offset, const uint8_t* const expected,
@@ -150,7 +162,7 @@ namespace NRedUserPatch
             }
             textBase    = located.fileOffset;
             loadAddress = located.loadAddress;
-            snprintf(vnodeName, sizeof(vnodeName), "%s", located.vnodeName);
+            copyText(vnodeName, sizeof(vnodeName), located.vnodeName);
         }
         else {
             if (context.openImage == nullptr) { return fail("no image opener"); }
@@ -161,7 +173,7 @@ namespace NRedUserPatch
             if (!parseMachO(textSource, 0, 0, 0, image)) { return fail("standalone Mach-O parse failed"); }
             textBase    = image.textFileOffset;
             loadAddress = 0;
-            snprintf(vnodeName, sizeof(vnodeName), "%s", basenameOf(rule.imagePath));
+            copyText(vnodeName, sizeof(vnodeName), basenameOf(rule.imagePath));
         }
 
         uint64_t symbolVa = 0;
@@ -216,8 +228,7 @@ namespace NRedUserPatch
             if (siteFile < funcFileStart || siteFile + variant.patchSize > funcFileEnd) { continue; }
             if (!readExact(textSource, siteFile, variant.find, variant.patchSize)) { continue; }
 
-            out.vnodeName[0] = '\0';
-            snprintf(out.vnodeName, sizeof(out.vnodeName), "%s", vnodeName);
+            copyText(out.vnodeName, sizeof(out.vnodeName), vnodeName);
             out.fileOffset = siteFile;
             out.find       = variant.find;
             out.replace    = variant.replace;

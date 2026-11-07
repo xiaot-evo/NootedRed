@@ -302,9 +302,9 @@ auto findSymbol(const ByteSource& linkedit, const MachOImage& image, const char*
     uint64_t matchValue = 0;
     uint64_t cursor = image.symoff;
     while (cursor < nlistEnd) {
-        uint8_t       entries[64U * 16U]{};
+        uint8_t       entries[16U * 16U]{};
         const size_t  remaining = static_cast<size_t>((nlistEnd - cursor) / 16U);
-        const size_t  count = remaining < 64U ? remaining : 64U;
+        const size_t  count = remaining < 16U ? remaining : 16U;
         const size_t  bytes = count * 16U;
         if (!linkedit.readAt(cursor, entries, bytes)) { return false; }
 
