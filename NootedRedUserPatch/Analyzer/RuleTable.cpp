@@ -85,7 +85,7 @@ namespace NRedUserPatch
     static const uint8_t kMask12a[] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
     static const uint8_t kFind13a[] = {0x0F, 0xAF, 0xC1, 0x05, 0xFF, 0x00, 0x00, 0x00, 0x25, 0x00, 0xFF, 0xFF, 0xFF};
-    static const uint8_t kReplace13a[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    static const uint8_t kReplace13a[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
     static const uint8_t kPattern13a[] = {0x8B, 0x8A, 0x84, 0x00, 0x00, 0x00, 0x8B, 0x87, 0x24, 0x04, 0x00, 0x00, 0x0F, 0xAF, 0xC1, 0x05, 0xFF, 0x00, 0x00, 0x00, 0x25, 0x00, 0xFF, 0xFF, 0xFF, 0x31, 0xD2, 0xF7, 0xF1, 0x89, 0x43, 0x18, 0xD1, 0xE8, 0x89, 0x43, 0x1C};
     static const uint8_t kMask13a[] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
@@ -113,6 +113,30 @@ namespace NRedUserPatch
     static const uint8_t kReplace18a[] = {0x81, 0xFE, 0x8E, 0x00, 0x00, 0x00};
     static const uint8_t kPattern18a[] = {0x81, 0xFE, 0x8D, 0x00, 0x00, 0x00, 0x0F, 0x85, 0x88, 0x00, 0x00, 0x00, 0x55, 0x48, 0x89, 0xE5, 0x8B, 0x87};
     static const uint8_t kMask18a[] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+
+    // The write path copies patchSize bytes from both arrays; a generator slip that truncates the
+    // replace array would make that copy read past it (and write an unrelated byte).
+    static_assert(sizeof(kFind0a) == sizeof(kReplace0a), "rule 0: find/replace size mismatch");
+    static_assert(sizeof(kFind1a) == sizeof(kReplace1a), "rule 1: find/replace size mismatch");
+    static_assert(sizeof(kFind2a) == sizeof(kReplace2a), "rule 2a: find/replace size mismatch");
+    static_assert(sizeof(kFind2b) == sizeof(kReplace2b), "rule 2b: find/replace size mismatch");
+    static_assert(sizeof(kFind3a) == sizeof(kReplace3a), "rule 3a: find/replace size mismatch");
+    static_assert(sizeof(kFind3b) == sizeof(kReplace3b), "rule 3b: find/replace size mismatch");
+    static_assert(sizeof(kFind4a) == sizeof(kReplace4a), "rule 4: find/replace size mismatch");
+    static_assert(sizeof(kFind5a) == sizeof(kReplace5a), "rule 5: find/replace size mismatch");
+    static_assert(sizeof(kFind6a) == sizeof(kReplace6a), "rule 6: find/replace size mismatch");
+    static_assert(sizeof(kFind7a) == sizeof(kReplace7a), "rule 7: find/replace size mismatch");
+    static_assert(sizeof(kFind8a) == sizeof(kReplace8a), "rule 8: find/replace size mismatch");
+    static_assert(sizeof(kFind9a) == sizeof(kReplace9a), "rule 9: find/replace size mismatch");
+    static_assert(sizeof(kFind10a) == sizeof(kReplace10a), "rule 10: find/replace size mismatch");
+    static_assert(sizeof(kFind11a) == sizeof(kReplace11a), "rule 11: find/replace size mismatch");
+    static_assert(sizeof(kFind12a) == sizeof(kReplace12a), "rule 12: find/replace size mismatch");
+    static_assert(sizeof(kFind13a) == sizeof(kReplace13a), "rule 13: find/replace size mismatch");
+    static_assert(sizeof(kFind14a) == sizeof(kReplace14a), "rule 14: find/replace size mismatch");
+    static_assert(sizeof(kFind15a) == sizeof(kReplace15a), "rule 15: find/replace size mismatch");
+    static_assert(sizeof(kFind16a) == sizeof(kReplace16a), "rule 16: find/replace size mismatch");
+    static_assert(sizeof(kFind17a) == sizeof(kReplace17a), "rule 17: find/replace size mismatch");
+    static_assert(sizeof(kFind18a) == sizeof(kReplace18a), "rule 18: find/replace size mismatch");
 
     static const RuleVariant kVariant0[] = {
         {LocalKind::kPattern, 0, kPattern0a, kMask0a, static_cast<uint8_t>(sizeof(kPattern0a)), 12, kFind0a, kReplace0a, static_cast<uint8_t>(sizeof(kFind0a))},
