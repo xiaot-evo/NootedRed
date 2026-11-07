@@ -94,6 +94,13 @@ namespace NRedUserPatch
         }
 
         const uint64_t blockOffset = offset & ~static_cast<uint64_t>(kBlockSize - 1U);
+        // A request that crosses the end of the candidate block cannot be satisfied by the cache
+        // line; read it directly instead of failing.  The analyzer routinely reads 16-400 byte
+        // windows (nlist entries, Mach-O paths) that straddle a 16 KiB boundary.
+        if (offset + size > blockOffset + kBlockSize) {
+            return FileIO::readFileData(destination, static_cast<off_t>(offset), size, self->vnode_, self->context_) == 0;
+        }
+
         const uint64_t remaining   = self->size_ - blockOffset;
         const size_t   toRead      = remaining < kBlockSize ? static_cast<size_t>(remaining) : kBlockSize;
         if (FileIO::readFileData(self->block_, static_cast<off_t>(blockOffset), toRead, self->vnode_, self->context_) != 0) {
