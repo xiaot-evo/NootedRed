@@ -24,6 +24,7 @@ TEST_SOURCE = ROOT / "test" / "test_analyzer.cpp"
 # Analyzer core sources are appended here as the tasks add them.
 ANALYZER_SOURCES: list[pathlib.Path] = [
     ROOT / "NootedRedUserPatch" / "Analyzer" / "MachO.cpp",
+    ROOT / "NootedRedUserPatch" / "Analyzer" / "CacheLocator.cpp",
 ]
 
 
@@ -31,13 +32,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--fixtures",
-        default=os.environ.get("NRED_FIXTURES", str(ROOT / "version-fixtures" / "15.8.2")),
+        default=os.environ.get("NRED_FIXTURES", str(ROOT / "version-fixtures")),
+        help="fixture root containing 15.8.2/ and 26.7.2/",
     )
     args = parser.parse_args()
 
     fixtures = pathlib.Path(args.fixtures)
-    if not fixtures.is_dir():
-        print(f"error: fixture root not found: {fixtures}", file=sys.stderr)
+    if not (fixtures / "15.8.2").is_dir() or not (fixtures / "26.7.2").is_dir():
+        print(f"error: fixture root must contain 15.8.2/ and 26.7.2/: {fixtures}", file=sys.stderr)
         print("hint: the tree is untracked; link or point at a clean image root with --fixtures", file=sys.stderr)
         return 2
 

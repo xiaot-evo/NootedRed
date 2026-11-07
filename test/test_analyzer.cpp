@@ -21,6 +21,7 @@
 // along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowledge/raw/branch/master/LICENSE-v1.md.
 
 #include <Analyzer/ByteSource.hpp>
+#include <Analyzer/CacheLocator.hpp>
 #include <Analyzer/MachO.hpp>
 #include <FileByteSource.hpp>
 
@@ -125,16 +126,109 @@ namespace
         }
     }
 
+    struct FixtureOpener
+    {
+        struct Entry
+        {
+            char                     name[64]{};
+            TestSupport::FileSource  file{};
+        };
+
+        char     dyldDir[1024]{};
+        Entry    entries[8]{};
+        uint32_t count{0};
+
+        static auto open(void* const context, const char* const name, NRedUserPatch::ByteSource& out) -> bool
+        {
+            auto* const self = static_cast<FixtureOpener*>(context);
+            for (uint32_t index = 0; index < self->count; index++) {
+                if (strcmp(self->entries[index].name, name) == 0) {
+                    out = self->entries[index].file.source();
+                    return true;
+                }
+            }
+            if (self->count >= 8U) { return false; }
+            char path[1200]{};
+            snprintf(path, sizeof(path), "%s/%s", self->dyldDir, name);
+            if (!TestSupport::openFixtureFile(path, self->entries[self->count].file)) { return false; }
+            snprintf(self->entries[self->count].name, sizeof(self->entries[self->count].name), "%s", name);
+            out = self->entries[self->count].file.source();
+            self->count += 1U;
+            return true;
+        }
+    };
+
+    void locateOne(const char* const root, const char* const imagePath, const char* const expectedVnode,
+                   const uint64_t expectedOffset, const uint64_t expectedSize, const uint64_t expectedLoad,
+                   const char* const expectedLinkeditVnode)
+    {
+        char dyldDir[1024]{};
+        snprintf(dyldDir, sizeof(dyldDir), "%s/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld", root);
+        char mainPath[1200]{};
+        snprintf(mainPath, sizeof(mainPath), "%s/dyld_shared_cache_x86_64h", dyldDir);
+
+        TestSupport::FileSource mainFile;
+        if (!TestSupport::openFixtureFile(mainPath, mainFile)) {
+            check(false, "open main dyld cache");
+            return;
+        }
+
+        FixtureOpener opener{};
+        snprintf(opener.dyldDir, sizeof(opener.dyldDir), "%s", dyldDir);
+
+        NRedUserPatch::LocatedImage located{};
+        const bool ok = NRedUserPatch::locateCacheImage(mainFile.source(), &FixtureOpener::open, &opener, imagePath,
+                                                        located);
+        check(ok, "locate cache image");
+        if (!ok) { return; }
+        check(strcmp(located.vnodeName, expectedVnode) == 0, "located text vnode");
+        check(located.fileOffset == expectedOffset, "located text file offset");
+        check(located.textSize == expectedSize, "located text size");
+        check(located.loadAddress == expectedLoad, "located load address");
+        check(strcmp(located.linkeditVnodeName, expectedLinkeditVnode) == 0, "located __LINKEDIT vnode");
+    }
+
+    void testCacheLocator(const char* const root15, const char* const root26)
+    {
+        locateOne(root15, "/System/Library/Extensions/AMDRadeonX5000MTLDriver.bundle/Contents/MacOS/"
+                          "AMDRadeonX5000MTLDriver",
+                  "dyld_shared_cache_x86_64h.03", 0x8757000U, 0x44FC11U, 0x7FFB08757000ULL,
+                  "dyld_shared_cache_x86_64h.03");
+        locateOne(root15, "/System/Library/Extensions/AMDRadeonVADriver2.bundle/Contents/MacOS/AMDRadeonVADriver2",
+                  "dyld_shared_cache_x86_64h.03", 0x8606000U, 0xB8268U, 0x7FFB08606000ULL,
+                  "dyld_shared_cache_x86_64h.03");
+        locateOne(root15, "/System/Library/PrivateFrameworks/AppleGVA.framework/Versions/A/AppleGVA",
+                  "dyld_shared_cache_x86_64h.02", 0x6672000U, 0xEE2CFU, 0x7FFA06672000ULL,
+                  "dyld_shared_cache_x86_64h.02");
+
+        locateOne(root26, "/System/Library/Extensions/AMDRadeonX5000MTLDriver.bundle/Contents/MacOS/"
+                          "AMDRadeonX5000MTLDriver",
+                  "dyld_shared_cache_x86_64h.03", 0x10C50000U, 0x437EB3U, 0x7FFB10C50000ULL,
+                  "dyld_shared_cache_x86_64h.03");
+        locateOne(root26, "/System/Library/Extensions/AMDRadeonVADriver2.bundle/Contents/MacOS/AMDRadeonVADriver2",
+                  "dyld_shared_cache_x86_64h.03", 0x10B00000U, 0xB7850U, 0x7FFB10B00000ULL,
+                  "dyld_shared_cache_x86_64h.03");
+        locateOne(root26, "/System/Library/PrivateFrameworks/AppleGVA.framework/Versions/A/AppleGVA",
+                  "dyld_shared_cache_x86_64h.02", 0xC57C000U, 0xEAD27U, 0x7FFA0C57C000ULL,
+                  "dyld_shared_cache_x86_64h.02");
+    }
+
 }    // namespace
 
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        printf("usage: %s <fixture-root>\n", argv[0]);
+        printf("usage: %s <fixtures-root>\n", argv[0]);
         return 2;
     }
 
-    testMachO(argv[1]);
+    char root15[1024];
+    char root26[1024];
+    snprintf(root15, sizeof(root15), "%s/15.8.2", argv[1]);
+    snprintf(root26, sizeof(root26), "%s/26.7.2", argv[1]);
+
+    testMachO(root15);
+    testCacheLocator(root15, root26);
 
     printf("%s: %u failure(s)\n", failures == 0 ? "PASS" : "FAIL", failures);
     return failures == 0 ? 0 : 1;
