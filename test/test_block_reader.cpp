@@ -29,9 +29,10 @@
 namespace
 {
 
-    uint8_t  g_data[0x50000];
+    uint8_t  g_data[0x51900];    // 20 full blocks plus a 0x1900-byte tail
     uint32_t g_reads      = 0;
     uint32_t g_failures   = 0;
+    bool     g_failing    = false;
 
     void check(const bool condition, const char* const what)
     {
@@ -46,6 +47,7 @@ namespace
 
     auto backing(void*, const uint64_t offset, void* const destination, const size_t size) -> bool
     {
+        if (g_failing) { return false; }
         if (offset > sizeof(g_data) || size > sizeof(g_data) - offset) { return false; }
         memcpy(destination, g_data + offset, size);
         g_reads += 1U;
@@ -79,6 +81,16 @@ int main()
     check(!reader.read(sizeof(g_data) + 1U, buffer, 1), "offset past end rejected");
     check(reader.read(sizeof(g_data) - 8U, buffer, 8) && memcmp(buffer, g_data + sizeof(g_data) - 8U, 8) == 0,
           "read at end");
+    check(reader.read(0x51000, buffer, 0x100) && memcmp(buffer, g_data + 0x51000, 0x100) == 0,
+          "read inside short final block");
+    check(reader.read(0x4FFF8, buffer, 0x10) && memcmp(buffer, g_data + 0x4FFF8, 0x10) == 0,
+          "cross-block read into short final block");
+
+    g_failing = true;
+    check(!reader.read(0x10000, buffer, 0x10), "backing failure rejected");
+    g_failing = false;
+    check(reader.read(0x10000, buffer, 0x10) && memcmp(buffer, g_data + 0x10000, 0x10) == 0,
+          "read after backing failure");
 
     reader.reset(0, nullptr, nullptr);
     check(!reader.read(0, buffer, 1), "reset reader rejects reads");
