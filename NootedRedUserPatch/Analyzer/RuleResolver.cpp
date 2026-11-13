@@ -131,8 +131,8 @@ namespace NRedUserPatch
         // Locates and parses one target image.  The result is cached by image path/kind when the
         // context supplies a cache, so rules sharing an image do not repeat the cache scan or
         // Mach-O parse.  The opened sources are borrowed from the caller's file readers.
-        auto resolveImage(const ResolveContext& context, const Rule& rule, ResolvedImage& out, const char** const reason)
-            -> bool
+        auto resolveImage(const ResolveContext& context, const Rule& rule, ResolvedImage& out,
+                          const char** const reason) -> bool
         {
             const auto fail = [reason](const char* const why) -> bool {
                 if (reason != nullptr) { *reason = why; }
@@ -157,7 +157,8 @@ namespace NRedUserPatch
                 if (context.mainCache == nullptr || context.openCache == nullptr) { return fail("no cache opener"); }
 
                 LocatedImage located{};
-                if (!locateCacheImage(*context.mainCache, context.openCache, context.openContext, rule.imagePath, located)) {
+                if (!locateCacheImage(*context.mainCache, context.openCache, context.openContext, rule.imagePath,
+                                      located)) {
                     return fail("image not located");
                 }
                 if (!context.openCache(context.openContext, located.vnodeName, resolved.textSource)) {
@@ -207,7 +208,9 @@ namespace NRedUserPatch
             };
 
             uint64_t symbolVa = 0;
-            if (!findSymbol(image.linkeditSource, image.image, rule.symbol, symbolVa)) { return fail("symbol not found"); }
+            if (!findSymbol(image.linkeditSource, image.image, rule.symbol, symbolVa)) {
+                return fail("symbol not found");
+            }
 
             uint64_t funcStart = 0;
             uint64_t funcEnd = 0;
