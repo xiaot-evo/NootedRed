@@ -378,7 +378,7 @@ for rule in rules:
 3. 断言 MTL gate/allow 在两个 fixture 上选中正确的 shape variant（`EB 0B`/`EB 00`、
    `31 C0 90`/`31 C9 90`）。
 4. 断言 familyMask 不匹配时规则被跳过。
-5. 负例：删除一个符号、改一个函数指纹、制造一个双匹配，断言该规则 fail closed 且其他规则不受影响。
+5. 负例（待补）：删除一个符号、改一个函数指纹、制造一个双匹配，断言该规则 fail closed 且其他规则不受影响。
 
 这组测试不需要硬件，也不依赖 UBC 状态，是跨版本适配的主要回归手段。`test_block_reader.py` 用内存
 源覆盖块缓存的跨块/命中/越界；`test_fixture_probe.py` 按 `13.*`/`14.*`/`15.*`/`26.*` 槽位探测

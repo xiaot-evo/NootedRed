@@ -23,4 +23,5 @@ PatchData 流水线；对应工具已删除。分析器设计见 [`../docs/USERS
 - `gl_blend_probe.c` / `gl_blend_probe.md`：离屏 CGL/OpenGL 混合测试（有风险，先读说明）。
 - `hwinfo_probe.c`：从 IOAccelerator 读出 HwInfo blob。
 
-分析器的主机侧回归测试在 `test/test_analyzer.py`；VDA 规则默认关闭，用 `-NRedUserPatchVDA` 打开。
+分析器的主机侧回归测试在 `test/test_analyzer.py`、`test/test_site_set.py`、`test/test_block_reader.py`
+和 `test/test_fixture_probe.py`；VDA 规则默认关闭，用 `-NRedUserPatchVDA` 打开。

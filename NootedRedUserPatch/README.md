@@ -18,7 +18,7 @@ Boot arguments: `-NRedUserPatchOff`, `-NRedUserPatchVDA`, `-NRedUserPatchDebug`.
 Build (needs a sibling AppleForge checkout or `$AppleForgePath`):
 
 ```sh
-xmake f -m debug -y && xmake build --project=. -y NootedRedUserPatch
+xmake f -P . -m debug && xmake build --project=. NootedRedUserPatch
 ```
 
 Host tests:
