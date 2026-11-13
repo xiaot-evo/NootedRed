@@ -208,7 +208,7 @@ namespace NRedUserPatch
 
         for (uint32_t ruleIndex = 0; ruleIndex < kRuleCount; ruleIndex++) {
             const Rule& rule = kRules[ruleIndex];
-            if (rule.imageKind != ImageKind::kStandalone) { continue; }
+            if (rule.imageKind != ImageKind::kStandalone || rule.imagePath == nullptr) { continue; }
             const char* base = rule.imagePath;
             for (const char* cursor = rule.imagePath; *cursor != '\0'; cursor++) {
                 if (*cursor == '/') { base = cursor + 1; }

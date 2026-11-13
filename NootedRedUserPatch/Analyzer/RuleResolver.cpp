@@ -283,7 +283,8 @@ namespace NRedUserPatch
         };
 
         if (!ruleEnabled(rule, context.runningFamily, context.vdaEnabled)) { return fail("rule gated"); }
-        if (rule.symbol == nullptr || rule.variants == nullptr || rule.variantCount == 0U) {
+        if (rule.imagePath == nullptr || rule.imagePath[0] == '\0' || rule.symbol == nullptr ||
+            rule.variants == nullptr || rule.variantCount == 0U) {
             return fail("rule incomplete");
         }
 

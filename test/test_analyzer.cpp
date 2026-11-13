@@ -354,6 +354,25 @@ namespace
         return resolved;
     }
 
+    void testRuleGuards()
+    {
+        NRedUserPatch::RuleVariant variant{};
+        NRedUserPatch::Rule        rule{};
+        rule.familyMask   = NRedUserPatch::kFamilyVCN2;
+        rule.imageKind    = NRedUserPatch::ImageKind::kSharedCache;
+        rule.symbol       = "_unused";
+        rule.variants     = &variant;
+        rule.variantCount = 1U;
+
+        NRedUserPatch::ResolveContext context{};
+        context.runningFamily = NRedUserPatch::kFamilyVCN2;
+
+        NRedUserPatch::ResolvedSite site{};
+        const char*                 reason = nullptr;
+        check(!NRedUserPatch::resolveRule(context, rule, site, &reason), "rule without image path rejected");
+        check(reason != nullptr && strcmp(reason, "rule incomplete") == 0, "rule without image path reason");
+    }
+
     void testRuleResolver(const char* const root15, const char* const root26)
     {
         check(NRedUserPatch::kRuleCount == 19U, "rule count");
@@ -387,6 +406,7 @@ int main(int argc, char** argv)
 
     testMachO(root15);
     testCacheLocator(root15, root26);
+    testRuleGuards();
     testRuleResolver(root15, root26);
 
     printf("%s: %u failure(s)\n", failures == 0 ? "PASS" : "FAIL", failures);
