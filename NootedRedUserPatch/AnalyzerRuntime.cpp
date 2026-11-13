@@ -222,6 +222,7 @@ namespace NRedUserPatch
     {
         for (uint32_t index = 0; index < this->fileCount_; index++) { this->files_[index].close(); }
         this->fileCount_ = 0;
+        this->resolveCache_.reset();
     }
 
     void AnalyzerRuntime::process()
