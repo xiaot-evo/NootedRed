@@ -1,5 +1,34 @@
 # Change log
 
+## v0.9.2 (13/11/2026)
+
+### Enhancements
+
+- Replaced the embedded user-space patch data with `NootedRedUserPatch`, a runtime analyzer:
+  it locates the live GL/Metal and VADriver2 images, resolves 19 compiled rules through
+  symbols, function starts and shape variants, and applies the sites in `_cs_validate_page`.
+  Profiles, NRPT, injection and the patch-data channel are removed.
+- The 14 VDA rules remain behind `-NRedUserPatchVDA`; the five GL/Metal sites apply by default.
+- The analyzer's VFS/namei phase runs in a sleepable kernel thread triggered by the first
+  dyld shared-cache page validation, never at patcher load.
+- The VCN bridge resolves kernel symbol boundaries at runtime instead of using static
+  per-build tables.
+- `NootedRedUserPatch` is versioned independently; this release ships 0.3.2.
+
+### Bug Fixes
+
+- Fixed the 24H232 cross-block nlist/path read failure in the 16 KiB vnode cache that made
+  symbol and image resolution fail (0/19); live readback now shows 19/19 sites patched.
+- Apply the complete 13-byte rule 13 replacement.
+- Reject rules with a missing target image path instead of dereferencing it.
+- Restored the `iGPU` null guard in `setProp32`.
+
+> [!NOTE]
+> Use the `RELEASE` build. `RESEARCH_RELEASE` is `DEBUG` with optimisations.
+> The latter two will be way slower and inefficient than the former build. Use them **only** when debugging an issue with NootedRed.
+
+**Full Changelog**: https://github.com/xiaot-evo/NootedRed/commits/v0.9.2
+
 ## v0.9.1 (25/10/2026)
 
 ### Enhancements

@@ -1,7 +1,7 @@
 includes(path.join(os.getenv("AppleForgePath") or "../AppleForge", "xmake/rules/AppleForge.lua"))
 
 set_project("NootedRed")
-set_version("0.9.1")
+set_version("0.9.2")
 
 AppleForge_ApplyDefaults()
 set_allowedarchs("x86_64")
@@ -52,6 +52,7 @@ target_end()
 target("NootedRedUserPatch")
 	add_rules("LiluPlugIn")
 	set_kind("binary")
+	set_version("0.3.2")
 	set_languages("cxx23")
 	add_cxflags("-Wno-c23-extensions")
 
