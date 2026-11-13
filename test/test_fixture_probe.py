@@ -53,17 +53,22 @@ def main() -> int:
             return compiled.returncode
 
         failures = 0
+        exercised = 0
         for slot in slots:
             fixtures = sorted(path for path in root.glob(slot) if path.is_dir())
             if not fixtures:
                 print(f"RESERVED {slot}: no fixture under {root}")
                 continue
             for fixture in fixtures:
+                exercised += 1
                 print(f"== {fixture.name} ==", flush=True)
                 result = subprocess.run([str(binary), str(fixture)], cwd=ROOT)
                 if result.returncode != 0:
                     failures += 1
 
+        if exercised == 0:
+            print(f"FAIL: no fixtures found under {root}")
+            return 1
         if failures != 0:
             print(f"FAIL: {failures} fixture(s) unresolved")
             return 1
