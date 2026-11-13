@@ -6,6 +6,8 @@ build/
 compile_commands.json
 .cache/
 *.dSYM/
+/dist/
+/scratch/
 
 # ---------------------------------------------------------------------------
 # Local decompiler / toolchain installations (large, not part of the project)
