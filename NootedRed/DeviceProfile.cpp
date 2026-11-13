@@ -63,7 +63,7 @@ namespace
     //
     // The table is keyed by device ID only.  The [minVersion, maxVersion] window is metadata for now; the
     // authoritative selector for patch data becomes the identity of the Apple binary being patched
-    // (docs/COMPATIBILITY.md).  The support level is a coarse per-profile roll-up: the only
+    // (see DeviceProfile.hpp).  The support level is a coarse per-profile roll-up: the only
     // hardware-validated combination is the conditional GL/Metal fix on macOS 15.8.1 / 0x1638, but that is a
     // per-build fact and this entry is version-wide, so no profile is marked kValidated until the generated
     // manifest can express per-build levels.  Media enablement is limited to VCN 2.x, which also keeps the
@@ -186,15 +186,6 @@ const DeviceProfile::Profile* DeviceProfile::current()
 
     const auto* const profile = forDevice(deviceID, currentKernelVersion());
     return profile != nullptr ? profile : &kFallbackProfile;
-}
-
-const DeviceProfile::Profile* DeviceProfile::forDevice(const UInt16 deviceID)
-{
-    for (const auto& profile : kProfiles) {
-        if (profile.deviceID == deviceID) { return &profile; }
-    }
-
-    return nullptr;
 }
 
 const DeviceProfile::Profile* DeviceProfile::forDevice(const UInt16 deviceID,

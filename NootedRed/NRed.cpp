@@ -46,10 +46,10 @@
 #include <Regs/GC.hpp>
 #include <Regs/NBIO.hpp>
 #include <Regs/SMU.hpp>
-#include <VCNBridge.hpp>
-#include <VDA.hpp>
 #include <X5000.hpp>
 #include <X6000FB.hpp>
+#include <VCNBridge.hpp>
+#include <VDA.hpp>
 #include <kern/clock.h>
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSMetaClass.h>
@@ -82,7 +82,7 @@ void NRed::init()
     lilu.onPatcherLoadForce(
         [](void* const, KernelPatcher& patcher)
         {
-            singleton().processPatcher(patcher);
+            singleton().processPatcher();
             DriverInjector::singleton().processPatcher(patcher);
             PenguinWizardry::RuntimeMCManager::singleton().processPatcher(patcher);
         },
@@ -154,7 +154,7 @@ void NRed::hwLateInit()
     DBGLOG("NRed", "enumRevision = 0x%X", this->enumRevision);
 }
 
-void NRed::processPatcher(KernelPatcher&)
+void NRed::processPatcher()
 {
     const auto devInfo = DeviceInfo::create();
     assert(devInfo != nullptr);
@@ -176,9 +176,6 @@ void NRed::processPatcher(KernelPatcher&)
     this->iGPU->setProperty("hda-gfx", hdaGfxBytes, sizeof(hdaGfxBytes));
 
     this->deviceID = static_cast<UInt16>(WIOKit::readPCIConfigValue(this->iGPU, WIOKit::kIOPCIConfigDeviceID));
-    // Legacy attribute mapping kept for the existing hardware paths (X5000/HWLibs).  The compatibility
-    // layer's source of truth for family and capability is DeviceProfile, which distinguishes Cezanne and
-    // Barcelo explicitly (see docs/COMPATIBILITY.md).
     switch (this->deviceID) {
         case 0x15D8: {
             this->attributes.setPicasso();
@@ -221,12 +218,7 @@ void NRed::processPatcher(KernelPatcher&)
     DeviceInfo::deleter(devInfo);
 }
 
-void NRed::setProp32(const char* const key, const UInt32 value) const
-{
-    if (this->iGPU == nullptr) { return; }
-
-    this->iGPU->setProperty(key, value, 32);
-}
+void NRed::setProp32(const char* const key, const UInt32 value) const { this->iGPU->setProperty(key, value, 32); }
 
 UInt32 NRed::readReg32(const UInt32 reg) const
 {

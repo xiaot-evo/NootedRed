@@ -26,8 +26,8 @@
 
 // A single source of truth for per-device graphics and media capabilities.
 //
-// This is the hardware half of the per-device capability model: see docs/COMPATIBILITY.md and
-// the other half is the identity of the Apple binary being patched.  A profile answers "what can this APU
+// This is the hardware half of the per-device capability model; the other half is the identity of
+// the Apple binary being patched.  A profile answers "what can this APU
 // do" (graphics policy, media policy, validation level); it deliberately does not contain patch bytes or
 // per macOS build data, so adding an APU never duplicates patch data and adding a macOS build never
 // duplicates hardware facts.
@@ -51,8 +51,8 @@ public:
         kBarcelo,
     };
 
-    // Coarse validation roll-up for a profile.  The authoritative per-feature level is tracked in
-    // docs/COMPATIBILITY.md; this only controls logging and diagnostics.
+    // Coarse validation roll-up for a profile.  The per-feature level is a property of the device
+    // table in DeviceProfile.cpp; this only controls logging and diagnostics.
     enum SupportLevel : UInt8 {
         kUnavailable = 0,
         kExperimental,
@@ -132,9 +132,6 @@ public:
     // Returns the profile for the running device and kernel version, or the generic fallback when the
     // device is not known.  The fallback keeps the current graphics policy and disables all media engines.
     static const Profile* current();
-
-    // Returns nullptr for an unsupported device ID, ignoring the kernel version.
-    static const Profile* forDevice(UInt16 deviceID);
 
     // Returns nullptr when the device is unknown or the running kernel version is outside the profile's
     // [minVersion, maxVersion] window.  The version window is metadata for now: per-build patch data is
