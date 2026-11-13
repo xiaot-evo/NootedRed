@@ -49,8 +49,6 @@ namespace NRedUserPatch
 
         // Called by the kernel hook once at install time.  Without a writer, apply fails closed.
         void setWriter(WriteBeginFn begin, WriteEndFn end, void* context);
-        void setDryRun(bool dryRun);
-        auto dryRun() const -> bool;
 
         // Hook path.  `chunkOffset`/`data`/`size` are the validated chunk delivered by the kernel;
         // `vnodeName` is the delivered vnode basename.  Returns the number of sites written.
@@ -61,7 +59,6 @@ namespace NRedUserPatch
         auto foreign() const -> uint32_t;
         auto writeFailures() const -> uint32_t;
         auto verifyFailures() const -> uint32_t;
-        auto planned() const -> uint32_t;
 
     private:
         SiteSet()  = default;
@@ -76,14 +73,12 @@ namespace NRedUserPatch
         WriteBeginFn begin_{nullptr};
         WriteEndFn   end_{nullptr};
         void*        writerContext_{nullptr};
-        volatile uint8_t dryRun_{0};
 
         volatile uint32_t applied_{0};
         volatile uint32_t already_{0};
         volatile uint32_t foreign_{0};
         volatile uint32_t writeFailures_{0};
         volatile uint32_t verifyFailures_{0};
-        volatile uint32_t planned_{0};
     };
 
 }    // namespace NRedUserPatch

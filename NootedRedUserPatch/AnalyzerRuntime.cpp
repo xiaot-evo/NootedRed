@@ -257,11 +257,13 @@ namespace NRedUserPatch
         IOLog("NootedRedUserPatch: main cache open '%s'\n", mainFile->path());
 
         ByteSource mainSource = mainFile->source();
+        this->resolveCache_.reset();
         ResolveContext context{};
         context.mainCache     = &mainSource;
         context.openCache     = &AnalyzerRuntime::openCacheThunk;
         context.openImage     = &AnalyzerRuntime::openImageThunk;
         context.openContext   = this;
+        context.cache         = &this->resolveCache_;
         context.runningFamily = this->runningFamily_;
         context.vdaEnabled    = this->vdaEnabled_;
 

@@ -309,6 +309,8 @@ namespace
         context.openCache    = &ResolverFixture::openCache;
         context.openImage    = &ResolverFixture::openImage;
         context.openContext  = &fixture;
+        NRedUserPatch::ResolveCache cache{};
+        context.cache = &cache;
         context.runningFamily = NRedUserPatch::kFamilyVCN2;
         context.vdaEnabled   = vdaEnabled;
 

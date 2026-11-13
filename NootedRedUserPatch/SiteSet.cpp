@@ -61,10 +61,6 @@ namespace NRedUserPatch
         this->writerContext_ = context;
     }
 
-    void SiteSet::setDryRun(const bool dryRun) { __atomic_store_n(&this->dryRun_, dryRun ? 1U : 0U, __ATOMIC_RELEASE); }
-
-    auto SiteSet::dryRun() const -> bool { return __atomic_load_n(&this->dryRun_, __ATOMIC_ACQUIRE) != 0U; }
-
     auto SiteSet::apply(const char* const vnodeName, const uint64_t chunkOffset, const uint8_t* const data,
                         const size_t size) -> uint32_t
     {
@@ -91,10 +87,6 @@ namespace NRedUserPatch
         }
 
         if (clean == 0U) { return 0U; }
-        if (this->dryRun()) {
-            __atomic_fetch_add(&this->planned_, clean, __ATOMIC_RELAXED);
-            return 0U;
-        }
 
         if (this->begin_ == nullptr || this->end_ == nullptr || !this->begin_(this->writerContext_)) {
             __atomic_fetch_add(&this->writeFailures_, 1U, __ATOMIC_RELAXED);
@@ -144,7 +136,5 @@ namespace NRedUserPatch
     {
         return __atomic_load_n(&this->verifyFailures_, __ATOMIC_RELAXED);
     }
-
-    auto SiteSet::planned() const -> uint32_t { return __atomic_load_n(&this->planned_, __ATOMIC_RELAXED); }
 
 }    // namespace NRedUserPatch

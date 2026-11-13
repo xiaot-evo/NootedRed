@@ -13,8 +13,7 @@ There is no profile, no injection step and no runtime patch-data channel.
 - Write path: `ValidationHook.cpp` and `SiteSet.cpp`.
 - Design: [`../docs/USERSPACE-PATCHING.md`](../docs/USERSPACE-PATCHING.md).
 
-Boot arguments: `-NRedUserPatchOff`, `-NRedUserPatchDry`, `-NRedUserPatchVDA`,
-`-NRedUserPatchDebug`.
+Boot arguments: `-NRedUserPatchOff`, `-NRedUserPatchVDA`, `-NRedUserPatchDebug`.
 
 Build (needs a sibling AppleForge checkout or `$AppleForgePath`):
 
@@ -26,5 +25,7 @@ Host tests:
 
 ```sh
 python3 test/test_analyzer.py    # 19 rules against the 15.8.2/26.7.2 fixtures
-python3 test/test_site_set.py    # hook write/idempotence/dry-run semantics
+python3 test/test_site_set.py    # hook write/idempotence semantics
+python3 test/test_block_reader.py    # 16 KiB block-cache cross-block regression
+python3 test/test_fixture_probe.py   # 13/14/15/26 slots; missing fixtures are reserved
 ```

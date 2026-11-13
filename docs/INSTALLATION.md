@@ -39,7 +39,6 @@ Hackintosh。项目处于活跃研发阶段，会崩；先做好 EFI 备份再�
 | `-NRedVDA` | 请求 VCN 内核桥（硬解/硬编实验路径） |
 | `-NRedUserPatchOff` | 关闭用户态补丁，保留内核侧 |
 | `-NRedUserPatchVDA` | 启用 14 条 VADriver2 用户态规则（默认关闭） |
-| `-NRedUserPatchDry` | 正常解析和校验，只记录计划写入，不写字节 |
 | `-NRedDebug` / `-NRedUserPatchDebug` | 打开调试日志（配合 DEBUG 构建的 Lilu） |
 | `-NRedNoAccel` | 只做 FB，不加载加速器 |
 | `-NRedOff` | 完全关闭 NootedRed（救援） |

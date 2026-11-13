@@ -102,13 +102,7 @@ int main()
     check(memcmp(chunk + 0x10, find0, sizeof(find0)) == 0, "split chunk bytes unchanged");
 
     fillFind(chunk);
-    set.setDryRun(true);
-    check(set.apply("test", 0, chunk, sizeof(chunk)) == 0U, "dry run writes nothing");
-    check(set.planned() == 2U, "dry-run planned counter");
-    check(memcmp(chunk + 0x10, find0, sizeof(find0)) == 0, "dry-run bytes unchanged");
-    set.setDryRun(false);
-
-    check(set.apply("test", 0, chunk, sizeof(chunk)) == 2U, "apply after dry run writes");
+    check(set.apply("test", 0, chunk, sizeof(chunk)) == 2U, "apply writes after split");
     check(set.applied() == 4U, "applied counter");
 
     printf("%s: %u failure(s)\n", failures == 0 ? "PASS" : "FAIL", failures);

@@ -125,6 +125,155 @@ namespace NRedUserPatch
         return true;
     }
 
+    namespace
+    {
+
+        // Locates and parses one target image.  The result is cached by image path/kind when the
+        // context supplies a cache, so rules sharing an image do not repeat the cache scan or
+        // Mach-O parse.  The opened sources are borrowed from the caller's file readers.
+        auto resolveImage(const ResolveContext& context, const Rule& rule, ResolvedImage& out, const char** const reason)
+            -> bool
+        {
+            const auto fail = [reason](const char* const why) -> bool {
+                if (reason != nullptr) { *reason = why; }
+                return false;
+            };
+
+            if (context.cache != nullptr) {
+                for (uint32_t index = 0; index < context.cache->count; index++) {
+                    const ResolvedImage& candidate = context.cache->images[index];
+                    if (candidate.kind == rule.imageKind && strcmp(candidate.path, rule.imagePath) == 0) {
+                        out = candidate;
+                        return true;
+                    }
+                }
+            }
+
+            ResolvedImage resolved{};
+            resolved.kind = rule.imageKind;
+            copyText(resolved.path, sizeof(resolved.path), rule.imagePath);
+
+            if (rule.imageKind == ImageKind::kSharedCache) {
+                if (context.mainCache == nullptr || context.openCache == nullptr) { return fail("no cache opener"); }
+
+                LocatedImage located{};
+                if (!locateCacheImage(*context.mainCache, context.openCache, context.openContext, rule.imagePath, located)) {
+                    return fail("image not located");
+                }
+                if (!context.openCache(context.openContext, located.vnodeName, resolved.textSource)) {
+                    return fail("text subcache not opened");
+                }
+                if (!context.openCache(context.openContext, located.linkeditVnodeName, resolved.linkeditSource)) {
+                    return fail("linkedit subcache not opened");
+                }
+                if (!parseMachO(resolved.textSource, located.fileOffset, located.loadAddress, located.textSize,
+                                resolved.image)) {
+                    return fail("text Mach-O parse failed");
+                }
+                resolved.textBase    = located.fileOffset;
+                resolved.loadAddress = located.loadAddress;
+                copyText(resolved.vnodeName, sizeof(resolved.vnodeName), located.vnodeName);
+            }
+            else {
+                if (context.openImage == nullptr) { return fail("no image opener"); }
+                if (!context.openImage(context.openContext, rule.imagePath, resolved.textSource)) {
+                    return fail("standalone image not opened");
+                }
+                resolved.linkeditSource = resolved.textSource;
+                if (!parseMachO(resolved.textSource, 0, 0, 0, resolved.image)) {
+                    return fail("standalone Mach-O parse failed");
+                }
+                resolved.textBase    = resolved.image.textFileOffset;
+                resolved.loadAddress = 0;
+                copyText(resolved.vnodeName, sizeof(resolved.vnodeName), basenameOf(rule.imagePath));
+            }
+
+            out = resolved;
+            if (context.cache != nullptr && context.cache->count < kMaxCachedImages) {
+                context.cache->images[context.cache->count] = resolved;
+                context.cache->count += 1U;
+            }
+            return true;
+        }
+
+        // Resolves a rule inside an already parsed image.  The symbol/function/pattern work is
+        // per-rule; the expensive image location and Mach-O parse are not repeated.
+        auto resolveRuleInImage(const Rule& rule, const ResolvedImage& image, ResolvedSite& out,
+                                const char** const reason) -> bool
+        {
+            const auto fail = [reason](const char* const why) -> bool {
+                if (reason != nullptr) { *reason = why; }
+                return false;
+            };
+
+            uint64_t symbolVa = 0;
+            if (!findSymbol(image.linkeditSource, image.image, rule.symbol, symbolVa)) { return fail("symbol not found"); }
+
+            uint64_t funcStart = 0;
+            uint64_t funcEnd = 0;
+            if (!functionRange(image.linkeditSource, image.image, symbolVa, funcStart, funcEnd)) {
+                return fail("function range not found");
+            }
+            if (funcStart < image.loadAddress || funcEnd > image.image.imageVaEnd) {
+                return fail("function range invalid");
+            }
+
+            const uint64_t funcFileStart = image.textBase + (funcStart - image.loadAddress);
+            const uint64_t funcFileEnd   = image.textBase + (funcEnd - image.loadAddress);
+            if (funcFileEnd <= funcFileStart) { return fail("function range empty"); }
+
+            for (uint32_t variantIndex = 0; variantIndex < rule.variantCount; variantIndex++) {
+                const RuleVariant& variant = rule.variants[variantIndex];
+                if (variant.patchSize == 0U || variant.patchSize > 64U) { continue; }
+                if (variant.find == nullptr || variant.replace == nullptr) { continue; }
+
+                uint64_t siteFile = 0;
+
+                if (variant.localKind == LocalKind::kOffset) {
+                    const uint64_t siteVa = funcStart + variant.localOffset;
+                    if (siteVa < funcStart || siteVa >= funcEnd) { continue; }
+                    siteFile = image.textBase + (siteVa - image.loadAddress);
+                }
+                else {
+                    if (variant.localPattern == nullptr || variant.localMask == nullptr) { continue; }
+                    PatternMatches matches{};
+                    if (!scanPattern(image.textSource, funcFileStart, funcFileEnd, variant, matches)) {
+                        return fail("pattern scan failed");
+                    }
+                    if (matches.overflow) { return fail("too many pattern matches"); }
+                    if (matches.count == 0U) { continue; }
+
+                    if (rule.policy == MatchPolicy::kUnique) {
+                        if (matches.count != 1U) { return fail("pattern not unique"); }
+                        siteFile = matches.offsets[0] + variant.patchOffset;
+                    }
+                    else if (rule.policy == MatchPolicy::kNth) {
+                        const uint32_t nth = rule.localNth != 0U ? rule.localNth : 1U;
+                        if (matches.count < nth) { continue; }
+                        siteFile = matches.offsets[nth - 1U] + variant.patchOffset;
+                    }
+                    else {
+                        return fail("match-all policy not supported");
+                    }
+                }
+
+                if (siteFile < funcFileStart || siteFile + variant.patchSize > funcFileEnd) { continue; }
+                if (!readExact(image.textSource, siteFile, variant.find, variant.patchSize)) { continue; }
+
+                copyText(out.vnodeName, sizeof(out.vnodeName), image.vnodeName);
+                out.fileOffset = siteFile;
+                out.find       = variant.find;
+                out.replace    = variant.replace;
+                out.size       = variant.patchSize;
+                out.ruleId     = rule.id;
+                return true;
+            }
+
+            return fail("no variant matched");
+        }
+
+    }    // namespace
+
     auto resolveRule(const ResolveContext& context, const Rule& rule, ResolvedSite& out, const char** const reason)
         -> bool
     {
@@ -138,106 +287,9 @@ namespace NRedUserPatch
             return fail("rule incomplete");
         }
 
-        ByteSource textSource{};
-        ByteSource linkeditSource{};
-        MachOImage image{};
-        uint64_t   textBase = 0;
-        uint64_t   loadAddress = 0;
-        char       vnodeName[64]{};
-
-        if (rule.imageKind == ImageKind::kSharedCache) {
-            if (context.mainCache == nullptr || context.openCache == nullptr) { return fail("no cache opener"); }
-            LocatedImage located{};
-            if (!locateCacheImage(*context.mainCache, context.openCache, context.openContext, rule.imagePath, located)) {
-                return fail("image not located");
-            }
-            if (!context.openCache(context.openContext, located.vnodeName, textSource)) {
-                return fail("text subcache not opened");
-            }
-            if (!context.openCache(context.openContext, located.linkeditVnodeName, linkeditSource)) {
-                return fail("linkedit subcache not opened");
-            }
-            if (!parseMachO(textSource, located.fileOffset, located.loadAddress, located.textSize, image)) {
-                return fail("text Mach-O parse failed");
-            }
-            textBase    = located.fileOffset;
-            loadAddress = located.loadAddress;
-            copyText(vnodeName, sizeof(vnodeName), located.vnodeName);
-        }
-        else {
-            if (context.openImage == nullptr) { return fail("no image opener"); }
-            if (!context.openImage(context.openContext, rule.imagePath, textSource)) {
-                return fail("standalone image not opened");
-            }
-            linkeditSource = textSource;
-            if (!parseMachO(textSource, 0, 0, 0, image)) { return fail("standalone Mach-O parse failed"); }
-            textBase    = image.textFileOffset;
-            loadAddress = 0;
-            copyText(vnodeName, sizeof(vnodeName), basenameOf(rule.imagePath));
-        }
-
-        uint64_t symbolVa = 0;
-        if (!findSymbol(linkeditSource, image, rule.symbol, symbolVa)) { return fail("symbol not found"); }
-
-        uint64_t funcStart = 0;
-        uint64_t funcEnd = 0;
-        if (!functionRange(linkeditSource, image, symbolVa, funcStart, funcEnd)) {
-            return fail("function range not found");
-        }
-        if (funcStart < loadAddress || funcEnd > image.imageVaEnd) { return fail("function range invalid"); }
-
-        const uint64_t funcFileStart = textBase + (funcStart - loadAddress);
-        const uint64_t funcFileEnd   = textBase + (funcEnd - loadAddress);
-        if (funcFileEnd <= funcFileStart) { return fail("function range empty"); }
-
-        for (uint32_t variantIndex = 0; variantIndex < rule.variantCount; variantIndex++) {
-            const RuleVariant& variant = rule.variants[variantIndex];
-            if (variant.patchSize == 0U || variant.patchSize > 64U) { continue; }
-            if (variant.find == nullptr || variant.replace == nullptr) { continue; }
-
-            uint64_t siteFile = 0;
-
-            if (variant.localKind == LocalKind::kOffset) {
-                const uint64_t siteVa = funcStart + variant.localOffset;
-                if (siteVa < funcStart || siteVa >= funcEnd) { continue; }
-                siteFile = textBase + (siteVa - loadAddress);
-            }
-            else {
-                if (variant.localPattern == nullptr || variant.localMask == nullptr) { continue; }
-                PatternMatches matches{};
-                if (!scanPattern(textSource, funcFileStart, funcFileEnd, variant, matches)) {
-                    return fail("pattern scan failed");
-                }
-                if (matches.overflow) { return fail("too many pattern matches"); }
-                if (matches.count == 0U) { continue; }
-
-                if (rule.policy == MatchPolicy::kUnique) {
-                    if (matches.count != 1U) { return fail("pattern not unique"); }
-                    siteFile = matches.offsets[0] + variant.patchOffset;
-                }
-                else if (rule.policy == MatchPolicy::kNth) {
-                    const uint32_t nth = rule.localNth != 0U ? rule.localNth : 1U;
-                    if (matches.count < nth) { continue; }
-                    siteFile = matches.offsets[nth - 1U] + variant.patchOffset;
-                }
-                else {
-                    return fail("match-all policy not supported");
-                }
-            }
-
-            if (siteFile < funcFileStart || siteFile + variant.patchSize > funcFileEnd) { continue; }
-            if (!readExact(textSource, siteFile, variant.find, variant.patchSize)) { continue; }
-
-            copyText(out.vnodeName, sizeof(out.vnodeName), vnodeName);
-            out.fileOffset = siteFile;
-            out.find       = variant.find;
-            out.replace    = variant.replace;
-            out.size       = variant.patchSize;
-            out.ruleId     = rule.id;
-            return true;
-        }
-
-        return fail("no variant matched");
+        ResolvedImage image{};
+        if (!resolveImage(context, rule, image, reason)) { return false; }
+        return resolveRuleInImage(rule, image, out, reason);
     }
 
 }    // namespace NRedUserPatch

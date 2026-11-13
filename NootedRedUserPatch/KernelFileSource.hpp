@@ -21,6 +21,7 @@
 // along with this work.  If not, see https://git.chefkiss.dev/ChefKiss/OpenKnowledge/raw/branch/master/LICENSE-v1.md.
 
 #pragma once
+#include <Analyzer/BlockReader.hpp>
 #include <Analyzer/ByteSource.hpp>
 #include <Headers/kern_file.hpp>
 #include <stdint.h>
@@ -36,8 +37,7 @@ namespace NRedUserPatch
     class KernelFile
     {
     public:
-        static constexpr size_t kBlockSize = 0x4000U;
-        static constexpr size_t kMaxPath    = 256U;
+        static constexpr size_t kMaxPath = 256U;
 
         // Trivially destructible: the analyzer calls close() explicitly, and a non-trivial destructor
         // would force a local-static guard that the kernel does not support.
@@ -53,14 +53,13 @@ namespace NRedUserPatch
 
     private:
         static auto read(void* context, uint64_t offset, void* destination, size_t size) -> bool;
+        static auto readBacking(void* context, uint64_t offset, void* destination, size_t size) -> bool;
 
         vnode_t        vnode_{nullptr};
         vfs_context_t  context_{nullptr};
         uint64_t       size_{0};
         char           path_[kMaxPath]{};
-        uint8_t        block_[kBlockSize]{};
-        uint64_t       blockOffset_{0};
-        size_t         blockSize_{0};
+        BlockReader    reader_{};
     };
 
 }    // namespace NRedUserPatch

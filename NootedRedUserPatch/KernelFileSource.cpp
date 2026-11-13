@@ -57,6 +57,7 @@ namespace NRedUserPatch
             this->close();
             return false;
         }
+        this->reader_.reset(this->size_, &KernelFile::readBacking, this);
         return true;
     }
 
@@ -70,10 +71,9 @@ namespace NRedUserPatch
             vfs_context_rele(this->context_);
             this->context_ = nullptr;
         }
-        this->size_        = 0;
-        this->blockOffset_ = 0;
-        this->blockSize_   = 0;
-        this->path_[0]     = '\0';
+        this->size_    = 0;
+        this->path_[0] = '\0';
+        this->reader_.reset(0, nullptr, nullptr);
     }
 
     auto KernelFile::read(void* const context, const uint64_t offset, void* const destination, const size_t size)
@@ -81,37 +81,15 @@ namespace NRedUserPatch
     {
         auto* const self = static_cast<KernelFile*>(context);
         if (self == nullptr || self->vnode_ == nullptr || destination == nullptr) { return false; }
-        if (offset > self->size_ || size > self->size_ - offset) { return false; }
+        return self->reader_.read(offset, destination, size);
+    }
 
-        if (size > kBlockSize) {
-            return FileIO::readFileData(destination, static_cast<off_t>(offset), size, self->vnode_, self->context_) == 0;
-        }
-
-        if (self->blockSize_ != 0U && offset >= self->blockOffset_ &&
-            offset + size <= self->blockOffset_ + self->blockSize_) {
-            memcpy(destination, self->block_ + (offset - self->blockOffset_), size);
-            return true;
-        }
-
-        const uint64_t blockOffset = offset & ~static_cast<uint64_t>(kBlockSize - 1U);
-        // A request that crosses the end of the candidate block cannot be satisfied by the cache
-        // line; read it directly instead of failing.  The analyzer routinely reads 16-400 byte
-        // windows (nlist entries, Mach-O paths) that straddle a 16 KiB boundary.
-        if (offset + size > blockOffset + kBlockSize) {
-            return FileIO::readFileData(destination, static_cast<off_t>(offset), size, self->vnode_, self->context_) == 0;
-        }
-
-        const uint64_t remaining   = self->size_ - blockOffset;
-        const size_t   toRead      = remaining < kBlockSize ? static_cast<size_t>(remaining) : kBlockSize;
-        if (FileIO::readFileData(self->block_, static_cast<off_t>(blockOffset), toRead, self->vnode_, self->context_) != 0) {
-            return false;
-        }
-        self->blockOffset_ = blockOffset;
-        self->blockSize_   = toRead;
-
-        if (offset < blockOffset || offset + size > blockOffset + toRead) { return false; }
-        memcpy(destination, self->block_ + (offset - blockOffset), size);
-        return true;
+    auto KernelFile::readBacking(void* const context, const uint64_t offset, void* const destination,
+                                 const size_t size) -> bool
+    {
+        auto* const self = static_cast<KernelFile*>(context);
+        if (self == nullptr || self->vnode_ == nullptr) { return false; }
+        return FileIO::readFileData(destination, static_cast<off_t>(offset), size, self->vnode_, self->context_) == 0;
     }
 
 }    // namespace NRedUserPatch

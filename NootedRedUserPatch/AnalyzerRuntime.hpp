@@ -80,6 +80,7 @@ namespace NRedUserPatch
 
         KernelFile    files_[kMaxFiles]{};
         ResolvedSite  pending_[SiteSet::kMaxSites]{};
+        ResolveCache  resolveCache_{};
         uint32_t      fileCount_{0};
         uint32_t      runningFamily_{0};
         bool          vdaEnabled_{false};

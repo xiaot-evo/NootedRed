@@ -32,7 +32,6 @@
 static const char* bootargOff   = "-NRedUserPatchOff";
 static const char* bootargDebug = "-NRedUserPatchDebug";
 static const char* bootargBeta  = "-NRedUserPatchBeta";
-static const char* bootargDry   = "-NRedUserPatchDry";
 
 PluginConfiguration ADDPR(config){
     xStringify(PRODUCT_NAME),
@@ -53,7 +52,6 @@ PluginConfiguration ADDPR(config){
         lilu.onPatcherLoadForce(
             [](void* const, KernelPatcher& patcher)
             {
-                NRedUserPatch::SiteSet::singleton().setDryRun(checkKernelArgument(bootargDry));
                 NRedUserPatch::ValidationHook::singleton().install(patcher);
                 NRedUserPatch::AnalyzerRuntime::singleton().start(patcher);
             },

@@ -118,6 +118,7 @@ Cryptex 已挂载，才是安全的 VFS 起点。
 **内核读取约束**：vnode `ByteSource` 的 16 KiB 块缓存必须处理跨块请求，回退到直接
 `FileIO::readFileData`。24H232 实测，旧实现让跨块的 nlist/path 读取返回 false，符号扫描和镜像
 路径匹配整体失败，日志表现为 `symbol not found` / `image not located`；修复后 19/19 解析成功。
+主机回归见 `test/test_block_reader.py`；analyzer fixture 测试用普通文件源，不经过该缓存，两者都要跑。
 
 ### 5.3 符号索引
 
@@ -287,7 +288,6 @@ for rule in rules:
 ### 7.3 诊断与开关
 
 - `-NRedUserPatchOff`：satellite 不安装 hook，不解析，不写。
-- `-NRedUserPatchDry`：正常解析和校验，只记录计划写入，不写字节。
 - `-NRedUserPatchVDA`：启用 14 条 VADriver2 规则；默认只打 GL/Metal 5 条（保持当前发布行为）。
 - `-NRedUserPatchDebug`：详细日志（与 `-NRedDebug` 分开，便于隔离）。
 - 日志内容：解析到的镜像范围、每条规则的 anchor/函数/偏移/匹配数、resolved/unresolved 汇总、
@@ -321,7 +321,8 @@ for rule in rules:
 
 ### 8.2 新系统版本的维护流程
 
-1. 用干净 fixture 跑主机侧 analyzer 测试（同一套解析代码）。
+1. 用干净 fixture 跑主机侧 analyzer 测试（`test/test_fixture_probe.py` 先报告 13–26 各槽位的
+   resolved/unresolved，再用 `test_analyzer.py` 做严格断言）。
 2. 若有规则 unresolved：查看日志里的 anchor/函数/匹配数，只改那一条规则的 anchor 或局部规则。
 3. 如果函数控制流/寄存器分配变化，增加一个按函数形状的 variant；不是每个 build 生成 profile。
 4. 不需要生成 profile，不需要注入，不需要按 build 选择。
@@ -369,7 +370,8 @@ for rule in rules:
 
 ### 11.1 主机侧测试
 
-主机的 `test/test_analyzer.py` 和 `test/test_site_set.py`：
+主机的 `test/test_analyzer.py`、`test/test_site_set.py`、`test/test_block_reader.py` 和
+`test/test_fixture_probe.py`：
 
 1. 对 `version-fixtures/15.8.2` 和 `version-fixtures/26.7.2` 运行同一套 Mach-O 解析 + 规则解析。
 2. 断言 default 5 条、VDA 打开后 19 条全部 resolved；每条解析出的 `find` 字节与 fixture 一致。
@@ -378,7 +380,9 @@ for rule in rules:
 4. 断言 familyMask 不匹配时规则被跳过。
 5. 负例：删除一个符号、改一个函数指纹、制造一个双匹配，断言该规则 fail closed 且其他规则不受影响。
 
-这组测试不需要硬件，也不依赖 UBC 状态，是跨版本适配的主要回归手段。
+这组测试不需要硬件，也不依赖 UBC 状态，是跨版本适配的主要回归手段。`test_block_reader.py` 用内存
+源覆盖块缓存的跨块/命中/越界；`test_fixture_probe.py` 按 `13.*`/`14.*`/`15.*`/`26.*` 槽位探测
+fixture，13/14 目前预留，加入对应目录后自动运行并报告每条规则的 resolved/unresolved。
 
 ### 11.2 硬件验证
 
@@ -392,7 +396,7 @@ for rule in rules:
   13 字节 NOP）；无 panic，SIP/AMFI 未关闭。
 - 调试通道：该机 Lilu 1.7.2 debug 的 `liludump` 未落盘，1.7.3 debug 正常；硬件验证用 1.7.3。
 
-待验证：`-NRedUserPatchDry`/`-NRedUserPatchOff`、UBC 回收后的重写、GL/Metal/VDA 功能负载、
+待验证：`-NRedUserPatchOff`、UBC 回收后的重写、GL/Metal/VDA 功能负载、
 26.7.2 实机启动。
 
 ## 12. 决策与取舍
