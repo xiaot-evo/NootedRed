@@ -218,7 +218,12 @@ void NRed::processPatcher()
     DeviceInfo::deleter(devInfo);
 }
 
-void NRed::setProp32(const char* const key, const UInt32 value) const { this->iGPU->setProperty(key, value, 32); }
+void NRed::setProp32(const char* const key, const UInt32 value) const
+{
+    if (this->iGPU == nullptr) { return; }
+
+    this->iGPU->setProperty(key, value, 32);
+}
 
 UInt32 NRed::readReg32(const UInt32 reg) const
 {
