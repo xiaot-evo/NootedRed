@@ -151,6 +151,7 @@ int main(int argc, char** argv)
     context.vdaEnabled    = true;
 
     unsigned resolved = 0;
+    unsigned enabled  = 0;
     for (uint32_t index = 0; index < kRuleCount; index++) {
         const Rule& rule = kRules[index];
         ResolvedSite site{};
@@ -159,6 +160,7 @@ int main(int argc, char** argv)
             printf("rule %2u SKIP (gate)\n", rule.id);
             continue;
         }
+        enabled += 1U;
         if (!resolveRule(context, rule, site, &reason)) {
             printf("rule %2u UNRESOLVED: %s\n", rule.id, reason != nullptr ? reason : "?");
             continue;
@@ -168,7 +170,7 @@ int main(int argc, char** argv)
                static_cast<unsigned long long>(site.fileOffset), site.vnodeName);
     }
 
-    printf("summary: %u/%u resolved (family 0x%X, VDA 1)\n", resolved, kRuleCount,
+    printf("summary: %u/%u resolved (family 0x%X, VDA 1)\n", resolved, enabled,
            static_cast<unsigned>(context.runningFamily));
-    return resolved == kRuleCount ? 0 : 1;
+    return resolved == enabled ? 0 : 1;
 }
