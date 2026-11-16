@@ -76,7 +76,7 @@ class VCNBridge
     OSMetaClass* sharedMC{nullptr};
     OSMetaClass* clientMC{nullptr};
     void*        hardwareHandle{nullptr};
-    static constexpr size_t kClassPairCount = 6;
+    static constexpr size_t kClassPairCount = 8;
     ClassPair              classPairs[kClassPairCount];
 
 public:

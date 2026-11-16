@@ -37,6 +37,7 @@
 #include <libkern/OSAtomic.h>
 #include <libkern/OSKextLib.h>
 #include <libkern/c++/OSMetaClass.h>
+#include <string.h>
 
 // libkern/version.h declares this with C linkage; including the header conflicts with the version
 // constants already declared by KernelVersion.hpp, so declare only the build string we need.
@@ -460,6 +461,18 @@ OSMetaClassBase* VCNBridge::safeMetaCast(const OSMetaClassBase* const object, co
         FunctionCast(safeMetaCast, bridge.orgSafeMetaCast)(object, target);
     if (result != nullptr || object == nullptr || !bridge.engineEnabled()) { return result; }
 
+    // The bridge pairs the X5000/X6000 classes it knows are layout-compatible. A miss on a VM class
+    // is exactly where the VCN engine's per-client VMID assignment would fall back to a stale context,
+    // so keep the name of the first failing cast instead of guessing from the reset report.
+#ifdef DEBUG
+    const char* const targetName = target->getClassName();
+    if (targetName != nullptr && strstr(targetName, "VM") != nullptr) {
+        const OSMetaClass* const objectMeta = object->getMetaClass();
+        DBGLOG("VCN", "safeMetaCast miss: %s -> %s",
+               objectMeta != nullptr ? objectMeta->getClassName() : "?", targetName);
+    }
+#endif
+
     for (const auto& pair : bridge.classPairs) {
         if (pair.oldClass == nullptr || pair.newClass == nullptr) { continue; }
 
@@ -533,6 +546,8 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
             "__ZN28AMDRadeonX5000_IAMDHWChannel10gMetaClassE",
             "__ZN29AMDRadeonX5000_AMDAccelShared10gMetaClassE",
             "__ZN39AMDRadeonX5000_AMDAccelSharedUserClient10gMetaClassE",
+            "__ZN29AMDRadeonX5000_AMDHWVMContext10gMetaClassE",
+            "__ZN30AMDRadeonX5000_IAMDHWVMContext10gMetaClassE",
         };
         static_assert(arrsize(kPairs) == kClassPairCount, "Update kClassPairCount with the class pair table");
         for (size_t i = 0; i < arrsize(kPairs); ++i) {
@@ -635,6 +650,8 @@ void VCNBridge::processKext(KernelPatcher& patcher, const size_t id, const mach_
             "__ZN28AMDRadeonX6000_IAMDHWChannel10gMetaClassE",
             "__ZN29AMDRadeonX6000_AMDAccelShared10gMetaClassE",
             "__ZN39AMDRadeonX6000_AMDAccelSharedUserClient10gMetaClassE",
+            "__ZN29AMDRadeonX6000_AMDHWVMContext10gMetaClassE",
+            "__ZN30AMDRadeonX6000_IAMDHWVMContext10gMetaClassE",
         };
         static_assert(arrsize(kPairs) == kClassPairCount, "Update kClassPairCount with the class pair table");
         for (size_t i = 0; i < arrsize(kPairs); ++i) {
