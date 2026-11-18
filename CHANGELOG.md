@@ -1,5 +1,27 @@
 # Change log
 
+## v0.9.3 (18/11/2026)
+
+### Bug Fixes
+
+- VCN: bridge the X5000/X6000 `AMDHWVMContext` and `IAMDHWVMContext` metaclasses in
+  `safeMetaCast`. Without the bridge a second video decode client (for example Bilibili with a
+  dynamic wallpaper already decoding) could fall back to a stale VMID; the engine then wrote
+  through VMID 8 while the pending command buffer belonged to VMID 10, faulted on
+  `0x400c04000`, and the full-ASIC reset storm took WindowServer down with it.
+- Keep a debug-only `safeMetaCast` miss log for VM classes.
+
+Validated on Renoir `0x1638` / 15.8.3 `24H241`: Bilibili HEVC hardware decode with the dynamic
+Sequoia Sunrise wallpaper, six concurrent 1080p 10-bit HEVC decoders, and the full VDA
+decode/encode matrix (H.264 720p, 64×64, HEVC 720p, hardware encode) without `cosWaitForFunc`,
+VCN0Dec resets or a panic.
+
+> [!NOTE]
+> Use the `RELEASE` build. `RESEARCH_RELEASE` is `DEBUG` with optimisations.
+> The latter two will be way slower and inefficient than the former build. Use them **only** when debugging an issue with NootedRed.
+
+**Full Changelog**: https://github.com/xiaot-evo/NootedRed/commits/v0.9.3
+
 ## v0.9.2 (13/11/2026)
 
 ### Enhancements
