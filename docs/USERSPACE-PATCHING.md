@@ -1,6 +1,6 @@
 # 用户态驱动补丁架构
 
-状态：2026-11-07。替代 NRPT v3 / NRPT v4 / `NRedProfiles` / image-completion 方案。
+状态：2026-11-23（规则收敛）；初版 2026-11-07。替代 NRPT v3 / NRPT v4 / `NRedProfiles` / image-completion 方案。
 范围：`NootedRedUserPatch.kext` 如何定位并写入用户态 AMD 驱动的补丁。主 kext 的内核补丁不变。
 
 ## 1. 目标与非目标
@@ -50,7 +50,7 @@ v1 退役，不参与解析。
 |------|----------|----------|----------|
 | NRPT v3/v4 profile | 每个 build 生成新 profile | 每个 build 一份 | 偏移是 build 精确值；需要 fixture 流水线、注入、identity 门控、image completion |
 | 带掩码的字节表 | pattern 可跨若干 build | 每适配一个版本累积 variant | 同 subcache 误匹配；数据随版本增长；仍需人工维护 |
-| **运行期解析（本方案）** | 解析当前镜像的符号/函数结构 | **固定 19 条规则（5 default + 14 VDA），不随版本增长** | 代码量比字节扫描大；解析器必须在内核里安全、可失败 |
+| **运行期解析（本方案）** | 解析当前镜像的符号/函数结构 | **固定 13 条规则（5 default + 8 VDA），不随版本增长** | 代码量比字节扫描大；解析器必须在内核里安全、可失败 |
 
 本方案的判断是：**版本差异是结构差异，不是数据差异**。Apple 改代码时会移动偏移、改变寄存器分配、
 增删指令，但驱动仍保留 Mach-O 符号表、`LC_FUNCTION_STARTS` 和可识别的函数级结构。把“定位”写成
@@ -60,7 +60,7 @@ v1 退役，不参与解析。
 
 ```
 NootedRedUserPatch.kext
- ├── RuleTable            19 条规则：镜像 + familyMask + 锚点 + variants[] + find/replace
+ ├── RuleTable            13 条规则：镜像 + familyMask + 锚点 + variants[] + find/replace
  ├── ImageAnalyzer        启动时一次：解析目标镜像的 Mach-O / 符号 / 函数边界
  │   └── RuleResolver     把规则解析成 {vnode, fileOffset, find, replace}
  ├── SiteSet              解析结果，只读；hook 只读它
@@ -117,7 +117,7 @@ Cryptex 已挂载，才是安全的 VFS 起点。
 
 **内核读取约束**：vnode `ByteSource` 的 16 KiB 块缓存必须处理跨块请求，回退到直接
 `FileIO::readFileData`。24H232 实测，旧实现让跨块的 nlist/path 读取返回 false，符号扫描和镜像
-路径匹配整体失败，日志表现为 `symbol not found` / `image not located`；修复后 19/19 解析成功。
+路径匹配整体失败，日志表现为 `symbol not found` / `image not located`；修复后当时 19 条规则全部解析成功（2026-11-23 收敛为 13 条，见 §6.6）。
 主机回归见 `test/test_block_reader.py`；analyzer fixture 测试用普通文件源，不经过该缓存，两者都要跑。
 
 ### 5.3 符号索引
@@ -127,7 +127,7 @@ Cryptex 已挂载，才是安全的 VFS 起点。
 - 读 `nlist_64` 数组（`nsyms × 16` 字节）。
 - 只保留 `n_value` 落在镜像 `[loadAddress, loadAddress + textSegmentSize)` 的符号。
 - 只对“函数起始地址”或“规则需要的符号”读取字符串，避免遍历整个字符串表。
-- 建立 `name -> n_value` 的查找（目标符号只有 19 个，可以线性比对；不需要哈希表）。
+- 建立 `name -> n_value` 的查找（目标符号只有 13 个，可以线性比对；不需要哈希表）。
 
 函数边界用 `LC_FUNCTION_STARTS` 给出，不用“最近的前一个符号”猜。符号地址是函数入口时，两者应
 一致；不一致时以 `LC_FUNCTION_STARTS` 为准，符号名仍作为锚点。
@@ -148,7 +148,7 @@ Cryptex 已挂载，才是安全的 VFS 起点。
 ```
 Rule {
     image       目标镜像路径（standalone 或 cache 内路径）
-    familyMask  运行 iGPU 家族掩码（发布集为 0x28 = VCN2 Renoir/Cezanne/Green Sardine）
+    familyMask  运行 iGPU 家族掩码（发布集为 0x38：bit 3 = VCN2，bit 4/5 = 两组 VCN2.2 设备）
     flags       kVDA（仅在 -NRedUserPatchVDA 时启用）
     anchor      符号名（首选）| 函数指纹 | 镜像内唯一模式
     variants[]  每个 variant: { local, find, replace }，按当前函数形状选择
@@ -160,7 +160,7 @@ Rule {
 由 analyzer 每次启动重新求值。规则不是按 build 的 profile：一条规则通常只有一个 variant；只有函数
 控制流或寄存器分配发生变化时，才增加一个**按函数形状**的 variant。
 
-15.8.2 的实际发布集是 **19 条规则**：default 5 条（GL + MTL），VDA 14 条（VADriver2）。
+15.8.2 的实际发布集是 **13 条规则**：default 5 条（GL + MTL），VDA 8 条（VADriver2）。2026-11-23 的收敛把原 14 条 VDA 规则减为 8 条：identify、VP family（`VAContext::createVideoProcessor`）、graphics engine、image blt、合并后的 `setEncodeParams`、feedback size、AVC/HEVC status；原 6/17/18 三条 addrlib 规则因 family-5 配置不可达而删除，原 7–9 合并为一条 VP family 规则，原 12/13 合并为一条 25 字节规则。
 `-NRedUserPatchVDA` 打开 VDA 集；AppleGVA 不在发布集，v1 不实现。
 
 规则表里每个 `find`/`replace` 数组的长度由编译期 `static_assert` 校验；写入路径按 `patchSize`
@@ -172,7 +172,7 @@ Rule {
 1. **symbol（首选）**
    - 在符号表里精确匹配 mangled name，得到函数入口 `n_value`。
    - 用 `LC_FUNCTION_STARTS` 求 `[funcStart, funcEnd)`。
-   - 15.8.2 发布集的 19 个 site 全部能锚定到函数起始符号；这 19 个符号名在 26.7.2 中全部存在。
+   - 15.8.2 发布集的 13 个 site 全部能锚定到函数起始符号；这 13 个符号名在 26.7.2 中全部存在。
      GL 的两个符号是 local symbol，走 nlist 扫描；VADriver 的多数符号可直接从 export trie 取。
 
 2. **function fingerprint（符号被 strip 时的回退）**
@@ -182,7 +182,7 @@ Rule {
 
 3. **image-unique pattern（最后的回退）**
    - 在镜像 `__TEXT` 内搜索掩码模式，要求恰好一个匹配。
-   - 作为符号和函数指纹都失效时的最后一级；v1 的 19 条规则都有符号锚点，不依赖这一级。
+   - 作为符号和函数指纹都失效时的最后一级；v1 的 13 条规则都有符号锚点，不依赖这一级。
    - AppleGVA 的 site（唯一需要这一级的样本）不在发布集，v1 不实现。
 
 ### 6.3 局部规则
@@ -249,6 +249,25 @@ for rule in rules:
 | hook 收到的 chunk 里 find 不匹配 | 跳过该 site；计数 + 有界日志 |
 | 写入失败/回读不一致 | 计数 + 有界日志；不重试到死循环 |
 
+### 6.6 2026-11-23 规则收敛
+
+原 14 条 VDA 规则收敛为 8 条：
+
+- **原 7–9 → 规则 6**：`VAContext::createVideoProcessor` 是三个 VP 工厂的公共 family 决策点。
+  在函数 `+0x25` 处把 `_VAHWConfig+0xC` 的加载替换为 `movl $2, %edx`，三个 create*VP 都收到
+  family 2（Gfx9），与逐工厂补丁等价；type 8/16（deinterlacer/dynamic contrast）本来就对
+  非零 family 返回 null，行为不变。
+- **原 12/13 → 规则 9**：两条相邻补丁合并为 25 字节替换
+  （`8B 82 80 00 00 00 8B 8A 84 00 00 00` + 13×`90`）。合并后是 all-or-nothing，避免只匹配
+  一半时静默算错 encode stride。
+- **原 6/17/18 → 删除**：规则 5 的 family-5 配置使 `_VAHWConfig+0x96` bit16 置位，
+  `VAContext::Init` 跳过 `VAAddrLibInterface::init`；`Addr::Lib::Create` 和
+  `HwlConvertChipFamily` 只在这条被跳过的路径上调用。`Gfx9*` VP/engine/ImageBlt 类覆写了会
+  解引用 `VAContext+0x12548` 的 `Vi*` 方法，没有隐藏依赖。该结论是静态可达性分析，需硬件 A/B
+  最终确认；若 decode/encode 回归，恢复这三条规则。
+- **设备门控**：`kFamilyVCN2` 从 `0x28` 扩为 `0x38`，覆盖 0x1636/0x1638/0x164C/0x15E7 四颗
+  VCN2.2 APU；`familyForDeviceID` 移入 `Analyzer/Family.hpp` 并在主机测试中断言。
+
 ## 7. 写入路径
 
 ### 7.1 Hook 契约
@@ -288,7 +307,7 @@ for rule in rules:
 ### 7.3 诊断与开关
 
 - `-NRedUserPatchOff`：satellite 不安装 hook，不解析，不写。
-- `-NRedUserPatchVDA`：启用 14 条 VADriver2 规则；默认只打 GL/Metal 5 条（保持当前发布行为）。
+- `-NRedUserPatchVDA`：启用 8 条 VADriver2 规则；默认只打 GL/Metal 5 条（保持当前发布行为）。
 - `-NRedUserPatchDebug`：详细日志（与 `-NRedDebug` 分开，便于隔离）。
 - 日志内容：解析到的镜像范围、每条规则的 anchor/函数/偏移/匹配数、resolved/unresolved 汇总、
   hook 调用数、写入数、已存在数、foreign 数、回读失败数。
@@ -300,18 +319,17 @@ for rule in rules:
 
 用 `version-fixtures/15.8.2` 和 `version-fixtures/26.7.2` 的干净镜像做 Mach-O 解析：
 
-- 发布集 19 条规则（default 5 + VDA 14）的语义位置都能在 26.7.2 中找到；19 条都有函数符号，
-  且 19 个符号名在 26.7.2 全部存在。GL 的符号是 local symbol（nlist 扫描），VADriver 的多数
+- 发布集 13 条规则（default 5 + VDA 8）的语义位置都能在 26.7.2 中找到；13 条都有函数符号，
+  且 13 个符号名在 26.7.2 全部存在。GL 的符号是 local symbol（nlist 扫描），VADriver 的多数
   符号可从 export trie 直接取。
-- **17/19 的 `find`/`replace` 字节在 15.8.2 与 26.7.2 完全一致**；剩下 2 条 MTL site 需要按函数
+- **11/13 的 `find`/`replace` 字节在 15.8.2 与 26.7.2 完全一致**；剩下 2 条 MTL site 需要按函数
   形状的 variant：
   - gate：15.8.2 `F6 80 A0 00 00 00 02 75 0B` -> `EB 0B`；26.7.2
     `F6 81 A0 00 00 00 02 74 28` -> `EB 00`。
   - allow：15.8.2 `0F 94 C0` -> `31 C0 90`；26.7.2 `0F 94 C1` -> `31 C9 90`。
 - 函数内偏移会移动（例如 VADriver 的 `identify` 内偏移移动约 12 字节），但函数名和局部指令形状
   不变；variant 按形状匹配，不按 build 选择。
-- 18/19 的 ±12 字节局部模式在各自镜像内唯一；剩余的是同一函数内相邻的两个 site
-  （`Vcn2Encoder::setEncodeParams`），由 `nth`/函数范围规则区分。
+- 13/13 的函数局部模式在各自镜像内唯一。合并后的 `Vcn2Encoder::setEncodeParams` 25 字节序列在镜像内另有一份 `Vcn3Encoder` 拷贝，由函数锚点隔离。
 - AppleGVA 不在发布集，v1 不实现。它是唯一没有函数符号且需要重算相对跳转目标的样本；
   相关 branch-target 规则留到 v2。
 
@@ -340,8 +358,8 @@ for rule in rules:
 ## 9. 性能
 
 - **解析**：每次启动一次，目标镜像约 7 MB、符号约 3 万条；预计 < 100 ms，在可睡眠线程里。
-- **hook 热路径**：vnode 名字匹配 + 最多 19 条 site 的区间比较；没有扫描、没有文件 I/O、没有分配。
-- **写入次数**：每个 site 每次页驻留写一次；典型一次启动 5 次（默认）或 19 次（VDA）写。UBC 回收后的页在下次 fault
+- **hook 热路径**：vnode 名字匹配 + 最多 13 条 site 的区间比较；没有扫描、没有文件 I/O、没有分配。
+- **写入次数**：每个 site 每次页驻留写一次；典型一次启动 5 次（默认）或 13 次（VDA）写。UBC 回收后的页在下次 fault
   时重写，这是机制固有的，不是额外开销。
 - **没有**：per-process 写入、主动 page-in、watchdog、定时器、image completion 线程。
 
@@ -374,7 +392,7 @@ for rule in rules:
 `test/test_fixture_probe.py`：
 
 1. 对 `version-fixtures/15.8.2` 和 `version-fixtures/26.7.2` 运行同一套 Mach-O 解析 + 规则解析。
-2. 断言 default 5 条、VDA 打开后 19 条全部 resolved；每条解析出的 `find` 字节与 fixture 一致。
+2. 断言 default 5 条、VDA 打开后 13 条全部 resolved；每条解析出的 `find` 字节与 fixture 一致。
 3. 断言 MTL gate/allow 在两个 fixture 上选中正确的 shape variant（`EB 0B`/`EB 00`、
    `31 C0 90`/`31 C9 90`）。
 4. 断言 familyMask 不匹配时规则被跳过。
@@ -385,6 +403,8 @@ for rule in rules:
 fixture，13/14 目前预留，加入对应目录后自动运行并报告每条规则的 resolved/unresolved。
 
 ### 11.2 硬件验证
+
+> 以下为 19 条规则表的硬件结果（2026-11-07 / 24H232）；13 条规则表待收敛后的 A/B。
 
 2026-11-07 / 24H232 / Renoir `0x1638` / SIP + AMFI 全开：
 
@@ -404,13 +424,13 @@ fixture，13/14 目前预留，加入对应目录后自动运行并报告每条�
 | 决策 | 选择 | 代价 |
 |------|------|------|
 | 定位方式 | 运行期 Mach-O 解析 + 符号/函数锚点 + 局部规则/variant | 代码量比字节表大；内核里要写安全解析器 |
-| 数据 | 19 条规则（5 default + 14 VDA），不按 build 增长；函数形状变化时加 variant | 少数 site 需要按函数形状的 variant；不是每 build 生成 profile |
+| 数据 | 13 条规则（5 default + 8 VDA），不按 build 增长；函数形状变化时加 variant | 少数 site 需要按函数形状的 variant；不是每 build 生成 profile |
 | 替换适配 | 固定的 find/replace + 少量 shape variant；不做通用 rewriter | MTL gate/allow 需要两个 variant；未来 AppleGVA 类需要 branch-target 规则 |
 | profile | 删除 | 失去“不改 kext 只换 profile”的能力；但也不再需要每 build 生成 profile |
 | identity | 保留最小 device-id `familyMask` 门控，删除 build/profile 选择 | 卫星仍有少量 IOKit 探测；但不再依赖 kern.osversion |
-| VDA 默认 | 默认关闭，`-NRedUserPatchVDA` 打开 14 条 VADriver 规则 | 保持当前发布行为；用户需要显式开启 VDA |
+| VDA 默认 | 默认关闭，`-NRedUserPatchVDA` 打开 8 条 VADriver 规则 | 保持当前发布行为；用户需要显式开启 VDA |
 | AppleGVA | v1 丢弃 | 少一个 site；它是唯一需要重算相对跳转目标的样本 |
-| image completion | 删除 | 24H232 实测 19/19 在目标页校验时写入；若未来出现 analyzer 与目标页的窗口，再加有界 pending 修复 |
+| image completion | 删除 | 24H232 实测（19 条规则表）19/19 在目标页校验时写入；若未来出现 analyzer 与目标页的窗口，再加有界 pending 修复 |
 | range hook | 暂不安装 | 如果未来版本走 range 路径，需要再加 |
 | kext 边界 | satellite 独立 | 两个安装物；但主 kext 的版本门不拖住用户态解析 |
 
@@ -418,7 +438,7 @@ fixture，13/14 目前预留，加入对应目录后自动运行并报告每条�
 
 以下符号名来自 15.8.2 fixture 的 `LC_SYMTAB`；`26 符号` 表示同名符号在 26.7.2 的符号表中存在。
 函数内偏移是 15.8.2 的解析结果，不是规则常量；运行时由 analyzer 重新求值。
-发布集是 0–18 共 19 条（5 default + 14 VDA）；site 19 AppleGVA 退役，不在 v1。
+发布集是 0–12 共 13 条（5 default + 8 VDA）；AppleGVA site 已退役，不在表内。
 
 | # | 镜像 | 锚点符号（mangled） | 15 函数内偏移 | 26 符号 |
 |---|------|---------------------|---------------|---------|
@@ -428,34 +448,35 @@ fixture，13/14 目前预留，加入对应目录后自动运行并报告每条�
 | 3 | MTL | 同上 | `0x11f8` | 有（2 个 shape variant） |
 | 4 | MTL | `__Z19gfx9_HwInfoInitDataP14GFX9_HwInfoRecP24_sAMD_GET_HW_INFO_VALUESj` | `0x141` | 有 |
 | 5 | VADriver2 | `__ZN17VAAcceleratorInfo8identifyEjj` | `0x1b6` | 有 |
-| 6 | VADriver2 | `__ZN18VAAddrLibInterface4initEP11VAIOConnectP13sHardwareInfo` | `0x8b` | 有 |
-| 7 | VADriver2 | `__ZN9VAFactory29createColourFormatConverterVPEi` | `0x7` | 有 |
-| 8 | VADriver2 | `__ZN9VAFactory17createDitheringVPEi` | `0x7` | 有 |
-| 9 | VADriver2 | `__ZN9VAFactory17createDeblockerVPEi` | `0x7` | 有 |
-| 10 | VADriver2 | `__ZN9VAFactory20createGraphicsEngineEP9VAContext` | `0xa` | 有 |
-| 11 | VADriver2 | `__ZN9VAFactory14createImageBltEP9VAContextj` | `0xb` | 有 |
-| 12 | VADriver2 | `__ZN11Vcn2Encoder15setEncodeParamsEPvP15VAVendorTexture` | `0x31` | 有 |
-| 13 | VADriver2 | 同上 | `0x3d` | 有 |
-| 14 | VADriver2 | `__ZN14Vcn2EncCommand15getFeedbackSizeEv` | `0x4` | 有 |
-| 15 | VADriver2 | `__ZN26AVDVcn2AvcEncDataProcessor19ProcessEncodeStatusEP19_VAEncodeStatus` | `0x2a` | 有 |
-| 16 | VADriver2 | `__ZN27AVDVcn2HevcEncDataProcessor19ProcessEncodeStatusEP19_VAEncodeStatus` | `0x2a` | 有 |
-| 17 | VADriver2 | `__ZN4Addr3Lib6CreateEPK18_ADDR_CREATE_INPUTP19_ADDR_CREATE_OUTPUT` | `0xb5` | 有 |
-| 18 | VADriver2 | `__ZN4Addr2V27Gfx9Lib20HwlConvertChipFamilyEjj` | `0x0` | 有 |
-| 19 | AppleGVA | 无（image-unique pattern） | — | n/a（v1 退役） |
+| 6 | VADriver2 | `__ZN9VAContext20createVideoProcessorEjjjj` | `0x25` | 有（替代原 7–9） |
+| 7 | VADriver2 | `__ZN9VAFactory20createGraphicsEngineEP9VAContext` | `0xa` | 有 |
+| 8 | VADriver2 | `__ZN9VAFactory14createImageBltEP9VAContextj` | `0xb` | 有 |
+| 9 | VADriver2 | `__ZN11Vcn2Encoder15setEncodeParamsEPvP15VAVendorTexture` | `0x31` | 有（25 字节，合并原 12/13） |
+| 10 | VADriver2 | `__ZN14Vcn2EncCommand15getFeedbackSizeEv` | `0x4` | 有 |
+| 11 | VADriver2 | `__ZN26AVDVcn2AvcEncDataProcessor19ProcessEncodeStatusEP19_VAEncodeStatus` | `0x2a` | 有 |
+| 12 | VADriver2 | `__ZN27AVDVcn2HevcEncDataProcessor19ProcessEncodeStatusEP19_VAEncodeStatus` | `0x2a` | 有 |
 
-补充：sites 12/13 在同一函数内，镜像范围内各有 2 个匹配（两个相邻 site 的局部模式互相覆盖），
-规则用函数范围 + `nth` 或更长的局部上下文区分。sites 2/3 在 15.8.2 的镜像范围内各有 2 个匹配，
-函数锚点把范围缩小到同一函数后由局部规则区分。
+补充：
 
-sites 2/3 的 **替换字节** 在两个 fixture 上不同（gate `75 0B`/`74 28`，allow `0F 94 C0`/`0F 94 C1`），
-所以每条规则有两个 shape variant；符号锚点和局部定位不变，只是 variant 的 `find`/`replace` 不同。
-这是“按函数版本适配”的取舍，不是按 build 的 profile。
+- 规则 6 是新的公共决策点：`VAContext::createVideoProcessor` 只在这里加载一次
+  `_VAHWConfig+0xC`，再通过 `VAFactory::createVideoProcessor` 分发给 colour format / dithering /
+  deblocker 三个 VP；一条 10 字节补丁替代了原 7–9 三条工厂补丁。
+- 规则 9 把原 12/13 合并为 25 字节的 all-or-nothing 替换；该 25 字节序列在镜像内还有一份
+  `Vcn3Encoder` 拷贝，由 `Vcn2Encoder::setEncodeParams` 的函数锚点隔离。
+- 原 6/17/18（`VAAddrLibInterface::init`、`Addr::Lib::Create`、`HwlConvertChipFamily`）已删除。
+  规则 5 的 family-5 配置使 `_VAHWConfig+0x96` bit16 置位时，`VAContext::Init` 直接跳过
+  `VAAddrLibInterface::init`；该函数是 `Addr::Lib::Create` 与 `HwlConvertChipFamily` 的唯一入口。
+  由规则 6–8 选择的 `Gfx9*` VP/engine/ImageBlt 类覆写了会解引用 `VAContext+0x12548` 的 `Vi*`
+  方法，所以没有隐藏的 addrlib 依赖。
+- sites 2/3 的 **替换字节** 在两个 fixture 上不同（gate `75 0B`/`74 28`，allow `0F 94 C0`/`0F 94 C1`），
+  所以每条规则有两个 shape variant；符号锚点和局部定位不变，只是 variant 的 `find`/`replace` 不同。
+  这是“按函数版本适配”的取舍，不是按 build 的 profile。
 
 ## 附录 B：为什么不直接反编译
 
 完整的反编译器（Ghidra 级）不适合放进 kext：
 
 - 体积和复杂度远超本问题；内核里没有动态分配、异常、STL 的余量。
-- 目标站点只有 19 个，且都有明确的语义（设备 ID 比较、固件 size、VP 创建、编码参数、分支）。
+- 目标站点只有 13 个，且都有明确的语义（设备 ID 比较、固件 size、VP 创建、编码参数、分支）。
 - 结构解析（Mach-O/符号/函数）已经能把“版本差异”吃掉；局部规则只需要识别少量指令类别。
 - 如果某个 site 的编码跨版本变化，再为它增加一条指令级规则，而不是引入通用反编译器。
