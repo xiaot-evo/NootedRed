@@ -22,6 +22,7 @@
 
 #include <Analyzer/ByteSource.hpp>
 #include <Analyzer/CacheLocator.hpp>
+#include <Analyzer/Family.hpp>
 #include <Analyzer/MachO.hpp>
 #include <Analyzer/RuleResolver.hpp>
 #include <Analyzer/RuleTable.hpp>
@@ -373,6 +374,27 @@ namespace
         check(reason != nullptr && strcmp(reason, "rule incomplete") == 0, "rule without image path reason");
     }
 
+    void testFamilyMap()
+    {
+        using NRedUserPatch::familyForDeviceID;
+        using NRedUserPatch::kFamilyVCN2;
+
+        check(familyForDeviceID(0x15DD) == 0x01U, "family: Raven 0x15DD");
+        check(familyForDeviceID(0x15D8) == 0x06U, "family: Raven2/Picasso 0x15D8");
+        check(familyForDeviceID(0x1636) == 0x18U, "family: Renoir 0x1636");
+        check(familyForDeviceID(0x164C) == 0x18U, "family: Cezanne 0x164C");
+        check(familyForDeviceID(0x15E7) == 0x28U, "family: Barcelo 0x15E7");
+        check(familyForDeviceID(0x1638) == 0x28U, "family: Renoir/Green Sardine 0x1638");
+        check(familyForDeviceID(0xFFFF) == 0U, "family: unknown");
+
+        check((familyForDeviceID(0x1636) & kFamilyVCN2) != 0U, "VCN2 mask covers 0x1636");
+        check((familyForDeviceID(0x164C) & kFamilyVCN2) != 0U, "VCN2 mask covers 0x164C");
+        check((familyForDeviceID(0x15E7) & kFamilyVCN2) != 0U, "VCN2 mask covers 0x15E7");
+        check((familyForDeviceID(0x1638) & kFamilyVCN2) != 0U, "VCN2 mask covers 0x1638");
+        check((familyForDeviceID(0x15DD) & kFamilyVCN2) == 0U, "VCN2 mask rejects Raven");
+        check((familyForDeviceID(0x15D8) & kFamilyVCN2) == 0U, "VCN2 mask rejects Raven2/Picasso");
+    }
+
     void testRuleResolver(const char* const root15, const char* const root26)
     {
         check(NRedUserPatch::kRuleCount == 19U, "rule count");
@@ -381,7 +403,9 @@ namespace
         check(resolveAll(root26, false, true) == 5U, "default resolves 5 on 26.7.2");
         check(resolveAll(root26, true, true) == 19U, "VDA resolves 19 on 26.7.2");
 
-        check(!NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[0], 0x10U, false), "family gate rejects");
+        check(!NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[0],
+                                          NRedUserPatch::familyForDeviceID(0x15DD), false),
+              "family gate rejects Raven");
         check(NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[0], NRedUserPatch::kFamilyVCN2, false),
               "family gate accepts");
         check(!NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[5], NRedUserPatch::kFamilyVCN2, false),
@@ -407,6 +431,7 @@ int main(int argc, char** argv)
     testMachO(root15);
     testCacheLocator(root15, root26);
     testRuleGuards();
+    testFamilyMap();
     testRuleResolver(root15, root26);
 
     printf("%s: %u failure(s)\n", failures == 0 ? "PASS" : "FAIL", failures);

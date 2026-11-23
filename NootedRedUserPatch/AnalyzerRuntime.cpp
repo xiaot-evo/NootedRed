@@ -22,6 +22,7 @@
 
 #include <AnalyzerRuntime.hpp>
 
+#include <Analyzer/Family.hpp>
 #include <Analyzer/RuleTable.hpp>
 #include <Headers/kern_devinfo.hpp>
 #include <Headers/kern_util.hpp>
@@ -111,24 +112,6 @@ namespace NRedUserPatch
         this->runningFamily_ = familyForDeviceID(static_cast<uint16_t>(deviceID & 0xFFFFU));
         SYSLOG("UserPatch", "analyzer: iGPU 0x%04X family 0x%X", static_cast<unsigned>(deviceID & 0xFFFFU),
                static_cast<unsigned>(this->runningFamily_));
-    }
-
-    auto AnalyzerRuntime::familyForDeviceID(const uint16_t deviceID) -> uint32_t
-    {
-        switch (deviceID) {
-            case 0x15DD:    // Raven
-                return 1U << 0;
-            case 0x15D8:    // Raven2 / Picasso
-                return (1U << 1) | (1U << 2);
-            case 0x1636:    // Renoir / Cezanne
-            case 0x164C:
-                return (1U << 3) | (1U << 4);
-            case 0x15E7:    // Barcelo / Green Sardine
-            case 0x1638:
-                return (1U << 3) | (1U << 5);
-            default:
-                return 0;
-        }
     }
 
     auto AnalyzerRuntime::findOrOpen(const char* const path) -> KernelFile*

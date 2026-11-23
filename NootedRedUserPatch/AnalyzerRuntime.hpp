@@ -76,7 +76,6 @@ namespace NRedUserPatch
         static auto openCacheThunk(void* context, const char* name, ByteSource& out) -> bool;
         static auto openImageThunk(void* context, const char* imagePath, ByteSource& out) -> bool;
         auto findOrOpen(const char* path) -> KernelFile*;
-        static auto familyForDeviceID(uint16_t deviceID) -> uint32_t;
 
         KernelFile    files_[kMaxFiles]{};
         ResolvedSite  pending_[SiteSet::kMaxSites]{};

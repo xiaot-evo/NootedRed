@@ -54,8 +54,10 @@ namespace NRedUserPatch
 
     // Rule flags.  VDA rules are enabled only with -NRedUserPatchVDA; the default set stays at the
     // five GL/Metal sites shipped by the current release.
-    static constexpr uint8_t  kRuleFlagVDA = 1U << 0U;
-    static constexpr uint32_t kFamilyVCN2  = 0x28U;
+    static constexpr uint8_t kRuleFlagVDA = 1U << 0U;
+    // Bit 3 is the VCN2 group used by every shipped rule; bits 4 and 5 distinguish the two VCN2.2
+    // silicon groups (0x1636/0x164C and 0x1638/0x15E7) for future per-family rules.
+    static constexpr uint32_t kFamilyVCN2 = 0x38U;
 
     // One shape-specific locator and replacement.  A rule with a single variant is the common case;
     // MTL gate/allow carry two because Apple's code shape changed between 15.8.2 and 26.7.2.
