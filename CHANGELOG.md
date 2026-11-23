@@ -1,5 +1,25 @@
 # Change log
 
+## NootedRedUserPatch 0.3.3 (23/11/2026)
+
+### Enhancements
+
+- Consolidate the VDA user-space rule set from 14 to 8 sites (19 to 13 rules total). The three
+  per-factory VP family patches become one patch at the shared
+  `VAContext::createVideoProcessor` family load; the two `Vcn2Encoder::setEncodeParams` patches
+  become one 25-byte all-or-nothing site; the three addrlib family remaps are removed as
+  unreachable under the family-5 VCN configuration.
+- `kFamilyVCN2` is now the shared VCN2 bit `0x08`. The previous `0x28` already covered
+  0x1636/0x164C through bit 3, so this is a behavior-preserving clarification; bits 4/5 remain
+  for future per-family rules.
+- Add exact find/replace assertions for the new sites and a shared-VCN2-bit family test.
+
+Validated on Renoir `0x1638` / macOS 15.8.3 `24H241` with the debug satellite: `13/13` rules
+resolved; H.264 720p/64x64 and HEVC 720p decode match software; 1080p 10-bit HEVC decode is
+bit-exact (150 frames); two rounds of six concurrent 1080p 10-bit HEVC decoders completed with no
+resets or panics; H.264/HEVC hardware encode produced decodable files and the AppleGVA hardware
+decoder path was used.
+
 ## v0.9.3 (18/11/2026)
 
 ### Bug Fixes

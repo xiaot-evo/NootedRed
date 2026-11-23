@@ -52,7 +52,7 @@ target_end()
 target("NootedRedUserPatch")
 	add_rules("LiluPlugIn")
 	set_kind("binary")
-	set_version("0.3.2")
+	set_version("0.3.3")
 	set_languages("cxx23")
 	add_cxflags("-Wno-c23-extensions")
 

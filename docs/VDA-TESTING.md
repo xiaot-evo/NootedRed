@@ -14,8 +14,9 @@
 - 没有外接 AMD 独显占用 X6000 路径。
 
 卫星的 `kFamilyVCN2` 门控通过共享的 VCN2 bit 3 覆盖上述四颗 VCN2.2 APU，并应用同一组 8 条
-VDA 规则；这是收敛前就有的行为。`0x1638` 是 19 条规则表的硬件验证目标，13 条规则表待收敛后的
-A/B；0x1636/0x164C/0x15E7 仍为 experimental。
+VDA 规则；这是收敛前就有的行为。13 条规则表已于 2026-11-23 在 `0x1638` / 15.8.3 `24H241`
+通过 debug A/B（13/13 resolved、8-bit 解码逐像素一致、1080p 10-bit HEVC bit-exact、两轮六路
+并发无 reset/panic、H.264/HEVC 硬件编码可解码）；0x1636/0x164C/0x15E7 仍为 experimental。
 
 ## 2. 打开开关
 
