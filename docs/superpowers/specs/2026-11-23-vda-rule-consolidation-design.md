@@ -14,8 +14,9 @@
 - 把 `Vcn2Encoder::setEncodeParams` 内相邻的两条补丁（原 12/13）合并为一条 25 字节的
   all-or-nothing 补丁。
 - 删除 3 条在当前 family-5 VCN 配置下静态不可达的 addrlib 补丁（原 6/17/18）。
-- 修正设备家族门控：0x1636/0x164C 与 0x1638/0x15E7 一样通过 `kFamilyVCN2`；把
-  device-id→family 映射移入 freestanding Analyzer，以便主机侧断言。
+- 厘清设备家族门控：`kFamilyVCN2` 改用四颗 VCN2.2 APU 共享的 bit 3（`0x08`）。原 `0x28` 已经
+  通过 bit 3 覆盖 0x1636/0x164C，因此这是语义精确化、不是行为修复；把 device-id→family 映射
+  移入 freestanding Analyzer，以便主机侧断言。
 
 ## 2. 关键证据
 
@@ -84,12 +85,13 @@ replace = 8B 82 80 00 00 00 8B 8A 84 00 00 00 90 90 90 90 90 90 90 90 90 90 90 9
 
 ### 3.3 设备家族门控
 
-- `kFamilyVCN2` 从 `0x28` 改为 `0x38`（bit 3 = VCN2，bit 4 = 0x1636/0x164C 组，
-  bit 5 = 0x1638/0x15E7 组）。所有发布规则使用该 mask，因此四颗 VCN2.2 APU 都会命中。
+- `kFamilyVCN2` 从 `0x28` 改为 `0x08`，即四颗 VCN2.2 APU 共享的 bit 3。原 `0x28` 已经通过
+  bit 3 命中 0x1636/0x164C（`0x28 & 0x18 = 0x08`）；本次改动是语义精确化，不是行为修复。
+  bit 4 = 0x1636/0x164C 组、bit 5 = 0x1638/0x15E7 组保留给未来的按硅片规则。
 - `familyForDeviceID` 从 `AnalyzerRuntime` 移入 `Analyzer/Family.hpp`，保持现有映射：
   0x1636/0x164C → `0x18`，0x1638/0x15E7 → `0x28`，Raven/Picasso → 低 bits，未知 → 0。
-- 在 `test_analyzer.cpp` 中直接断言四颗 VCN2.2 的 family 与 `kFamilyVCN2` 相交，且
-  Raven/Picasso/未知不相交。
+- 在 `test_analyzer.cpp` 中断言 `kFamilyVCN2` 等于四颗 VCN2 family 值的交集，四颗 VCN2.2 在
+  默认/VDA 规则下命中，Raven/Picasso/未知不命中。
 
 ## 4. 非目标
 
@@ -100,8 +102,9 @@ replace = 8B 82 80 00 00 00 8B 8A 84 00 00 00 90 90 90 90 90 90 90 90 90 90 90 9
 
 ## 5. 验证
 
-- 主机：`test_analyzer.py`（13/13）、`test_fixture_probe.py`（13/13）、
-  `test_site_set.py`（含 25 字节 site）、`test_block_reader.py`。
+- 主机：`test_analyzer.py`（13/13，含规则 6/9 的 find/replace 精确断言和 `kFamilyVCN2`
+  共享位断言）、`test_fixture_probe.py`（13/13）、`test_site_set.py`（含 25 字节 site）、
+  `test_block_reader.py`。
 - 规则生成器必须在 15.8.2 与 26.7.2 上分别通过 pattern 唯一性和 find 验证；任一失败即
   fail closed，不生成表。
 - 硬件（需用户明确授权 EFI 写入）：debug 卫星 +

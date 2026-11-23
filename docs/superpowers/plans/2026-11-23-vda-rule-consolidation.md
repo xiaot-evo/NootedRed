@@ -4,7 +4,7 @@
 
 **Goal:** Reduce the NootedRedUserPatch VDA rule set from 14 to 8 sites (19 to 13 rules total) without changing the validated decode/encode behavior, and make the VCN2 device-family gate cover 0x1636/0x164C.
 
-**Architecture:** Replace the three per-factory VP family patches with one patch at the common `VAContext::createVideoProcessor` family load; merge the two adjacent `Vcn2Encoder::setEncodeParams` patches into one 25-byte rule; drop three addrlib rules that are unreachable under the family-5 `_VAHWConfig`; widen `kFamilyVCN2` to `0x38` and move the device-ID map into the freestanding analyzer so it is host-tested.
+**Architecture:** Replace the three per-factory VP family patches with one patch at the common `VAContext::createVideoProcessor` family load; merge the two adjacent `Vcn2Encoder::setEncodeParams` patches into one 25-byte rule; drop three addrlib rules that are unreachable under the family-5 `_VAHWConfig`; make `kFamilyVCN2` the shared VCN2 bit `0x08` and move the device-ID map into the freestanding analyzer so it is host-tested.
 
 **Tech Stack:** C++23 freestanding analyzer (host tests with clang++), Python rule generator, xmake/AppleForge kernel build.
 
@@ -25,12 +25,12 @@
 - The new 10-byte VP family sequence shifts, disappears, or becomes non-unique in a future image: the rule must fail closed and not be half-applied. Pinned by the 15.8.2/26.7.2 resolver tests and the generator's uniqueness check (Task 2).
 - The merged 25-byte encode find could match partially or hit `Vcn3Encoder`; the function anchor and all-or-nothing replacement must prevent a wrong stride. Pinned by the resolver test and the encode hardware matrix (Tasks 2 and 5).
 - Dropping rules 6/17/18 could hide an addrlib path not visible statically. Pinned by the hardware A/B; restore the rules if decode/encode regresses (Task 5).
-- Widening `kFamilyVCN2` applies the default GL/Metal rules to 0x1636/0x164C, which have no test hardware. Pinned by the host family-map assertions and the experimental note (Tasks 1 and 3).
+- The mask change is behavior-preserving (bit 3 already covered 0x1636/0x164C); the risk is misdocumenting which devices were already covered. Pinned by the shared-bit/subset assertions and the corrected docs (Tasks 1 and 3).
 - The merged rule writes 25 bytes, larger than any current site. Pinned by the long-site `test_site_set` case (Task 2).
 
 ---
 
-### Task 1: Host-testable device family map and VCN2 mask widening
+### Task 1: Host-testable device family map and shared VCN2 mask
 
 **Files:**
 - Create: `NootedRedUserPatch/Analyzer/Family.hpp`
@@ -42,7 +42,7 @@
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
 - Produces: `constexpr auto NRedUserPatch::familyForDeviceID(uint16_t deviceID) -> uint32_t`.
-- Produces: `NRedUserPatch::kFamilyVCN2 == 0x38U`.
+- Produces: `NRedUserPatch::kFamilyVCN2 == 0x08U` (the shared VCN2 bit).
 - Mapping values: `0x15DD -> 0x01`, `0x15D8 -> 0x06`, `0x1636 -> 0x18`, `0x164C -> 0x18`, `0x15E7 -> 0x28`, `0x1638 -> 0x28`, default `0`.
 
 - [ ] **Step 1: Write the failing family test**
@@ -69,6 +69,10 @@ void testFamilyMap()
     check((familyForDeviceID(0x1638) & kFamilyVCN2) != 0U, "VCN2 mask covers 0x1638");
     check((familyForDeviceID(0x15DD) & kFamilyVCN2) == 0U, "VCN2 mask rejects Raven");
     check((familyForDeviceID(0x15D8) & kFamilyVCN2) == 0U, "VCN2 mask rejects Raven2/Picasso");
+
+    const uint32_t commonVcn2 = familyForDeviceID(0x1636) & familyForDeviceID(0x164C)
+                                & familyForDeviceID(0x15E7) & familyForDeviceID(0x1638);
+    check(kFamilyVCN2 == commonVcn2, "VCN2 mask is the shared VCN2 bit");
 }
 ```
 
@@ -110,7 +114,7 @@ namespace NRedUserPatch
 }    // namespace NRedUserPatch
 ```
 
-In `AnalyzerTypes.hpp`, change `kFamilyVCN2` to `0x38U` with a comment: bit 3 = VCN2, bit 4 = 0x1636/0x164C group, bit 5 = 0x1638/0x15E7 group.
+In `AnalyzerTypes.hpp`, change `kFamilyVCN2` to `0x08U` with a comment: bit 3 is the shared VCN2 bit used by the generic rules; bits 4/5 distinguish the 0x1636/0x164C and 0x1638/0x15E7 groups for future per-family rules. The old `0x28` already matched 0x1636/0x164C through bit 3, so this is precision, not a behavior fix.
 
 In `AnalyzerRuntime.hpp`, delete the private `static auto familyForDeviceID(uint16_t deviceID) -> uint32_t;` declaration. In `AnalyzerRuntime.cpp`, add `#include <Analyzer/Family.hpp>` and delete the local definition at lines 116-132; `detectFamily()` keeps calling `familyForDeviceID(...)`.
 
@@ -120,7 +124,7 @@ Run: `python3 test/test_analyzer.py`
 Expected: PASS with 19 rules still, including the new `family:` and `VCN2 mask` checks.
 
 Run: `python3 test/test_fixture_probe.py`
-Expected: PASS, 19/19 resolved (the mask widening does not change fixture resolution).
+Expected: PASS, 19/19 resolved (the shared-bit mask does not change fixture resolution).
 
 - [ ] **Step 5: Commit (only with user approval)**
 
@@ -195,6 +199,8 @@ if (rule.id >= 13U) {
 }
 ```
 
+Also add exact `find`/`replace` assertions for rules 6 and 9 (10-byte VP family and 25-byte encode) in `resolveAll`, so a generator slip cannot pass the host gate.
+
 In `test/test_site_set.cpp`, add a third site with a 25-byte find/replace (for example `0x5A` and `0xA5` fills) at chunk offset `0x40`; publish 3 sites and update the expected counts: apply writes `3`, `alreadyPatched() == 3`, `foreign() == 3`, split chunk still writes `0`, final `applied() == 6`. Extend `fillFind` to copy the 25-byte find at `0x40`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -247,12 +253,12 @@ git commit -m "perf: consolidate the VDA user-space rule set to 13 rules"
 - Modify: `docs/VDA-TESTING.md` (note that all four VCN2.2 IDs now share the 8 VDA rules; 0x1636/0x164C remain experimental)
 
 **Interfaces:**
-- Consumes: the 13-rule table and `kFamilyVCN2 = 0x38` from Tasks 1 and 2.
+- Consumes: the 13-rule table and `kFamilyVCN2 = 0x08` from Tasks 1 and 2.
 - Produces: documentation that matches the generated table; no code interface.
 
 - [ ] **Step 1: Update the counts and mask**
 
-Replace every current `19 rules` / `19/19` / `14 VDA` / `5 + 14` statement about the *current* rule set with `13` / `8`. Keep historical hardware statements clearly labeled (for example, "the 2026-11-18 validation resolved 19/19 on the pre-consolidation table; the 13-rule table is pending its own A/B"). Change `familyMask 0x28` to `0x38` and explain bits 3/4/5.
+Replace every current `19 rules` / `19/19` / `14 VDA` / `5 + 14` statement about the *current* rule set with `13` / `8`. Keep historical hardware statements clearly labeled (for example, "the 2026-11-18 validation resolved 19/19 on the pre-consolidation table; the 13-rule table is pending its own A/B"). Change `familyMask 0x28` to `0x08` (the shared VCN2 bit; the old `0x28` already covered 0x1636/0x164C through bit 3) and explain bits 3/4/5.
 
 Rewrite appendix A of `docs/USERSPACE-PATCHING.md` to the 13-row layout from the spec §3.1. Add a short subsection documenting the consolidation: the family-5 config evidence, why 6/17/18 were dropped, and why rule 6 (`VAContext::createVideoProcessor`) and rule 9 (merged encode) are at a higher level. Recount the 15.8.2↔26.7.2 byte-identity claim: it is now 11/13 identical; only MTL rules 2/3 need shape variants.
 

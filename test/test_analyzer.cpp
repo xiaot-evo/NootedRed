@@ -48,6 +48,12 @@ namespace
         }
     }
 
+    void checkBytes(const uint8_t* const actual, const uint8_t* const expected, const size_t size,
+                    const char* const what)
+    {
+        check(actual != nullptr && expected != nullptr && memcmp(actual, expected, size) == 0, what);
+    }
+
     void makePath(char* const out, const size_t size, const char* const root, const char* const tail)
     {
         snprintf(out, size, "%s/%s", root, tail);
@@ -287,6 +293,15 @@ namespace
         0x10B4B0D4U, 0x10B4C71EU, 0x10B4D8E4U,
     };
 
+    static const uint8_t kRule6Find[]    = {0x49, 0x8B, 0x85, 0x60, 0x04, 0x00, 0x00, 0x8B, 0x50, 0x0C};
+    static const uint8_t kRule6Replace[] = {0xBA, 0x02, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90};
+    static const uint8_t kRule9Find[]    = {0x8B, 0x8A, 0x84, 0x00, 0x00, 0x00, 0x8B, 0x87, 0x24, 0x04, 0x00, 0x00,
+                                            0x0F, 0xAF, 0xC1, 0x05, 0xFF, 0x00, 0x00, 0x00, 0x25, 0x00, 0xFF, 0xFF,
+                                            0xFF};
+    static const uint8_t kRule9Replace[] = {0x8B, 0x82, 0x80, 0x00, 0x00, 0x00, 0x8B, 0x8A, 0x84, 0x00, 0x00, 0x00,
+                                            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                                            0x90};
+
     uint32_t resolveAll(const char* const root, const bool vdaEnabled, const bool expect26)
     {
         char dyldDir[1024]{};
@@ -346,6 +361,17 @@ namespace
                 printf("ok: rule %u offset 0x%llx\n", rule.id, static_cast<unsigned long long>(site.fileOffset));
             }
 
+            if (rule.id == 6U) {
+                check(site.size == sizeof(kRule6Find), "rule 6 patch size");
+                checkBytes(site.find, kRule6Find, sizeof(kRule6Find), "rule 6 find");
+                checkBytes(site.replace, kRule6Replace, sizeof(kRule6Replace), "rule 6 replace");
+            }
+            if (rule.id == 9U) {
+                check(site.size == sizeof(kRule9Find), "rule 9 patch size");
+                checkBytes(site.find, kRule9Find, sizeof(kRule9Find), "rule 9 find");
+                checkBytes(site.replace, kRule9Replace, sizeof(kRule9Replace), "rule 9 replace");
+            }
+
             if (rule.id == 2) {
                 check(expect26 ? (site.find[0] == 0x74 && site.find[1] == 0x28)
                                : (site.find[0] == 0x75 && site.find[1] == 0x0B),
@@ -399,6 +425,10 @@ namespace
         check((familyForDeviceID(0x1638) & kFamilyVCN2) != 0U, "VCN2 mask covers 0x1638");
         check((familyForDeviceID(0x15DD) & kFamilyVCN2) == 0U, "VCN2 mask rejects Raven");
         check((familyForDeviceID(0x15D8) & kFamilyVCN2) == 0U, "VCN2 mask rejects Raven2/Picasso");
+
+        const uint32_t commonVcn2 = familyForDeviceID(0x1636) & familyForDeviceID(0x164C)
+                                    & familyForDeviceID(0x15E7) & familyForDeviceID(0x1638);
+        check(kFamilyVCN2 == commonVcn2, "VCN2 mask is the shared VCN2 bit");
     }
 
     void testRuleResolver(const char* const root15, const char* const root26)
@@ -412,6 +442,18 @@ namespace
         check(!NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[0],
                                           NRedUserPatch::familyForDeviceID(0x15DD), false),
               "family gate rejects Raven");
+        check(NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[0],
+                                          NRedUserPatch::familyForDeviceID(0x1636), false),
+              "default rules apply on 0x1636");
+        check(NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[0],
+                                          NRedUserPatch::familyForDeviceID(0x164C), false),
+              "default rules apply on 0x164C");
+        check(NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[5],
+                                          NRedUserPatch::familyForDeviceID(0x1636), true),
+              "VDA rules apply on 0x1636");
+        check(NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[5],
+                                          NRedUserPatch::familyForDeviceID(0x164C), true),
+              "VDA rules apply on 0x164C");
         check(NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[0], NRedUserPatch::kFamilyVCN2, false),
               "family gate accepts");
         check(!NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[5], NRedUserPatch::kFamilyVCN2, false),

@@ -148,7 +148,7 @@ Cryptex 已挂载，才是安全的 VFS 起点。
 ```
 Rule {
     image       目标镜像路径（standalone 或 cache 内路径）
-    familyMask  运行 iGPU 家族掩码（发布集为 0x38：bit 3 = VCN2，bit 4/5 = 两组 VCN2.2 设备）
+    familyMask  运行 iGPU 家族掩码（发布集为 0x08：四颗 VCN2.2 设备共享的 bit 3；bit 4/5 保留给按硅片规则）
     flags       kVDA（仅在 -NRedUserPatchVDA 时启用）
     anchor      符号名（首选）| 函数指纹 | 镜像内唯一模式
     variants[]  每个 variant: { local, find, replace }，按当前函数形状选择
@@ -172,7 +172,7 @@ Rule {
 1. **symbol（首选）**
    - 在符号表里精确匹配 mangled name，得到函数入口 `n_value`。
    - 用 `LC_FUNCTION_STARTS` 求 `[funcStart, funcEnd)`。
-   - 15.8.2 发布集的 13 个 site 全部能锚定到函数起始符号；这 13 个符号名在 26.7.2 中全部存在。
+   - 15.8.2 发布集的 13 个 site 全部能锚定到函数起始符号；这 13 个 site 的锚点在 26.7.2 中全部存在（12 个不同符号名；MTL gate/allow 共用同一个 ObjC 方法）。
      GL 的两个符号是 local symbol，走 nlist 扫描；VADriver 的多数符号可直接从 export trie 取。
 
 2. **function fingerprint（符号被 strip 时的回退）**
@@ -255,18 +255,22 @@ for rule in rules:
 
 - **原 7–9 → 规则 6**：`VAContext::createVideoProcessor` 是三个 VP 工厂的公共 family 决策点。
   在函数 `+0x25` 处把 `_VAHWConfig+0xC` 的加载替换为 `movl $2, %edx`，三个 create*VP 都收到
-  family 2（Gfx9），与逐工厂补丁等价；type 8/16（deinterlacer/dynamic contrast）本来就对
+  family 2（Gfx9），与逐工厂补丁等价；type 7/16（deinterlacer/dynamic contrast）本来就对
   非零 family 返回 null，行为不变。
 - **原 12/13 → 规则 9**：两条相邻补丁合并为 25 字节替换
   （`8B 82 80 00 00 00 8B 8A 84 00 00 00` + 13×`90`）。合并后是 all-or-nothing，避免只匹配
   一半时静默算错 encode stride。
-- **原 6/17/18 → 删除**：规则 5 的 family-5 配置使 `_VAHWConfig+0x96` bit16 置位，
+- **原 6/17/18 → 删除**：规则 5 的 family-5 配置使 `_VAHWConfig+0x96` bit0（即 `+0x94` dword 的 bit16）置位，
   `VAContext::Init` 跳过 `VAAddrLibInterface::init`；`Addr::Lib::Create` 和
   `HwlConvertChipFamily` 只在这条被跳过的路径上调用。`Gfx9*` VP/engine/ImageBlt 类覆写了会
   解引用 `VAContext+0x12548` 的 `Vi*` 方法，没有隐藏依赖。该结论是静态可达性分析，需硬件 A/B
   最终确认；若 decode/encode 回归，恢复这三条规则。
-- **设备门控**：`kFamilyVCN2` 从 `0x28` 扩为 `0x38`，覆盖 0x1636/0x1638/0x164C/0x15E7 四颗
-  VCN2.2 APU；`familyForDeviceID` 移入 `Analyzer/Family.hpp` 并在主机测试中断言。
+- **回退**：规则 6 是三个 VP 路径的单点；如果未来单个 VP shape 变化导致它 unresolved，回退方案是
+  恢复原 7–9 三条独立工厂规则。
+- **设备门控**：`kFamilyVCN2` 现在是 `0x08`，即四颗 VCN2.2 APU 共享的 bit 3。原 `0x28` 已经通过
+  bit 3 命中 0x1636/0x164C（`0x28 & 0x18 = 0x08`）；本次改动是语义精确化，不是行为修复。
+  bits 4/5 保留给未来的按硅片规则。`familyForDeviceID` 移入 `Analyzer/Family.hpp`，主机测试
+  断言 `kFamilyVCN2` 等于四颗 VCN2 family 值的交集，并断言 0x1636/0x164C 在默认/VDA 规则下命中。
 
 ## 7. 写入路径
 
@@ -320,7 +324,7 @@ for rule in rules:
 用 `version-fixtures/15.8.2` 和 `version-fixtures/26.7.2` 的干净镜像做 Mach-O 解析：
 
 - 发布集 13 条规则（default 5 + VDA 8）的语义位置都能在 26.7.2 中找到；13 条都有函数符号，
-  且 13 个符号名在 26.7.2 全部存在。GL 的符号是 local symbol（nlist 扫描），VADriver 的多数
+  且 13 个 site 的锚点在 26.7.2 全部存在（12 个不同符号名；MTL gate/allow 共用同一个 ObjC 方法）。GL 的符号是 local symbol（nlist 扫描），VADriver 的多数
   符号可从 export trie 直接取。
 - **11/13 的 `find`/`replace` 字节在 15.8.2 与 26.7.2 完全一致**；剩下 2 条 MTL site 需要按函数
   形状的 variant：
@@ -464,7 +468,7 @@ fixture，13/14 目前预留，加入对应目录后自动运行并报告每条�
 - 规则 9 把原 12/13 合并为 25 字节的 all-or-nothing 替换；该 25 字节序列在镜像内还有一份
   `Vcn3Encoder` 拷贝，由 `Vcn2Encoder::setEncodeParams` 的函数锚点隔离。
 - 原 6/17/18（`VAAddrLibInterface::init`、`Addr::Lib::Create`、`HwlConvertChipFamily`）已删除。
-  规则 5 的 family-5 配置使 `_VAHWConfig+0x96` bit16 置位时，`VAContext::Init` 直接跳过
+  规则 5 的 family-5 配置使 `_VAHWConfig+0x96` bit0（即 `+0x94` dword 的 bit16）置位时，`VAContext::Init` 直接跳过
   `VAAddrLibInterface::init`；该函数是 `Addr::Lib::Create` 与 `HwlConvertChipFamily` 的唯一入口。
   由规则 6–8 选择的 `Gfx9*` VP/engine/ImageBlt 类覆写了会解引用 `VAContext+0x12548` 的 `Vi*`
   方法，所以没有隐藏的 addrlib 依赖。
