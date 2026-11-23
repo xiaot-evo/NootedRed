@@ -27,7 +27,7 @@
 namespace NRedUserPatch
 {
 
-    // 19 shipped rules: 5 default (GL/Metal) + 14 VDA (VADriver2).  The table is generated from the
+    // 13 shipped rules: 5 default (GL/Metal) + 8 VDA (VADriver2).  The table is generated from the
     // clean 15.8.2 fixture and validated against 26.7.2 by the host test; it is not a per-build
     // profile.  Each rule carries at least one function-local masked pattern; the two MTL sites
     // carry a second shape variant for the 26.7.2 control-flow/register-allocation change.

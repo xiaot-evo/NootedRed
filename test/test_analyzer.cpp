@@ -276,15 +276,15 @@ namespace
     };
 
     static const uint64_t kExpected15[] = {
-        0x8160U,    0xE081U,    0x87B3164U, 0x87B3198U, 0x87EF51DU, 0x8606B96U, 0x8608449U,
-        0x860F987U, 0x860FA49U, 0x860FACBU, 0x860FBD0U, 0x860FC69U, 0x864CAF5U, 0x864CB01U,
-        0x864DF88U, 0x864F626U, 0x865082CU, 0x8667C65U, 0x867D770U,
+        0x8160U,    0xE081U,    0x87B3164U, 0x87B3198U, 0x87EF51DU,
+        0x8606B96U, 0x86091C1U, 0x860FBD0U, 0x860FC69U, 0x864CAF5U,
+        0x864DF88U, 0x864F626U, 0x865082CU,
     };
 
     static const uint64_t kExpected26[] = {
-        0x81CAU,     0xE0C1U,     0x10C79708U, 0x10C7972AU, 0x10C56121U, 0x10B00F4EU, 0x10B024A9U,
-        0x10B0DF5FU, 0x10B0E021U, 0x10B0E0A3U, 0x10B0E1A8U, 0x10B0E241U, 0x10B49C4FU, 0x10B49C5BU,
-        0x10B4B0D4U, 0x10B4C71EU, 0x10B4D8E4U, 0x10B026F5U, 0x10B02B00U,
+        0x81CAU,     0xE0C1U,     0x10C79708U, 0x10C7972AU, 0x10C56121U,
+        0x10B00F4EU, 0x10B07847U, 0x10B0E1A8U, 0x10B0E241U, 0x10B49C4FU,
+        0x10B4B0D4U, 0x10B4C71EU, 0x10B4D8E4U,
     };
 
     uint32_t resolveAll(const char* const root, const bool vdaEnabled, const bool expect26)
@@ -329,6 +329,12 @@ namespace
             }
 
             check(site.ruleId == rule.id, "resolved rule id");
+            if (rule.id >= 13U) {
+                printf("FAIL: rule id %u outside the expected table\n", rule.id);
+                failures += 1U;
+                continue;
+            }
+
             const uint64_t expected = expect26 ? kExpected26[rule.id] : kExpected15[rule.id];
             if (site.fileOffset != expected) {
                 printf("FAIL: rule %u offset 0x%llx != 0x%llx\n", rule.id,
@@ -397,11 +403,11 @@ namespace
 
     void testRuleResolver(const char* const root15, const char* const root26)
     {
-        check(NRedUserPatch::kRuleCount == 19U, "rule count");
+        check(NRedUserPatch::kRuleCount == 13U, "rule count");
         check(resolveAll(root15, false, false) == 5U, "default resolves 5 on 15.8.2");
-        check(resolveAll(root15, true, false) == 19U, "VDA resolves 19 on 15.8.2");
+        check(resolveAll(root15, true, false) == 13U, "VDA resolves 13 on 15.8.2");
         check(resolveAll(root26, false, true) == 5U, "default resolves 5 on 26.7.2");
-        check(resolveAll(root26, true, true) == 19U, "VDA resolves 19 on 26.7.2");
+        check(resolveAll(root26, true, true) == 13U, "VDA resolves 13 on 26.7.2");
 
         check(!NRedUserPatch::ruleEnabled(NRedUserPatch::kRules[0],
                                           NRedUserPatch::familyForDeviceID(0x15DD), false),
